@@ -164,12 +164,14 @@ mod tests {
     async fn background_children_do_not_block_or_survive() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("still_alive");
+        // Warm up the one-time sandbox availability probe so the timer measures only the command.
+        let _ = sandbox::available();
         let t = Instant::now();
         // A background child holding stdout open used to block until the timeout.
         let cmd = format!("(sleep 3; touch {}) & echo started", marker.display());
         let out = Bash.call(json!({"command": cmd}), &ctx(dir.path())).await.unwrap();
         assert!(out.contains("started") && out.contains("exit code: 0"), "{out}");
-        assert!(t.elapsed() < Duration::from_secs(2), "blocked for {:?}", t.elapsed());
+        assert!(t.elapsed() < Duration::from_secs(2), "blocked for {:?}; output: {out}", t.elapsed());
         tokio::time::sleep(Duration::from_millis(3500)).await;
         assert!(!marker.exists(), "background child outlived the tool call");
     }

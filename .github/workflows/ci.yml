@@ -36,7 +36,7 @@ jobs:
         shell: bash
         run: |
           [ -f test.log ] || exit 0
-          grep -E "^---- |panicked at|assertion|left:|right:|Error|error\[" test.log | head -60 |
+          grep -E -A3 "^---- |panicked at|assertion|left:|right:|Error|error\[" test.log | head -80 |
             while IFS= read -r line; do echo "::error title=test failure (${{ matrix.os }})::${line}"; done
 
   # Live tests against a FREE model; runs only when the secret is configured.
