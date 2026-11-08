@@ -21,6 +21,7 @@ pub const CYAN: &str = "\x1b[36m";
 /// Terminal state shared by the renderer and the interactive prompts (approver, plan review).
 pub struct Screen {
     out: Box<dyn Write + Send>,
+    fd: i32,
     color: bool,
     pub verbose: bool,
     /// Whether to stream the master's text (off in -p mode, where the final answer is printed at the end).
@@ -59,9 +60,11 @@ fn fmt_secs(s: u64) -> String {
 }
 
 impl Screen {
-    pub fn new(out: Box<dyn Write + Send>, color: bool, verbose: bool, stream_master: bool) -> SharedScreen {
+    /// `fd` is the descriptor `out` writes to (1 or 2), used to ask the terminal its width.
+    pub fn new(out: Box<dyn Write + Send>, fd: i32, color: bool, verbose: bool, stream_master: bool) -> SharedScreen {
         Arc::new(Mutex::new(Self {
             out,
+            fd,
             color,
             verbose,
             stream_master,
@@ -88,7 +91,10 @@ impl Screen {
     /// Erase the panel so normal output (or a prompt) can be printed.
     pub fn clear_panel(&mut self) {
         if self.panel_lines > 0 && self.color {
-            let _ = write!(self.out, "\x1b[{}F\x1b[J", self.panel_lines);
+            // Erase line by line (cursor up + erase line). Not "erase below" (ESC[J): when the
+            // panel sits on the top row, that clears the *entire* screen, and terminals with
+            // scroll-on-clear (tmux >= 3.3 default) then archive every frame into scrollback.
+            let _ = write!(self.out, "\r{}", "\x1b[1A\x1b[2K".repeat(self.panel_lines));
         }
         self.panel_lines = 0;
     }
@@ -120,15 +126,14 @@ impl Screen {
         let running: Vec<&Todo> = self.todos.iter().filter(|t| t.status == TodoStatus::InProgress).collect();
         let mut lines = Vec::new();
         if !running.is_empty() || !self.delegations.is_empty() {
-            let done = self.todos.iter().filter(|t| t.status == TodoStatus::Done).count();
-            lines.push(format!(
-                "{}── team: {} running · {}/{} TODOs done ──{}",
-                self.c(DIM),
-                running.len() + self.delegations.len(),
-                done,
-                self.todos.len(),
-                self.c(RESET)
-            ));
+            let working = running.len() + self.delegations.len();
+            let header = if self.todos.is_empty() {
+                format!("team: {working} working")
+            } else {
+                let done = self.todos.iter().filter(|t| t.status == TodoStatus::Done).count();
+                format!("team: {working} working · {done}/{} TODOs done", self.todos.len())
+            };
+            lines.push(format!("{}── {header} ──{}", self.c(DIM), self.c(RESET)));
             for t in &running {
                 let inst = t.instance.clone().unwrap_or_else(|| "queued".into());
                 let act = self.activity_line(&inst);
@@ -144,7 +149,7 @@ impl Screen {
             let act = self.activity_line("master");
             lines.push(format!("{} {}master{} {}· {act}{}", self.spinner(CYAN), self.c(BOLD), self.c(RESET), self.c(DIM), self.c(RESET)));
         }
-        let width = terminal_width();
+        let width = terminal_width(self.fd);
         for l in &lines {
             let _ = writeln!(self.out, "{}", clip(l, width));
         }
@@ -425,14 +430,28 @@ fn summary_line(report: &str) -> Option<String> {
         .or_else(|| report.lines().next().map(|s| s.chars().take(100).collect()))
 }
 
-fn terminal_width() -> usize {
-    std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok()).unwrap_or(120)
+/// Width of the terminal behind file descriptor `fd` (asked from the kernel on every redraw, so
+/// resizing works), then $COLUMNS, then 80. `COLUMNS` alone is unreliable: shells rarely export it.
+fn terminal_width(fd: i32) -> usize {
+    #[cfg(unix)]
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+            return ws.ws_col as usize;
+        }
+    }
+    let _ = fd;
+    std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok()).unwrap_or(80)
 }
 
-/// Clip a line to `width` visible chars (ANSI escapes don't count).
+/// Clip a line so it occupies at most `width - 1` terminal columns (ANSI escapes take none, wide
+/// characters like emoji/CJK take two). A panel line must never wrap: the redraw moves the cursor
+/// up one row per line, so a wrapped line would leave stale rows behind on every frame.
 fn clip(s: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let max = width.saturating_sub(1).max(10);
     let mut out = String::new();
-    let mut visible = 0;
+    let mut cols = 0;
     let mut in_esc = false;
     for ch in s.chars() {
         if in_esc {
@@ -447,13 +466,14 @@ fn clip(s: &str, width: usize) -> String {
             out.push(ch);
             continue;
         }
-        if visible + 1 >= width {
+        let w = ch.width().unwrap_or(0);
+        if cols + w > max - 1 {
             out.push('…');
             out.push_str(RESET);
             break;
         }
         out.push(ch);
-        visible += 1;
+        cols += w;
     }
     out
 }
@@ -516,7 +536,7 @@ mod tests {
     #[tokio::test]
     async fn long_command_shows_spinner_elapsed_and_latest_output() {
         let buf = Buf::default();
-        let screen = Screen::new(Box::new(buf.clone()), true, false, true);
+        let screen = Screen::new(Box::new(buf.clone()), -1, true, false, true);
         let mut s = screen.lock().await;
         s.handle(ev("coder#1", EventKind::DelegateStart { worker: "coder#1".into(), task: "build".into() }));
         s.handle(ev("coder#1", EventKind::ToolStart { call_id: "c".into(), name: "bash".into(), summary: "cargo build".into() }));
@@ -539,10 +559,39 @@ mod tests {
         assert_eq!(buf.text().len(), before, "nothing busy → tick draws nothing");
     }
 
+    #[test]
+    fn clipped_panel_lines_never_wrap() {
+        use unicode_width::UnicodeWidthStr;
+        let strip = |s: &str| {
+            let mut out = String::new();
+            let mut esc = false;
+            for c in s.chars() {
+                if esc {
+                    esc = !c.is_ascii_alphabetic();
+                    continue;
+                }
+                if c == '\x1b' {
+                    esc = true;
+                    continue;
+                }
+                out.push(c);
+            }
+            out
+        };
+        let line =
+            format!("{CYAN}⠹{RESET} coder#2 · bash(cargo test) · 1m07s · 編譯中 🦀🦀🦀 Compiling serde v1.0.200 and a lot more output");
+        for width in [20, 40, 60, 80] {
+            let visible = strip(&clip(&line, width));
+            assert!(visible.width() < width, "width {width}: {} cols: {visible}", visible.width());
+        }
+        // Short lines are untouched.
+        assert_eq!(strip(&clip("⠹ master · thinking · 4s", 80)), "⠹ master · thinking · 4s");
+    }
+
     #[tokio::test]
     async fn plain_output_prints_heartbeats_every_30s() {
         let buf = Buf::default();
-        let screen = Screen::new(Box::new(buf.clone()), false, false, false);
+        let screen = Screen::new(Box::new(buf.clone()), -1, false, false, false);
         let mut s = screen.lock().await;
         s.handle(ev("coder#2", EventKind::ToolStart { call_id: "c".into(), name: "bash".into(), summary: "npm test".into() }));
         s.tick();

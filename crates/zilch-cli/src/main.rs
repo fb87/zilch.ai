@@ -180,7 +180,7 @@ async fn real_main() -> Result<i32> {
     // In -p mode progress goes to stderr and the final answer to stdout.
     let out: Box<dyn std::io::Write + Send> = if one_shot { Box::new(std::io::stderr()) } else { Box::new(std::io::stdout()) };
     let color = if one_shot { std::io::stderr().is_terminal() } else { tty } && std::env::var_os("NO_COLOR").is_none();
-    let screen = Screen::new(out, color, cli.verbose, !one_shot);
+    let screen = Screen::new(out, if one_shot { 2 } else { 1 }, color, cli.verbose, !one_shot);
 
     let mut event_log = None;
     if !cli.no_log {
