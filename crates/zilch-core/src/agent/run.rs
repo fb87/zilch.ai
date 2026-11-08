@@ -55,7 +55,23 @@ impl Agent {
     }
 
     /// Run one user/task turn to completion and return the final assistant text.
+    ///
+    /// Blank input is rejected, and if the turn fails before the model produced anything
+    /// (e.g. the provider rejected the request), the history is rolled back so the agent stays
+    /// usable instead of replaying the failing request forever.
     pub async fn run(&mut self, input: &str) -> Result<String> {
+        if input.trim().is_empty() {
+            bail!("empty input: nothing to do");
+        }
+        let start = self.history.len();
+        let res = self.run_turn(input).await;
+        if res.is_err() && !self.history[start..].iter().any(|m| m.role == crate::llm::Role::Assistant) {
+            self.history.truncate(start);
+        }
+        res
+    }
+
+    async fn run_turn(&mut self, input: &str) -> Result<String> {
         let cancel = self.ctx.cancel.current();
         self.history.push(Message::user(input));
         let mut reminded = false;

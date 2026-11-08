@@ -125,3 +125,16 @@ crates/zilch-cli    `zilch` binary: REPL, live panel, approval and plan-review p
 - `Tool`: add a tool (and its name to a profile's `tools`).
 - `Approver` / `PlanReviewer`: a different UI.
 - `EventSink`: a different renderer, such as a TUI or a server.
+
+## Testing
+
+```sh
+cargo test                                   # offline: unit, integration, fuzz (proptest), corner cases
+PROPTEST_CASES=10000 cargo test --test fuzz  # fuzz harder
+# Live tests against a real FREE model (read-only tools, temp dirs only):
+OPENCODE_API_KEY=... cargo test -p zilch-core --test live_corners -- --ignored --nocapture --test-threads=2
+OPENCODE_API_KEY=... cargo test -p zilch-core --test live_compaction -- --ignored --nocapture
+```
+Fuzzed properties cover the SSE decoder/parser, tool-call reassembly, `edit_file` semantics,
+output truncation, path normalization, file scopes, TODO graphs, and history compaction
+(never splitting a tool call from its results).

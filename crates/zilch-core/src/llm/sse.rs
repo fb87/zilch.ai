@@ -4,29 +4,23 @@ use super::types::{LlmEvent, Usage};
 use serde_json::Value;
 
 /// Incrementally splits a byte stream into SSE `data:` payloads.
+///
+/// Buffers raw bytes and only decodes complete events, so a multi-byte UTF-8 character split
+/// across network chunks is never corrupted (found by fuzzing).
 #[derive(Default)]
 pub struct SseDecoder {
-    buf: String,
+    buf: Vec<u8>,
 }
 
 impl SseDecoder {
     /// Feed raw bytes; returns complete `data:` payloads (one per event).
     pub fn push(&mut self, chunk: &[u8]) -> Vec<String> {
-        self.buf.push_str(&String::from_utf8_lossy(chunk));
-        // Normalize CRLF so event boundaries are always "\n\n".
-        if self.buf.contains('\r') {
-            self.buf = self.buf.replace("\r\n", "\n");
-        }
+        self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
-        while let Some(pos) = self.buf.find("\n\n") {
-            let event: String = self.buf.drain(..pos + 2).collect();
-            let data: Vec<&str> = event
-                .lines()
-                .filter_map(|l| l.strip_prefix("data:"))
-                .map(|d| d.strip_prefix(' ').unwrap_or(d))
-                .collect();
-            if !data.is_empty() {
-                out.push(data.join("\n"));
+        while let Some((end, sep)) = find_boundary(&self.buf) {
+            let event: Vec<u8> = self.buf.drain(..end + sep).collect();
+            if let Some(data) = event_data(&event[..end]) {
+                out.push(data);
             }
         }
         out
@@ -34,12 +28,39 @@ impl SseDecoder {
 
     /// Flush a trailing event that wasn't terminated by a blank line.
     pub fn finish(&mut self) -> Vec<String> {
-        if self.buf.trim().is_empty() {
-            return vec![];
-        }
-        self.buf.push_str("\n\n");
-        self.push(&[])
+        let rest = std::mem::take(&mut self.buf);
+        event_data(&rest).into_iter().collect()
     }
+}
+
+/// Position of the first blank line ("\n\n", "\r\n\r\n", or mixed) and its length.
+fn find_boundary(b: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\n' {
+            // Accept "\n\n" and "\n\r\n" (the latter completes "\r\n\r\n").
+            if b.get(i + 1) == Some(&b'\n') {
+                return Some((i, 2));
+            }
+            if b.get(i + 1) == Some(&b'\r') && b.get(i + 2) == Some(&b'\n') {
+                return Some((i, 3));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Join the `data:` lines of one event (UTF-8 decoded once the event is complete).
+fn event_data(event: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(event);
+    let data: Vec<&str> = text
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .filter_map(|l| l.strip_prefix("data:"))
+        .map(|d| d.strip_prefix(' ').unwrap_or(d))
+        .collect();
+    if data.is_empty() { None } else { Some(data.join("\n")) }
 }
 
 /// Decode one `data:` payload into events. Returns `None` for `[DONE]`.
@@ -107,6 +128,19 @@ mod tests {
         assert!(d.push(b"data: {\"a\":").is_empty());
         let out = d.push(b"1}\n\ndata: [DONE]\n\n");
         assert_eq!(out, vec!["{\"a\":1}".to_string(), "[DONE]".to_string()]);
+    }
+
+    #[test]
+    fn utf8_split_across_chunks_is_not_corrupted() {
+        // Regression (fuzz): "¡" is 0xC2 0xA1; split between two network chunks.
+        let raw = "data: {\"choices\":[{\"delta\":{\"content\":\"¡Xin chào 🦀\"}}]}\n\n".as_bytes();
+        for cut in 1..raw.len() {
+            let mut d = SseDecoder::default();
+            let mut out = d.push(&raw[..cut]);
+            out.extend(d.push(&raw[cut..]));
+            let ev = parse_chunk(&out[0]).unwrap().unwrap();
+            assert_eq!(ev[0], LlmEvent::TextDelta("¡Xin chào 🦀".into()), "cut at {cut}");
+        }
     }
 
     #[test]
