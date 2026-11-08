@@ -1,7 +1,8 @@
 -- zilch.nvim — talk to a running zilch REPL from Neovim.
 --
--- zilch listens on <workspace>/.zilch/zilch.sock while its REPL runs. This plugin finds that
--- socket by walking up from the current file, and sends newline-delimited JSON:
+-- While its REPL runs, zilch writes its socket endpoint to <workspace>/.zilch/ipc (`@name` = Linux
+-- abstract socket, else a socket file). This plugin finds it by walking up from the current file
+-- and sends newline-delimited JSON:
 --   {"type":"send","text":…,"lane":…,"file":…,"start":…,"end":…,"selection":…}
 --   {"type":"status"}
 local M = {}
@@ -24,22 +25,28 @@ local function is_socket(path)
   return st ~= nil and st.type == "socket"
 end
 
---- The running zilch for the workspace at or above `start_dir`; returns socket path and
---- workspace root. zilch writes `.zilch/ipc` with the socket's location (the socket itself may
---- live outside the workspace: Unix socket paths are limited to ~108 bytes).
+--- Turn the pointer's endpoint into something libuv can connect to: `@name` is a Linux abstract
+--- socket (no file; libuv wants a leading NUL byte), anything else is a socket file path.
+local function resolve(endpoint)
+  if endpoint:sub(1, 1) == "@" then
+    return "\0" .. endpoint:sub(2)
+  end
+  return is_socket(endpoint) and endpoint or nil
+end
+
+--- The running zilch for the workspace at or above `start_dir`; returns the connectable endpoint
+--- and the workspace root. zilch writes `.zilch/ipc` with its endpoint while the REPL runs.
 function M.find_socket(start_dir)
   local dir = start_dir
   while dir and dir ~= "" do
     local f = io.open(dir .. "/.zilch/ipc", "r")
     if f then
-      local sock = (f:read("*l") or ""):gsub("%s+$", "")
+      local endpoint = (f:read("*l") or ""):gsub("%s+$", "")
       f:close()
-      if is_socket(sock) then
+      local sock = endpoint ~= "" and resolve(endpoint)
+      if sock then
         return sock, dir
       end
-    end
-    if is_socket(dir .. "/.zilch/zilch.sock") then
-      return dir .. "/.zilch/zilch.sock", dir
     end
     local parent = vim.fs.dirname(dir)
     if not parent or parent == dir then
@@ -53,9 +60,15 @@ end
 --- Send one request; `on_reply(tbl)` gets the decoded JSON reply.
 function M.request(sock, payload, on_reply)
   local pipe = uv.new_pipe(false)
-  pipe:connect(sock, function(err)
+  local abstract = sock:sub(1, 1) == "\0"
+  if abstract and not pipe.connect2 then
+    pipe:close()
+    notify("this Neovim's libuv cannot reach abstract sockets; Neovim 0.10+ is required", vim.log.levels.ERROR)
+    return
+  end
+  local function on_connect(err)
     if err then
-      notify("cannot connect to " .. sock .. " (" .. err .. ") — is the zilch REPL running?", vim.log.levels.ERROR)
+      notify("cannot connect to " .. sock:gsub("%z", "@") .. " (" .. err .. ") — is the zilch REPL running?", vim.log.levels.ERROR)
       pipe:close()
       return
     end
@@ -82,7 +95,13 @@ function M.request(sock, payload, on_reply)
       end
     end)
     pipe:write(vim.json.encode(payload) .. "\n")
-  end)
+  end
+  if abstract then
+    -- connect2 passes the name with its length, so the leading NUL byte survives.
+    pipe:connect2(sock, {}, on_connect)
+  else
+    pipe:connect(sock, on_connect)
+  end
 end
 
 local function relative(path, root)
@@ -103,7 +122,7 @@ function M.send(opts)
     sock, root = M.find_socket(uv.cwd())
   end
   if not sock then
-    notify("no running zilch found (looked for .zilch/zilch.sock above " .. start_dir .. ")", vim.log.levels.ERROR)
+    notify("no running zilch found (looked for .zilch/ipc above " .. start_dir .. ")", vim.log.levels.ERROR)
     return
   end
   local l1 = opts.line1 or vim.fn.line(".")

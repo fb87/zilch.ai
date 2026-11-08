@@ -412,8 +412,7 @@ async fn repl(
     let _ipc = match ipc::serve(lanes.clone(), &team.shared.cfg.cwd).await {
         Ok(Some(guard)) => {
             let mut s = screen.lock().await;
-            let msg =
-                format!("{}editor link: {} (Neovim: :ZilchSend){}", s.c(DIM), ipc::socket_path(&team.shared.cfg.cwd).display(), s.c(RESET));
+            let msg = format!("{}editor link: {} (Neovim: :ZilchSend){}", s.c(DIM), guard.endpoint, s.c(RESET));
             s.line(&msg);
             Some(guard)
         }

@@ -31,11 +31,20 @@ Without a comment argument you are prompted for one. Visual mode: select, then `
 
 ## How it connects
 
-While its REPL runs, zilch listens on a Unix socket (owner-only) and writes its location to
+While its REPL runs, zilch listens on a local socket and writes its endpoint to
 `<workspace>/.zilch/ipc`; the plugin finds that file by walking up from the current file.
+
+- **Linux:** an abstract socket (`@zilch-<uid>-<hash>`). There is no socket file, so nothing can
+  go stale or get the wrong permissions: the kernel releases the name when zilch exits, even if
+  it crashes.
+- **macOS / other Unix:** a socket file (mode 0600) inside a private 0700 directory owned by you
+  (`$XDG_RUNTIME_DIR/zilch/` or `/tmp/zilch-<uid>/`).
+
+Either way zilch checks the connecting process's user ID and only serves your own user.
 Messages are newline-delimited JSON:
 ```json
 {"type":"send","text":"why?","lane":"code","file":"src/x.rs","start":10,"end":20,"selection":"..."}
 {"type":"status"}
 ```
-Any editor or script can use the same protocol (`socat - UNIX-CONNECT:$(cat .zilch/ipc)`).
+Any editor or script can use the same protocol, e.g. `socat - ABSTRACT-CONNECT:zilch-…` on Linux
+(the endpoint without its `@`) or `socat - UNIX-CONNECT:$(cat .zilch/ipc)` on macOS.

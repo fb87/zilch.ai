@@ -248,5 +248,5 @@ are saved in the session and resume with `-c`.
 
 `editor/nvim` is a small Neovim plugin: select code, `:ZilchSend why is this rounding here?`, and
 the running zilch receives the file, line range, selected code and your comment in the active lane
-(or `:ZilchCode` / `:ZilchSpec` to pick one). It talks to the REPL over a local Unix socket using
+(or `:ZilchCode` / `:ZilchSpec` to pick one). It talks to the REPL over a local socket (abstract on Linux, owner-only, peer-uid checked) using
 newline-delimited JSON — see [`editor/nvim/README.md`](editor/nvim/README.md).
