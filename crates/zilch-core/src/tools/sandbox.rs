@@ -202,9 +202,33 @@ pub fn seatbelt_available() -> bool {
     })
 }
 
+/// Quote a path for SBPL, resolved to its real location first: Seatbelt matches rules against
+/// resolved paths, so a rule written with a symlinked path (macOS: /var → /private/var, /tmp →
+/// /private/tmp) would silently never match — leaving "hidden" files readable.
 fn sbpl_str(p: &Path) -> String {
-    let s = p.to_string_lossy();
+    let real = real_path(p);
+    let s = real.to_string_lossy();
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Canonicalize the longest existing prefix of `p` and re-append the rest.
+pub fn real_path(p: &Path) -> PathBuf {
+    let mut existing = p.to_path_buf();
+    let mut tail = Vec::new();
+    while !existing.exists() {
+        match (existing.file_name().map(|s| s.to_os_string()), existing.parent()) {
+            (Some(n), Some(parent)) => {
+                tail.push(n);
+                existing = parent.to_path_buf();
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
+    let mut r = existing.canonicalize().unwrap_or(existing);
+    for t in tail.iter().rev() {
+        r.push(t);
+    }
+    r
 }
 
 /// Seatbelt profile with the same policy as the bubblewrap sandbox. Differences forced by the
@@ -312,6 +336,31 @@ mod tests {
         assert!(p.find(".git\"))").unwrap() > p.find("(subpath \"/Users/u/proj\")").unwrap());
         let open = seatbelt_profile(Path::new("/w"), &SandboxSpec { network: true, protect_git: false, ..Default::default() });
         assert!(!open.contains("network") && !open.contains("/w/.git\""), "{open}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seatbelt_rules_use_real_paths() {
+        // Regression (found by macOS CI): Seatbelt matches resolved paths, so symlinked paths in
+        // rules never matched — e.g. a hidden dir under /var/folders (→ /private/var/folders).
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().canonicalize().unwrap().join("real");
+        std::fs::create_dir_all(real.join("ws")).unwrap();
+        std::fs::create_dir_all(real.join("vault")).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let spec = SandboxSpec {
+            hide: vec![link.join("vault").display().to_string()],
+            overlay: Some(vec![]),
+            protect_git: true,
+            network: true,
+            ..Default::default()
+        };
+        let p = seatbelt_profile(&link.join("ws"), &spec);
+        assert!(p.contains(&format!("(subpath \"{}\")", real.join("ws").display())), "workspace resolved: {p}");
+        assert!(p.contains(&format!("(subpath \"{}\"))", real.join("vault").display())), "hidden dir resolved: {p}");
+        assert!(p.contains(&format!("{}\"))", real.join("ws/.git").display())), "non-existent .git resolved via parent: {p}");
+        assert!(!p.contains(&link.display().to_string()), "no symlinked path may remain: {p}");
     }
 
     #[cfg(target_os = "macos")]
