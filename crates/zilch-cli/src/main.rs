@@ -223,12 +223,14 @@ async fn real_main() -> Result<i32> {
 async fn doctor(cfg: &Config, providers: &zilch_core::llm::Providers) -> Result<i32> {
     println!("workspace   {}", cfg.cwd.display());
     println!(
-        "approval    {:?} · sandbox {} · max workers {} · token cap {}",
+        "approval    {:?} · file sandbox {} · max workers {} · token cap {}",
         cfg.approval,
         if cfg.sandbox { "on" } else { "OFF" },
         cfg.max_workers,
         cfg.max_session_tokens.map_or("none".into(), |t| t.to_string())
     );
+    let (confined, why) = zilch_core::tools::sandbox::status(cfg.bash_sandbox, cfg.bash_network);
+    println!("bash        {} {why}", if confined { "✓" } else { "⚠" });
     println!("\nproviders");
     for (name, p) in &cfg.providers {
         let key = match (&p.api_key, &p.api_key_env) {
@@ -330,12 +332,16 @@ async fn banner(team: &Team, screen: &SharedScreen) {
     let (c, b, d, r) = (s.c(CYAN), s.c(BOLD), s.c(DIM), s.c(RESET));
     let workers: Vec<String> = cfg.workers().map(|p| format!("{} {d}({}){r}", p.name, p.binding.key())).collect();
     let msg = format!(
-        "{c}{b}zilch{r} {d}· {}{r}\n  master  {d}{}{r}\n  workers {}\n  {d}max {} parallel · approval: {:?} · /help for commands{r}",
+        "{c}{b}zilch{r} {d}· {}{r}\n  master  {d}{}{r}\n  workers {}\n  {d}max {} parallel · approval: {:?} · /help for commands{r}{}",
         cfg.cwd.display(),
         cfg.master().binding.key(),
         workers.join(", "),
         cfg.max_workers,
         cfg.approval,
+        match zilch_core::tools::sandbox::status(cfg.bash_sandbox, cfg.bash_network) {
+            (true, _) => String::new(),
+            (false, why) => format!("\n  {}⚠ bash sandbox {why}{r}", s.c(render::YELLOW)),
+        },
     );
     s.line(&msg);
 }

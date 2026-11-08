@@ -223,6 +223,13 @@ impl Team {
             sandbox: cfg.sandbox,
             secret_env: cfg.providers.values().filter_map(|p| p.api_key_env.clone()).collect(),
             env_passthrough: cfg.bash_env_passthrough.clone(),
+            bash_sandbox: cfg.bash_sandbox,
+            bash: crate::tools::sandbox::SandboxSpec {
+                network: cfg.bash_network,
+                hide: cfg.bash_hide.clone(),
+                writable: cfg.bash_writable.clone(),
+                overlay: cfg.bash_overlay.clone(),
+            },
         });
         let shared = Arc::new(TeamShared {
             pool: WorkerPool::new(cfg.max_workers),

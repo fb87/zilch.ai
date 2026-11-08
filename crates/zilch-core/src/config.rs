@@ -5,6 +5,7 @@ use crate::llm::openai::OpenAiClient;
 use crate::llm::{ModelBinding, Providers};
 use crate::profile::{AgentRole, Profile, PromptMode};
 use crate::prompt;
+use crate::tools::sandbox::BashSandbox;
 use crate::tools::COORDINATION_TOOLS;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -107,6 +108,11 @@ pub struct FileConfig {
     pub approval: Option<ApprovalMode>,
     pub sandbox: Option<bool>,
     pub bash_env_passthrough: Option<Vec<String>>,
+    pub bash_sandbox: Option<BashSandbox>,
+    pub bash_network: Option<bool>,
+    pub bash_hide: Option<Vec<String>>,
+    pub bash_writable: Option<Vec<String>>,
+    pub bash_overlay: Option<Vec<String>>,
     pub max_session_tokens: Option<u64>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderCfg>,
@@ -135,6 +141,16 @@ pub struct Config {
     pub sandbox: bool,
     /// Secret-looking env vars still passed to bash (e.g. GITHUB_TOKEN).
     pub bash_env_passthrough: Vec<String>,
+    /// OS sandbox for bash: off | auto (default: bubblewrap when available) | bwrap (required).
+    pub bash_sandbox: BashSandbox,
+    /// Whether sandboxed commands get network access (default true).
+    pub bash_network: bool,
+    /// Extra paths hidden from sandboxed commands.
+    pub bash_hide: Vec<String>,
+    /// Extra writable paths for sandboxed commands (e.g. "~/.cache/pip").
+    pub bash_writable: Vec<String>,
+    /// Copy-on-write paths for sandboxed commands (None = default tool caches).
+    pub bash_overlay: Option<Vec<String>>,
     /// Team-wide token cap per session (prompt + completion), None = unlimited.
     pub max_session_tokens: Option<u64>,
     pub providers: BTreeMap<String, ProviderCfg>,
@@ -231,6 +247,11 @@ impl Config {
             approval: ov.approval.or(fc.approval).unwrap_or_default(),
             sandbox: fc.sandbox.unwrap_or(true),
             bash_env_passthrough: fc.bash_env_passthrough.unwrap_or_default(),
+            bash_sandbox: fc.bash_sandbox.unwrap_or_default(),
+            bash_network: fc.bash_network.unwrap_or(true),
+            bash_hide: fc.bash_hide.unwrap_or_default(),
+            bash_writable: fc.bash_writable.unwrap_or_default(),
+            bash_overlay: fc.bash_overlay,
             max_session_tokens: ov.max_session_tokens.or(fc.max_session_tokens),
             providers: fc.providers,
             profiles,
@@ -287,6 +308,11 @@ fn merge_file(dst: &mut FileConfig, src: FileConfig, base: &Path) {
     merge_opt(&mut dst.approval, src.approval);
     merge_opt(&mut dst.sandbox, src.sandbox);
     merge_opt(&mut dst.bash_env_passthrough, src.bash_env_passthrough);
+    merge_opt(&mut dst.bash_sandbox, src.bash_sandbox);
+    merge_opt(&mut dst.bash_network, src.bash_network);
+    merge_opt(&mut dst.bash_hide, src.bash_hide);
+    merge_opt(&mut dst.bash_writable, src.bash_writable);
+    merge_opt(&mut dst.bash_overlay, src.bash_overlay);
     merge_opt(&mut dst.max_session_tokens, src.max_session_tokens);
     for (k, v) in src.providers {
         dst.providers.entry(k).or_default().merge(v);

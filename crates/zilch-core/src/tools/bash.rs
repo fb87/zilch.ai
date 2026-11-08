@@ -1,3 +1,4 @@
+use super::sandbox::{bwrap_args, bwrap_available, BashSandbox};
 use super::{arg_opt_u64, arg_str, truncate_output, Tool, ToolCtx};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -52,10 +53,29 @@ impl Tool for Bash {
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<String> {
         let cmd = arg_str(&args, "command")?;
         let timeout = Duration::from_secs(arg_opt_u64(&args, "timeout_secs").unwrap_or(120).clamp(1, 600));
-        let mut command = tokio::process::Command::new("bash");
+        let sandboxed = match ctx.policy.bash_sandbox {
+            BashSandbox::Off => false,
+            BashSandbox::Auto => bwrap_available(),
+            BashSandbox::Bwrap => {
+                if !bwrap_available() {
+                    anyhow::bail!("bash sandbox is required (bash_sandbox = \"bwrap\") but bubblewrap is not available or not permitted on this machine");
+                }
+                true
+            }
+        };
+        let mut command = if sandboxed {
+            let workspace = ctx.cwd.canonicalize().unwrap_or_else(|_| ctx.cwd.clone());
+            let mut c = tokio::process::Command::new("bwrap");
+            c.args(bwrap_args(&workspace, &ctx.policy.bash)).arg("--").arg("bash");
+            c
+        } else {
+            tokio::process::Command::new("bash")
+        };
         command
             .arg("-c")
-            .arg(format!("{cmd} 2>&1"))
+            // `exec 2>&1` merges stderr for EVERY command; a trailing `2>&1` only covered the last
+            // one, silently dropping e.g. compiler errors in `cargo build; echo done`.
+            .arg(format!("exec 2>&1\n{cmd}"))
             .current_dir(&ctx.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -134,12 +154,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stderr_of_every_command_is_captured() {
+        // Regression: a trailing `2>&1` only applied to the last command of a list.
+        let dir = tempfile::tempdir().unwrap();
+        let c =
+            ctx(dir.path()).with_policy(Arc::new(crate::tools::ToolPolicy { bash_sandbox: BashSandbox::Off, ..Default::default() }), None);
+        let out = Bash.call(json!({"command": "echo first-error >&2; ls /definitely/missing; echo done"}), &c).await.unwrap();
+        assert!(out.contains("first-error") && out.contains("No such file") && out.contains("done"), "{out}");
+    }
+
+    #[tokio::test]
     async fn timeout_kills_the_group() {
         let dir = tempfile::tempdir().unwrap();
         let t = Instant::now();
         let out = Bash.call(json!({"command": "sleep 30 & sleep 30", "timeout_secs": 1}), &ctx(dir.path())).await.unwrap();
         assert!(out.contains("timed out after 1s"), "{out}");
         assert!(t.elapsed() < Duration::from_secs(4));
+    }
+
+    fn sandboxed_ctx(dir: &std::path::Path, network: bool, hide: Vec<String>) -> ToolCtx {
+        let policy = crate::tools::ToolPolicy {
+            bash_sandbox: BashSandbox::Bwrap,
+            bash: crate::tools::sandbox::SandboxSpec { network, hide, writable: vec![], overlay: None },
+            ..Default::default()
+        };
+        ctx(dir).with_policy(Arc::new(policy), None)
+    }
+
+    #[tokio::test]
+    async fn bwrap_confines_commands() {
+        if !bwrap_available() {
+            eprintln!("skipping: bubblewrap not available");
+            return;
+        }
+        let outer = tempfile::tempdir().unwrap();
+        let ws = outer.path().join("ws");
+        let vault = outer.path().join("vault");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(vault.join("id_rsa"), "PRIVATE-KEY-DATA").unwrap();
+        std::fs::write(outer.path().join("notes.txt"), "readable").unwrap(); // on host /tmp
+        let c = sandboxed_ctx(&ws, false, vec![vault.display().to_string()]);
+        let run = |cmd: String| {
+            let c = &c;
+            async move { Bash.call(json!({"command": cmd}), c).await.unwrap() }
+        };
+
+        // Hidden secrets are invisible; other host files stay readable (toolchains, sources).
+        let out = run(format!("cat {}/id_rsa; ls -A {} | wc -l", vault.display(), vault.display())).await;
+        assert!(!out.contains("PRIVATE-KEY-DATA") && out.lines().any(|l| l.trim() == "0"), "{out}");
+        assert!(out.contains("No such file"), "stderr of earlier commands must be captured: {out}");
+        // Host files outside /tmp stay readable (toolchains, sources); host /tmp is private.
+        let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        assert!(run(format!("cat {manifest}")).await.contains("zilch-core"));
+        let out = run(format!("cat {}/notes.txt", outer.path().display())).await;
+        assert!(!out.contains("readable"), "host /tmp must not be visible: {out}");
+
+        // Host filesystem is read-only; nothing written outside the workspace reaches the host.
+        let probe = concat!(env!("CARGO_MANIFEST_DIR"), "/.zilch-sandbox-probe");
+        let out = run(format!("touch {probe}; touch {}/evil; echo done", outer.path().display())).await;
+        let leaked = std::path::Path::new(probe).exists();
+        let _ = std::fs::remove_file(probe);
+        assert!(out.contains("Read-only file system") && !leaked, "{out}");
+        assert!(!outer.path().join("evil").exists(), "write escaped to host /tmp");
+        let out = run("echo hi > made.txt && f=$(mktemp) && echo ok > $f && cat $f".into()).await;
+        assert!(out.contains("ok") && ws.join("made.txt").exists(), "{out}");
+
+        // No network: only loopback in the namespace.
+        let out = run("tail -n +3 /proc/net/dev | grep -v ' lo:' | wc -l".into()).await;
+        assert!(out.trim_start().starts_with('0'), "network interfaces visible: {out}");
+
+        // Own PID namespace: host processes are invisible.
+        let out = run("ls /proc | grep -c '^[0-9]'".into()).await;
+        let n: usize = out.lines().next().unwrap().trim().parse().unwrap();
+        assert!(n < 10, "saw {n} processes: {out}");
+    }
+
+    #[tokio::test]
+    async fn bwrap_network_can_be_enabled_and_children_are_killed() {
+        if !bwrap_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let c = sandboxed_ctx(dir.path(), true, vec![]);
+        let out = Bash.call(json!({"command": "tail -n +3 /proc/net/dev | wc -l"}), &c).await.unwrap();
+        assert!(!out.trim_start().starts_with('0'), "{out}");
+        let marker = dir.path().join("alive");
+        let out = Bash.call(json!({"command": format!("(sleep 2; touch {}) & echo bg", marker.display())}), &c).await.unwrap();
+        assert!(out.contains("bg"));
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(!marker.exists(), "sandboxed background child outlived the call");
     }
 
     #[test]

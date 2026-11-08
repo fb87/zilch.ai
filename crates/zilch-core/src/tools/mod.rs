@@ -4,6 +4,7 @@ pub mod bash;
 pub mod delegate;
 pub mod edit;
 pub mod fs;
+pub mod sandbox;
 pub mod search;
 pub mod todo_tools;
 
@@ -98,11 +99,21 @@ pub struct ToolPolicy {
     pub secret_env: Vec<String>,
     /// Variables passed to `bash` even if they look secret (e.g. `GITHUB_TOKEN` for `gh`).
     pub env_passthrough: Vec<String>,
+    /// OS-level sandbox for `bash` (bubblewrap).
+    pub bash_sandbox: sandbox::BashSandbox,
+    /// What sandboxed commands may reach (network, extra hidden/writable paths).
+    pub bash: sandbox::SandboxSpec,
 }
 
 impl Default for ToolPolicy {
     fn default() -> Self {
-        Self { sandbox: true, secret_env: vec![], env_passthrough: vec![] }
+        Self {
+            sandbox: true,
+            secret_env: vec![],
+            env_passthrough: vec![],
+            bash_sandbox: sandbox::BashSandbox::Auto,
+            bash: sandbox::SandboxSpec { network: true, ..Default::default() },
+        }
     }
 }
 
