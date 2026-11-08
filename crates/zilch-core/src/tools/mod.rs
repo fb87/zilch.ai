@@ -114,7 +114,7 @@ impl Default for ToolPolicy {
             secret_env: vec![],
             env_passthrough: vec![],
             bash_sandbox: sandbox::BashSandbox::Auto,
-            bash: sandbox::SandboxSpec { network: true, ..Default::default() },
+            bash: sandbox::SandboxSpec { network: true, protect_git: true, ..Default::default() },
         }
     }
 }

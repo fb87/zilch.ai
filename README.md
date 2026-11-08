@@ -170,3 +170,36 @@ zilch --no-session            # don't save
 On resume, TODOs that were in progress go back to pending, a crash mid-turn is trimmed back to a
 consistent point, and workers must re-read files before editing them (stale-edit protection is
 never trusted across processes). `/clear` starts a new session; the old one stays resumable.
+
+## Protocols, costs and releases
+
+**Protocols** — each provider speaks one of:
+```toml
+[providers.openai]     # default
+protocol = "chat"      # POST {base}/chat/completions
+[providers.oai-resp]
+protocol = "responses" # POST {base}/responses   (OpenAI Responses API)
+[providers.anthropic]
+base_url = "https://api.anthropic.com/v1"
+api_key_env = "ANTHROPIC_API_KEY"
+protocol = "anthropic" # POST {base}/messages    (x-api-key auth)
+```
+
+**Costs** — at startup zilch reads each provider's `{base}/models` (OpenCode and OpenRouter
+publish prices and context windows) so `/usage`, the REPL footer and `--doctor` show USD, and
+`context_tokens` defaults to the model's real context window. Override or fill in prices per role
+with `price_in` / `price_out` (USD per 1M tokens); `discover = false` on a provider skips the lookup.
+`max_session_cost = 5.0` (or `--max-cost 5`) stops the team before a request would exceed the cap;
+`max_session_tokens` likewise, both checked **before** sending.
+
+**Sandbox on macOS** — `bash` runs under `sandbox-exec` with the same policy (writes limited to the
+workspace, temp dirs and tool caches; secrets and the Keychain hidden; optional no-network). No
+copy-on-write there, so caches are writable directly. `bash_sandbox = "required"` refuses to run
+commands without an OS sandbox on either platform. `.git/` is read-only to commands by default
+(`bash_protect_git = false` to let agents commit).
+
+**Releases** — pushing a `v*` tag builds and tests Linux (gnu + static musl, x86_64 + aarch64) and
+macOS (Intel + Apple Silicon) binaries and publishes them with `SHA256SUMS`:
+```sh
+curl -LO https://github.com/<owner>/zilch/releases/latest/download/zilch-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz
+```

@@ -1,4 +1,6 @@
-use super::sandbox::{bwrap_args, bwrap_available, BashSandbox};
+#[cfg(test)]
+use super::sandbox::bwrap_available;
+use super::sandbox::{self, BashSandbox};
 use super::{arg_opt_u64, arg_str, truncate_output, Tool, ToolCtx};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -55,18 +57,19 @@ impl Tool for Bash {
         let timeout = Duration::from_secs(arg_opt_u64(&args, "timeout_secs").unwrap_or(120).clamp(1, 600));
         let sandboxed = match ctx.policy.bash_sandbox {
             BashSandbox::Off => false,
-            BashSandbox::Auto => bwrap_available(),
+            BashSandbox::Auto => sandbox::available(),
             BashSandbox::Bwrap => {
-                if !bwrap_available() {
-                    anyhow::bail!("bash sandbox is required (bash_sandbox = \"bwrap\") but bubblewrap is not available or not permitted on this machine");
+                if !sandbox::available() {
+                    anyhow::bail!("bash sandbox is required (bash_sandbox = \"required\") but no OS sandbox (bubblewrap / sandbox-exec) works on this machine");
                 }
                 true
             }
         };
         let mut command = if sandboxed {
             let workspace = ctx.cwd.canonicalize().unwrap_or_else(|_| ctx.cwd.clone());
-            let mut c = tokio::process::Command::new("bwrap");
-            c.args(bwrap_args(&workspace, &ctx.policy.bash)).arg("--").arg("bash");
+            let (program, args) = sandbox::wrapper(&workspace, &ctx.policy.bash);
+            let mut c = tokio::process::Command::new(program);
+            c.args(args).arg("bash");
             c
         } else {
             tokio::process::Command::new("bash")
@@ -175,7 +178,7 @@ mod tests {
     fn sandboxed_ctx(dir: &std::path::Path, network: bool, hide: Vec<String>) -> ToolCtx {
         let policy = crate::tools::ToolPolicy {
             bash_sandbox: BashSandbox::Bwrap,
-            bash: crate::tools::sandbox::SandboxSpec { network, hide, writable: vec![], overlay: None },
+            bash: crate::tools::sandbox::SandboxSpec { network, hide, writable: vec![], overlay: None, protect_git: true },
             ..Default::default()
         };
         ctx(dir).with_policy(Arc::new(policy), None)
@@ -255,5 +258,40 @@ mod tests {
         for s in ["PATH", "HOME", "GITHUB_TOKEN", "TOKENIZERS_PARALLELISM"] {
             assert!(!p.is_secret_env(s), "{s}");
         }
+    }
+
+    #[tokio::test]
+    async fn bwrap_protects_git_metadata() {
+        if !bwrap_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| std::process::Command::new("git").args(args).current_dir(dir.path()).output().unwrap();
+        git(&["init", "-q"]);
+        std::fs::write(dir.path().join("f.txt"), "v1").unwrap();
+        git(&["add", "."]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
+        let c = sandboxed_ctx(dir.path(), false, vec![]);
+        let out = Bash
+            .call(json!({"command": "echo pwned > .git/hooks/pre-commit; git commit --allow-empty -qm evil 2>&1 | head -2; echo v2 > f.txt && echo edited; git status --short; git log --oneline | wc -l"}), &c)
+            .await
+            .unwrap();
+        assert!(out.contains("Read-only file system"), "{out}");
+        assert!(!dir.path().join(".git/hooks/pre-commit").exists(), "hook planted");
+        assert!(out.contains("edited") && out.contains(" M f.txt"), "workspace still writable, git status works: {out}");
+        let log = String::from_utf8_lossy(&git(&["log", "--oneline"]).stdout).lines().count();
+        assert_eq!(log, 1, "history must be unchanged");
+        // Opt-out restores normal git usage.
+        let open = ctx(dir.path()).with_policy(
+            Arc::new(crate::tools::ToolPolicy {
+                bash_sandbox: BashSandbox::Bwrap,
+                bash: crate::tools::sandbox::SandboxSpec { network: false, protect_git: false, ..Default::default() },
+                ..Default::default()
+            }),
+            None,
+        );
+        let out =
+            Bash.call(json!({"command": "git -c user.name=t -c user.email=t@t commit -qam ok && echo committed"}), &open).await.unwrap();
+        assert!(out.contains("committed"), "{out}");
     }
 }

@@ -125,6 +125,7 @@ pub struct FileConfig {
     pub bash_hide: Option<Vec<String>>,
     pub bash_writable: Option<Vec<String>>,
     pub bash_overlay: Option<Vec<String>>,
+    pub bash_protect_git: Option<bool>,
     pub max_session_tokens: Option<u64>,
     pub max_session_cost: Option<f64>,
     #[serde(default)]
@@ -165,6 +166,8 @@ pub struct Config {
     pub bash_writable: Vec<String>,
     /// Copy-on-write paths for sandboxed commands (None = default tool caches).
     pub bash_overlay: Option<Vec<String>>,
+    /// Make the workspace .git/ read-only for sandboxed commands (default true).
+    pub bash_protect_git: bool,
     /// Team-wide token cap per session (prompt + completion), None = unlimited.
     pub max_session_tokens: Option<u64>,
     /// Team-wide spend cap in USD per session (needs known prices), None = unlimited.
@@ -268,6 +271,7 @@ impl Config {
             bash_hide: fc.bash_hide.unwrap_or_default(),
             bash_writable: fc.bash_writable.unwrap_or_default(),
             bash_overlay: fc.bash_overlay,
+            bash_protect_git: fc.bash_protect_git.unwrap_or(true),
             max_session_tokens: ov.max_session_tokens.or(fc.max_session_tokens),
             max_session_cost: ov.max_session_cost.or(fc.max_session_cost),
             providers: fc.providers,
@@ -331,6 +335,7 @@ fn merge_file(dst: &mut FileConfig, src: FileConfig, base: &Path) {
     merge_opt(&mut dst.bash_hide, src.bash_hide);
     merge_opt(&mut dst.bash_writable, src.bash_writable);
     merge_opt(&mut dst.bash_overlay, src.bash_overlay);
+    merge_opt(&mut dst.bash_protect_git, src.bash_protect_git);
     merge_opt(&mut dst.max_session_tokens, src.max_session_tokens);
     merge_opt(&mut dst.max_session_cost, src.max_session_cost);
     for (k, v) in src.providers {

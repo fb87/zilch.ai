@@ -295,6 +295,7 @@ impl Team {
                 hide: cfg.bash_hide.clone(),
                 writable: cfg.bash_writable.clone(),
                 overlay: cfg.bash_overlay.clone(),
+                protect_git: cfg.bash_protect_git,
             },
         });
         let shared = Arc::new(TeamShared {
