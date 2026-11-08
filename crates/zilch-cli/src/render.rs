@@ -37,6 +37,14 @@ pub struct Screen {
     worker_text: HashMap<String, String>,
     pub usage: BTreeMap<(String, String), Usage>,
     pub cost: BTreeMap<(String, String), f64>,
+    /// Animate the status panel with cursor movement (off in the REPL: the input line is live).
+    pub live_panel: bool,
+    /// Lane-aware output (REPL): only the active lane streams; the other one is summarized.
+    pub lanes: bool,
+    /// Agent id of the active lane: "master" (/code) or "spec" (/spec).
+    pub active: String,
+    /// Answers produced by a background lane, shown when the user switches to it.
+    background_answer: HashMap<String, String>,
 }
 
 pub type SharedScreen = Arc<Mutex<Screen>>;
@@ -77,6 +85,10 @@ impl Screen {
             worker_text: HashMap::new(),
             usage: BTreeMap::new(),
             cost: BTreeMap::new(),
+            live_panel: true,
+            lanes: false,
+            active: "master".into(),
+            background_answer: HashMap::new(),
         }))
     }
 
@@ -119,7 +131,7 @@ impl Screen {
     }
 
     fn draw_panel(&mut self) {
-        if !self.at_line_start || !self.color {
+        if !self.at_line_start || !self.color || !self.live_panel {
             let _ = self.out.flush();
             return;
         }
@@ -187,7 +199,7 @@ impl Screen {
         if self.busy.is_empty() {
             return;
         }
-        if self.color {
+        if self.color && self.live_panel {
             if self.at_line_start {
                 self.clear_panel();
                 self.draw_panel();
@@ -199,7 +211,8 @@ impl Screen {
             let secs = b.since.elapsed().as_secs();
             if secs >= 30 && secs / 30 > b.noted {
                 b.noted = secs / 30;
-                notes.push(format!("… {agent} still running {} ({})", b.label, fmt_secs(secs)));
+                let what = if b.label == "thinking" { "still thinking".to_string() } else { format!("still running {}", b.label) };
+                notes.push(format!("… {agent} {what} ({})", fmt_secs(secs)));
             }
         }
         for n in notes {
@@ -207,8 +220,94 @@ impl Screen {
         }
     }
 
+    /// The lane an agent belongs to: the spec master is its own lane; master and workers are code.
+    fn lane_of(agent: &str) -> &'static str {
+        if agent == "spec" {
+            "spec"
+        } else {
+            "master"
+        }
+    }
+
+    fn lane_name(root: &str) -> &'static str {
+        if root == "spec" {
+            "spec"
+        } else {
+            "code"
+        }
+    }
+
+    /// Lane routing (REPL). Returns true if the event should be handled normally. Events of the
+    /// background lane update its status silently, its answer is buffered for later, and a short
+    /// notice appears when it finishes; important events (TODO changes, notices, costs) always
+    /// pass through.
+    fn route_background(&mut self, ev: &AgentEvent) -> bool {
+        let lane = Self::lane_of(&ev.agent);
+        if lane == self.active {
+            return true;
+        }
+        let root = ev.agent == lane;
+        match &ev.kind {
+            EventKind::TextDelta(t) if root => {
+                self.background_answer.entry(ev.agent.clone()).or_default().push_str(t);
+                false
+            }
+            EventKind::Thinking => {
+                self.set_busy(&ev.agent, "thinking".into());
+                false
+            }
+            EventKind::ToolStart { name, summary, .. } => {
+                self.set_busy(&ev.agent, format!("{name}({summary})"));
+                false
+            }
+            EventKind::ToolProgress { line, .. } => {
+                if let Some(b) = self.busy.get_mut(&ev.agent) {
+                    b.progress = Some(line.clone());
+                }
+                false
+            }
+            EventKind::Idle if root => {
+                self.busy.remove(&ev.agent);
+                let name = Self::lane_name(lane);
+                let has_answer = self.background_answer.get(&ev.agent).is_some_and(|a| !a.trim().is_empty());
+                let msg = if has_answer {
+                    format!("{}✓ {name} lane finished — /{name} to see its answer{}", self.c(GREEN), self.c(RESET))
+                } else {
+                    format!("{}✓ {name} lane finished{}", self.c(GREEN), self.c(RESET))
+                };
+                self.line(&msg);
+                false
+            }
+            EventKind::Idle => {
+                self.busy.remove(&ev.agent);
+                false
+            }
+            EventKind::TodosChanged(_) | EventKind::Notice(_) | EventKind::Usage { .. } | EventKind::TodoStatus { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Make `root` ("master" or "spec") the foreground lane and show anything it said meanwhile.
+    pub fn switch_lane(&mut self, root: &str) {
+        self.active = root.to_string();
+        if let Some(answer) = self.background_answer.remove(root).filter(|a| !a.trim().is_empty()) {
+            let msg = format!(
+                "{}── {} lane answered while you were away ──{}\n{}",
+                self.c(DIM),
+                Self::lane_name(root),
+                self.c(RESET),
+                answer.trim_end()
+            );
+            self.line(&msg);
+        }
+    }
+
     pub fn handle(&mut self, ev: AgentEvent) {
-        let master = ev.agent == "master";
+        if self.lanes && !self.route_background(&ev) {
+            return;
+        }
+        // The lane root (master or spec) gets the full treatment; workers are summarized.
+        let master = ev.agent == "master" || ev.agent == "spec";
         match ev.kind {
             EventKind::TextDelta(t) if master => {
                 if !self.stream_master {
@@ -505,6 +604,39 @@ pub fn spawn_renderer(
             }
         }
     })
+}
+
+/// `Write` adapter for the REPL: complete lines are handed to rustyline's external printer, which
+/// prints them above the input line and redraws what the user is typing, so output from either
+/// lane never garbles the prompt.
+pub struct PrinterOut {
+    printer: Box<dyn rustyline::ExternalPrinter + Send>,
+    buf: Vec<u8>,
+}
+
+impl PrinterOut {
+    pub fn new(printer: Box<dyn rustyline::ExternalPrinter + Send>) -> Self {
+        Self { printer, buf: Vec::new() }
+    }
+}
+
+impl Write for PrinterOut {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        while let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=pos).collect();
+            let text = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
+            // rustyline writes the message as-is in raw mode (no output post-processing), and only
+            // appends a bare "\n" when the message lacks one: end with "\r\n" ourselves so lines
+            // start at column 0 instead of drifting right ("staircase").
+            self.printer.print(format!("{text}\r\n")).map_err(std::io::Error::other)?;
+        }
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        // Partial lines (streaming text) are kept until their newline arrives.
+        Ok(())
+    }
 }
 
 #[cfg(test)]

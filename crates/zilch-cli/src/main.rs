@@ -1,4 +1,5 @@
 mod approver;
+mod inbox;
 mod log;
 mod render;
 
@@ -64,6 +65,9 @@ struct Cli {
     /// Don't save this session.
     #[arg(long)]
     no_session: bool,
+    /// Lane for -p: "code" (default, plan + implement) or "spec" (requirements interview).
+    #[arg(long, value_parser = ["code", "spec"], default_value = "code")]
+    lane: String,
     /// Check configuration and connectivity of every configured model, then exit.
     #[arg(long)]
     doctor: bool,
@@ -181,10 +185,20 @@ async fn real_main() -> Result<i32> {
 
     let one_shot = cli.prompt.is_some();
     let tty = std::io::stdout().is_terminal();
-    // In -p mode progress goes to stderr and the final answer to stdout.
-    let out: Box<dyn std::io::Write + Send> = if one_shot { Box::new(std::io::stderr()) } else { Box::new(std::io::stdout()) };
+    // In -p mode progress goes to stderr and the final answer to stdout. In the REPL, output is
+    // printed above the live input line (both lanes can produce output while the user types).
+    let mut editor = if one_shot { None } else { Some(rustyline::DefaultEditor::new()?) };
+    let out: Box<dyn std::io::Write + Send> = match editor.as_mut() {
+        None => Box::new(std::io::stderr()),
+        Some(rl) => Box::new(render::PrinterOut::new(Box::new(rl.create_external_printer()?))),
+    };
     let color = if one_shot { std::io::stderr().is_terminal() } else { tty } && std::env::var_os("NO_COLOR").is_none();
     let screen = Screen::new(out, if one_shot { 2 } else { 1 }, color, cli.verbose, !one_shot);
+    if !one_shot {
+        let mut s = screen.lock().await;
+        s.live_panel = false; // cursor movement would corrupt the line being typed
+        s.lanes = true;
+    }
 
     let mut event_log = None;
     if !cli.no_log {
@@ -202,8 +216,14 @@ async fn real_main() -> Result<i32> {
 
     let (sink, rx) = EventSink::new();
     let renderer = render::spawn_renderer(screen.clone(), rx, event_log);
-    let approver: Arc<dyn Approver> = Arc::new(approver::TerminalApprover(screen.clone()));
-    let reviewer: Arc<dyn PlanReviewer> = Arc::new(approver::TerminalReviewer(screen.clone()));
+    // -p: agents may prompt on the terminal directly. REPL: the line editor owns the keyboard, so
+    // questions go through the inbox and are answered by the next input line.
+    let inbox = inbox::Inbox::new(screen.clone());
+    let (approver, reviewer): (Arc<dyn Approver>, Arc<dyn PlanReviewer>) = if one_shot {
+        (Arc::new(approver::TerminalApprover(screen.clone())), Arc::new(approver::TerminalReviewer(screen.clone())))
+    } else {
+        (Arc::new(inbox::ReplApprover(inbox.clone())), Arc::new(inbox::ReplReviewer(inbox.clone())))
+    };
     let mut team = Team::new(cfg, providers, approver, reviewer, sink)?;
     let store = if cli.no_session { None } else { session::SessionStore::default_store() };
     if let Some(s) = store.clone() {
@@ -262,7 +282,7 @@ async fn real_main() -> Result<i32> {
         if let Some(piped) = read_piped_stdin().filter(|p| !p.trim().is_empty()) {
             prompt = format!("{prompt}\n\n<stdin>\n{piped}\n</stdin>");
         }
-        let res = team.run(&prompt).await;
+        let res = if cli.lane == "spec" { team.run_spec(&prompt).await } else { team.run(&prompt).await };
         // The Ctrl-C task keeps the event sink alive, so give the renderer a moment instead of joining it.
         tokio::time::sleep(Duration::from_millis(50)).await;
         renderer.abort();
@@ -288,7 +308,7 @@ async fn real_main() -> Result<i32> {
         });
     }
 
-    repl(team, screen, log_path, recap).await?;
+    repl(team, screen, log_path, recap, editor.expect("line editor exists in REPL mode"), inbox).await?;
     Ok(0)
 }
 
@@ -361,7 +381,42 @@ async fn doctor(
     Ok(if failures == 0 { 0 } else { 1 })
 }
 
-async fn repl(team: Arc<Team>, screen: SharedScreen, log_path: Option<std::path::PathBuf>, recap: Option<String>) -> Result<()> {
+/// The two interaction lanes. Switching only changes which one receives input; both keep running.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    Code,
+    Spec,
+}
+
+impl Lane {
+    fn root(self) -> &'static str {
+        match self {
+            Lane::Code => "master",
+            Lane::Spec => "spec",
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Lane::Code => "code",
+            Lane::Spec => "spec",
+        }
+    }
+    fn other(self) -> Lane {
+        match self {
+            Lane::Code => Lane::Spec,
+            Lane::Spec => Lane::Code,
+        }
+    }
+}
+
+async fn repl(
+    team: Arc<Team>,
+    screen: SharedScreen,
+    log_path: Option<std::path::PathBuf>,
+    recap: Option<String>,
+    mut rl: rustyline::DefaultEditor,
+    inbox: Arc<inbox::Inbox>,
+) -> Result<()> {
     banner(&team, &screen).await;
     if let Some(r) = recap {
         let mut s = screen.lock().await;
@@ -371,53 +426,145 @@ async fn repl(team: Arc<Team>, screen: SharedScreen, log_path: Option<std::path:
         let body: Vec<String> = lines.map(|l| format!("{d}{l}{x}")).collect();
         s.line(&format!("\n{c}{head}{x}\n{}\n", body.join("\n")));
     }
-    let mut rl = rustyline::DefaultEditor::new()?;
     let history = dirs::data_dir().map(|d| d.join("zilch").join("history.txt"));
     if let Some(h) = &history {
         let _ = std::fs::create_dir_all(h.parent().unwrap());
         let _ = rl.load_history(h);
     }
+
+    let mut active = Lane::Code;
+    let mut tasks: std::collections::HashMap<&'static str, tokio::task::JoinHandle<()>> = Default::default();
+    let busy = |tasks: &std::collections::HashMap<&'static str, tokio::task::JoinHandle<()>>, lane: Lane| {
+        tasks.get(lane.name()).is_some_and(|h| !h.is_finished())
+    };
+
     loop {
-        let line = tokio::task::block_in_place(|| rl.readline("› "));
-        let line = match line {
+        let prompt = match inbox.prompt() {
+            Some(p) => p.to_string(),
+            None => {
+                // Just the lane: a prompt cannot be updated once shown, so busy markers would go
+                // stale the moment a lane finishes. Finish notices and /status cover activity.
+                format!("[{}] › ", active.name())
+            }
+        };
+        let line = match tokio::task::block_in_place(|| rl.readline(&prompt)) {
             Ok(l) => l,
-            Err(rustyline::error::ReadlineError::Interrupted) => continue,
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                // Ctrl-C cancels the active lane's running turn (the other lane keeps going).
+                if busy(&tasks, active) {
+                    match active {
+                        Lane::Code => team.cancel(),
+                        Lane::Spec => team.cancel_spec(),
+                    }
+                    screen.lock().await.line(&format!("⏹ cancelling the {} lane…", active.name()));
+                } else {
+                    screen.lock().await.line("(Ctrl-D to quit)");
+                }
+                continue;
+            }
             Err(rustyline::error::ReadlineError::Eof) => break,
             Err(e) => return Err(e.into()),
         };
+        // A pending question (approval / plan review) takes the next line as its answer.
+        if inbox.pending() {
+            inbox.answer(&line).await;
+            continue;
+        }
         let input = line.trim();
         if input.is_empty() {
             continue;
         }
         let _ = rl.add_history_entry(input);
-        if input.starts_with('/') {
-            if !command(&team, &screen, input).await {
-                break;
+
+        match input {
+            "/spec" | "/code" => {
+                active = if input == "/spec" { Lane::Spec } else { Lane::Code };
+                let mut s = screen.lock().await;
+                s.switch_lane(active.root());
+                let msg = match active {
+                    Lane::Spec => format!(
+                        "{}→ spec lane: requirements engineering. {}{}",
+                        s.c(CYAN),
+                        team.spec_status().describe(&team.shared.spec_store.dir),
+                        s.c(RESET)
+                    ),
+                    Lane::Code => {
+                        format!("{}→ code lane: planning and implementation (works from plan.md/design.md).{}", s.c(CYAN), s.c(RESET))
+                    }
+                };
+                s.line(&msg);
+                continue;
             }
+            "/status" => {
+                let mut s = screen.lock().await;
+                let lane = |l: Lane| if busy(&tasks, l) { "working" } else { "idle" };
+                let msg = format!(
+                    "lanes: code {} · spec {} (active: {})\n{}",
+                    lane(Lane::Code),
+                    lane(Lane::Spec),
+                    active.name(),
+                    team.spec_status().describe(&team.shared.spec_store.dir)
+                );
+                s.line(&msg);
+                continue;
+            }
+            _ if input.starts_with('/') => {
+                if !command(&team, &screen, input).await {
+                    break;
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        if busy(&tasks, active) {
+            screen.lock().await.line(&format!(
+                "The {} lane is still working on your previous message. Wait for it, switch lanes (/{}), or press Ctrl-C to cancel it.",
+                active.name(),
+                active.other().name()
+            ));
             continue;
         }
-        let (before_in, before_out) = screen.lock().await.total_tokens();
-        let before_cost = screen.lock().await.total_cost();
-        let res = team.run(input).await;
-        // Let the renderer drain pending events before printing the footer.
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        let mut s = screen.lock().await;
-        let (i, o) = s.total_tokens();
-        let msg = match res {
-            Ok(_) => {
-                let cost = match (s.total_cost(), before_cost) {
-                    (Some(now), b) => format!(" · ${:.4} (session ${now:.4})", now - b.unwrap_or(0.0)),
-                    _ => String::new(),
-                };
-                format!("{}↳ tokens: +{} in / +{} out{cost}{}", s.c(DIM), i - before_in, o - before_out, s.c(RESET))
-            }
-            Err(e) => {
-                let hint =
-                    log_path.as_ref().map(|p| format!("\n{}session log: {}{}", s.c(DIM), p.display(), s.c(RESET))).unwrap_or_default();
-                format!("{}error:{} {e:#}{hint}", s.c(RED), s.c(RESET))
-            }
-        };
-        s.line(&msg);
+
+        // Run the turn in the background: the prompt comes back immediately, so the user can
+        // switch lanes and keep working while this one runs.
+        let (team2, screen2, log2, input2, lane) = (team.clone(), screen.clone(), log_path.clone(), input.to_string(), active);
+        let handle = tokio::spawn(async move {
+            let (before_in, before_out) = screen2.lock().await.total_tokens();
+            let res = match lane {
+                Lane::Code => team2.run(&input2).await,
+                Lane::Spec => team2.run_spec(&input2).await,
+            };
+            // Let the renderer drain pending events before printing the footer.
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            let mut s = screen2.lock().await;
+            let (i, o) = s.total_tokens();
+            let msg = match res {
+                Ok(_) if s.active == lane.root() => {
+                    let cost = s.total_cost().map(|c| format!(" · session ${c:.4}")).unwrap_or_default();
+                    format!("{}↳ {} · +{} in / +{} out tokens{cost}{}", s.c(DIM), lane.name(), i - before_in, o - before_out, s.c(RESET))
+                }
+                Ok(_) => return, // background lane: the renderer already announced it
+                Err(e) => {
+                    let hint =
+                        log2.as_ref().map(|p| format!("\n{}session log: {}{}", s.c(DIM), p.display(), s.c(RESET))).unwrap_or_default();
+                    format!("{}error ({} lane):{} {e:#}{hint}", s.c(RED), lane.name(), s.c(RESET))
+                }
+            };
+            s.line(&msg);
+        });
+        tasks.insert(active.name(), handle);
+    }
+
+    // Leaving: stop anything still running, then save.
+    if busy(&tasks, Lane::Code) {
+        team.cancel();
+    }
+    if busy(&tasks, Lane::Spec) {
+        team.cancel_spec();
+    }
+    for (_, h) in tasks {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), h).await;
     }
     if let Some(h) = &history {
         let _ = rl.save_history(h);
@@ -462,6 +609,9 @@ async fn command(team: &Team, screen: &SharedScreen, input: &str) -> bool {
 /prompt <agent>   print the composed system prompt (master, coder, coder#2, …)
 /usage            token usage per agent and model
 /reset <instance> drop a worker instance (its history and context)
+/spec             switch to the spec lane (requirements → spec, design, plan); keeps running in parallel
+/code             switch to the code lane (implements from plan.md/design.md)
+/status           what each lane is doing + spec document versions
 /recap            what this session has done so far (requests, last answer, TODOs, workers)
 /sessions         list saved sessions for this directory
 /clear            start a fresh session (the current one stays resumable)

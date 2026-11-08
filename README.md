@@ -219,3 +219,27 @@ and for how long, including the latest output line of long-running commands:
 ```
 Without a terminal (e.g. `zilch -p … 2> log`), a plain `… coder#2 still running bash(cargo test) (1m00s)`
 heartbeat is printed every 30s instead, so logs never look frozen.
+
+## Spec lane and code lane
+
+Two conversations run **in parallel** in the REPL; `/spec` and `/code` only switch which one you
+are typing into — neither stops the other:
+
+- **`/spec` — requirements engineering.** The spec master interviews you (a few focused questions
+  per turn, with suggested answers), reads the code so it never asks what the repo already says,
+  and maintains three documents in the spec directory (`spec_dir = "…"` or `--spec-dir`,
+  default `specs/`):
+  - `spec.md` — requirements with stable ids (FR-n, NFR-n) and EARS acceptance criteria;
+  - `design.md` and `plan.md` — derived from a **released** spec version.
+- **Versioning is enforced by zilch, not just the prompt:** `release_spec` freezes the draft as an
+  immutable `versions/spec-vN.md` with a changelog entry; every write of design/plan is stamped
+  `based-on: spec vN` and requires a released version.
+- **`/code` — implementation**, as before. The code master works from `plan.md`/`design.md`
+  (never `spec.md`); its context shows which spec version the plan is based on, warns when it is
+  **stale**, and notes when the spec lane updated the plan mid-run.
+
+While a lane works in the background its output is summarized (`✓ code lane finished — /code to
+see its answer`); switching shows what it said. Approvals and plan reviews from either lane appear
+above the prompt and your next line answers them. `/status` shows both lanes and the document
+versions; `zilch -p "…" --lane spec` talks to the spec lane non-interactively. Both conversations
+are saved in the session and resume with `-c`.
