@@ -145,7 +145,7 @@ output truncation, path normalization, file scopes, TODO graphs, and history com
 |---|---|---|
 | File access | File tools are **sandboxed to the workspace**: `..`, absolute paths and symlinks that resolve outside it are refused; writes into `.git/` are refused | `sandbox = false` to disable |
 | Secrets | `bash` runs **without secret env vars** (every provider `api_key_env`, plus `*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, …) so a prompt-injected `env` can't leak keys | `bash_env_passthrough = ["GITHUB_TOKEN"]` |
-| Arbitrary commands | `bash` runs inside **bubblewrap** (Linux): host filesystem read-only, only the workspace and a private `/tmp` writable, credential stores hidden (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, zilch config/logs, …), tool caches (`~/.cargo`, `~/.cache`, `~/.npm`, …) copy-on-write so builds work without touching the host, own PID namespace, optional no-network. `auto` falls back to unsandboxed with a visible warning when bubblewrap is unavailable (e.g. macOS); `bwrap` makes it mandatory | `bash_sandbox = "auto" | "bwrap" | "off"`, `bash_network = false`, `bash_hide = [...]`, `bash_writable = [...]`, `bash_overlay = [...]` |
+| Arbitrary commands | `bash` runs in zilch's **built-in sandbox** — no external tools needed. Linux: native user/mount/PID/IPC/UTS(/net) namespaces implemented in Rust (the `zilch` binary re-executes itself as the sandbox helper); macOS: the OS's Seatbelt. Host filesystem read-only, only the workspace, a private `/tmp` and `/dev/shm` writable, credential stores hidden (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, zilch config/logs, …), tool caches (`~/.cargo`, `~/.cache`, `~/.npm`, …) copy-on-write via overlayfs, `.git/` read-only, own PID namespace (the command is PID 1; everything inside dies with it), optional no-network (loopback only). `auto` falls back to unsandboxed with a visible warning when user namespaces are disabled; `required` refuses | `bash_sandbox = "auto" \| "required" \| "off"`, `bash_network = false`, `bash_hide`, `bash_writable`, `bash_overlay`, `bash_protect_git` |
 | Runaway commands | each `bash` call runs in its own process group; on finish/timeout/cancel the **whole group is killed** (no orphaned servers) | `timeout_secs` per call (max 600) |
 | Runaway cost | optional **team-wide token cap**; agents stop with a clear error when it's reached (soft cap: checked before each request) | `max_session_tokens = 2_000_000` / `--max-tokens` |
 | Hung providers | no headers or no stream data for `idle_timeout_secs` → error instead of hanging; 429/408/5xx retried with backoff, `Retry-After` honoured, 4xx not retried | `[providers.x] idle_timeout_secs = 180` |
@@ -203,3 +203,14 @@ macOS (Intel + Apple Silicon) binaries and publishes them with `SHA256SUMS`:
 ```sh
 curl -LO https://github.com/<owner>/zilch/releases/latest/download/zilch-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz
 ```
+
+## Live progress
+
+While agents work, the CLI shows an animated status line per busy agent with what it is doing
+and for how long, including the latest output line of long-running commands:
+```
+⠹ master · thinking · 4s
+  ⠼ [t2] Add CLI flags · coder#2 · bash(cargo test) · 1m07s · Compiling serde v1.0.200
+```
+Without a terminal (e.g. `zilch -p … 2> log`), a plain `… coder#2 still running bash(cargo test) (1m00s)`
+heartbeat is printed every 30s instead, so logs never look frozen.

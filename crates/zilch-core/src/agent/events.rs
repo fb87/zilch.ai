@@ -54,6 +54,15 @@ pub enum EventKind {
         cost: Option<f64>,
     },
     Notice(String),
+    /// The agent sent a request to its model and is waiting for the reply.
+    Thinking,
+    /// Latest output line of a still-running tool (throttled), for live progress.
+    ToolProgress {
+        call_id: String,
+        line: String,
+    },
+    /// The agent finished its run (success, error or cancellation).
+    Idle,
 }
 
 /// Cheap, cloneable event sender. Sending never fails (events are dropped if nobody listens).

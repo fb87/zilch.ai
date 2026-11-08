@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{mpsc, Mutex};
 use zilch_core::llm::Usage;
 use zilch_core::team::todo::{Todo, TodoStatus};
@@ -27,8 +28,9 @@ pub struct Screen {
     panel_lines: usize,
     at_line_start: bool,
     todos: Vec<Todo>,
-    /// instance -> current activity (last tool), for running workers.
-    activity: HashMap<String, String>,
+    /// agent -> what it is doing right now (for the live status lines).
+    busy: BTreeMap<String, Busy>,
+    started: Instant,
     /// instance -> task, for delegations not tied to a TODO.
     delegations: BTreeMap<String, String>,
     worker_text: HashMap<String, String>,
@@ -37,6 +39,24 @@ pub struct Screen {
 }
 
 pub type SharedScreen = Arc<Mutex<Screen>>;
+
+/// What one agent is doing right now.
+struct Busy {
+    label: String,
+    since: Instant,
+    /// Latest output line of a running command.
+    progress: Option<String>,
+    /// Heartbeats already printed (plain output mode).
+    noted: u64,
+}
+
+fn fmt_secs(s: u64) -> String {
+    if s < 60 {
+        format!("{s}s")
+    } else {
+        format!("{}m{:02}s", s / 60, s % 60)
+    }
+}
 
 impl Screen {
     pub fn new(out: Box<dyn Write + Send>, color: bool, verbose: bool, stream_master: bool) -> SharedScreen {
@@ -48,7 +68,8 @@ impl Screen {
             panel_lines: 0,
             at_line_start: true,
             todos: vec![],
-            activity: HashMap::new(),
+            busy: BTreeMap::new(),
+            started: Instant::now(),
             delegations: BTreeMap::new(),
             worker_text: HashMap::new(),
             usage: BTreeMap::new(),
@@ -97,37 +118,31 @@ impl Screen {
             return;
         }
         let running: Vec<&Todo> = self.todos.iter().filter(|t| t.status == TodoStatus::InProgress).collect();
-        if running.is_empty() && self.delegations.is_empty() {
-            let _ = self.out.flush();
-            return;
-        }
-        let done = self.todos.iter().filter(|t| t.status == TodoStatus::Done).count();
-        let mut lines = vec![format!(
-            "{}── team: {} running · {}/{} TODOs done ──{}",
-            self.c(DIM),
-            running.len() + self.delegations.len(),
-            done,
-            self.todos.len(),
-            self.c(RESET)
-        )];
-        for t in &running {
-            let inst = t.instance.clone().unwrap_or_else(|| "queued".into());
-            let act = self.activity.get(&inst).cloned().unwrap_or_else(|| "thinking…".into());
+        let mut lines = Vec::new();
+        if !running.is_empty() || !self.delegations.is_empty() {
+            let done = self.todos.iter().filter(|t| t.status == TodoStatus::Done).count();
             lines.push(format!(
-                "  {}◐{} [{}] {} {}· {} · {}{}",
-                self.c(YELLOW),
-                self.c(RESET),
-                t.id,
-                t.title,
+                "{}── team: {} running · {}/{} TODOs done ──{}",
                 self.c(DIM),
-                inst,
-                act,
+                running.len() + self.delegations.len(),
+                done,
+                self.todos.len(),
                 self.c(RESET)
             ));
+            for t in &running {
+                let inst = t.instance.clone().unwrap_or_else(|| "queued".into());
+                let act = self.activity_line(&inst);
+                lines.push(format!("  {} [{}] {} {}· {inst} · {act}{}", self.spinner(YELLOW), t.id, t.title, self.c(DIM), self.c(RESET)));
+            }
+            for (inst, task) in &self.delegations {
+                let act = self.activity_line(inst);
+                lines.push(format!("  {} {inst} {}· {task} · {act}{}", self.spinner(CYAN), self.c(DIM), self.c(RESET)));
+            }
         }
-        for (inst, task) in &self.delegations {
-            let act = self.activity.get(inst).cloned().unwrap_or_else(|| "thinking…".into());
-            lines.push(format!("  {}◐{} {} {}· {} · {}{}", self.c(CYAN), self.c(RESET), inst, self.c(DIM), task, act, self.c(RESET)));
+        // The master is always shown while it works, so the screen never looks frozen.
+        if self.busy.contains_key("master") {
+            let act = self.activity_line("master");
+            lines.push(format!("{} {}master{} {}· {act}{}", self.spinner(CYAN), self.c(BOLD), self.c(RESET), self.c(DIM), self.c(RESET)));
         }
         let width = terminal_width();
         for l in &lines {
@@ -135,6 +150,56 @@ impl Screen {
         }
         self.panel_lines = lines.len();
         let _ = self.out.flush();
+    }
+
+    fn set_busy(&mut self, agent: &str, label: String) {
+        self.busy.insert(agent.to_string(), Busy { label, since: Instant::now(), progress: None, noted: 0 });
+    }
+
+    /// "bash(cargo test) · 37s · Compiling serde v1.0" for an agent (or "starting…").
+    fn activity_line(&self, agent: &str) -> String {
+        match self.busy.get(agent) {
+            Some(b) => {
+                let mut s = format!("{} · {}", b.label, fmt_secs(b.since.elapsed().as_secs()));
+                if let Some(p) = &b.progress {
+                    s.push_str(&format!(" · {p}"));
+                }
+                s
+            }
+            None => "starting…".into(),
+        }
+    }
+
+    fn spinner(&self, color: &'static str) -> String {
+        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let i = (self.started.elapsed().as_millis() / 100) as usize % FRAMES.len();
+        format!("{}{}{}", self.c(color), FRAMES[i], self.c(RESET))
+    }
+
+    /// Called ~8×/s: animate the panel on a TTY; on plain output, print a heartbeat line every
+    /// 30s for long-running work so logs never look frozen.
+    pub fn tick(&mut self) {
+        if self.busy.is_empty() {
+            return;
+        }
+        if self.color {
+            if self.at_line_start {
+                self.clear_panel();
+                self.draw_panel();
+            }
+            return;
+        }
+        let mut notes = Vec::new();
+        for (agent, b) in self.busy.iter_mut() {
+            let secs = b.since.elapsed().as_secs();
+            if secs >= 30 && secs / 30 > b.noted {
+                b.noted = secs / 30;
+                notes.push(format!("… {agent} still running {} ({})", b.label, fmt_secs(secs)));
+            }
+        }
+        for n in notes {
+            self.line(&n);
+        }
     }
 
     pub fn handle(&mut self, ev: AgentEvent) {
@@ -185,7 +250,7 @@ impl Screen {
                         self.line(&msg);
                     }
                 } else {
-                    self.activity.insert(ev.agent.clone(), format!("{name} {summary}"));
+                    self.set_busy(&ev.agent, format!("{name}({summary})"));
                     if self.verbose {
                         let msg = format!("{}  │ {} ● {}({}){}", self.c(DIM), ev.agent, name, summary, self.c(RESET));
                         self.line(&msg);
@@ -280,7 +345,7 @@ impl Screen {
             }
             EventKind::DelegateEnd { worker, ok } => {
                 self.delegations.remove(&worker);
-                self.activity.remove(&worker);
+                self.busy.remove(&worker);
                 let msg = if ok {
                     format!("  {}✓{} {} reported back", self.c(GREEN), self.c(RESET), worker)
                 } else {
@@ -306,6 +371,17 @@ impl Screen {
                 self.line(&msg);
             }
             EventKind::TodoStatus { .. } => {}
+            EventKind::Thinking => self.set_busy(&ev.agent, "thinking".into()),
+            EventKind::ToolProgress { line, .. } => {
+                if let Some(b) = self.busy.get_mut(&ev.agent) {
+                    b.progress = Some(line);
+                }
+            }
+            EventKind::Idle => {
+                self.busy.remove(&ev.agent);
+                self.clear_panel();
+                self.draw_panel();
+            }
         }
     }
 
@@ -388,11 +464,93 @@ pub fn spawn_renderer(
     mut log: Option<crate::log::EventLog>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(ev) = rx.recv().await {
-            if let Some(l) = log.as_mut() {
-                l.handle(&ev);
+        // Events drive the screen; a timer keeps spinners and elapsed times moving between events.
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(125));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                ev = rx.recv() => {
+                    let Some(ev) = ev else { break };
+                    if let Some(l) = log.as_mut() {
+                        l.handle(&ev);
+                    }
+                    screen.lock().await.handle(ev);
+                }
+                _ = ticker.tick() => {
+                    // Never block on the lock: an approval prompt may be holding it.
+                    if let Ok(mut s) = screen.try_lock() {
+                        s.tick();
+                    }
+                }
             }
-            screen.lock().await.handle(ev);
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// A Write sink we can read back.
+    #[derive(Clone, Default)]
+    struct Buf(Arc<StdMutex<Vec<u8>>>);
+    impl Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Buf {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).replace("\x1b[", "\u{241b}[")
+        }
+    }
+    fn ev(agent: &str, kind: EventKind) -> AgentEvent {
+        AgentEvent { agent: agent.into(), kind }
+    }
+
+    #[tokio::test]
+    async fn long_command_shows_spinner_elapsed_and_latest_output() {
+        let buf = Buf::default();
+        let screen = Screen::new(Box::new(buf.clone()), true, false, true);
+        let mut s = screen.lock().await;
+        s.handle(ev("coder#1", EventKind::DelegateStart { worker: "coder#1".into(), task: "build".into() }));
+        s.handle(ev("coder#1", EventKind::ToolStart { call_id: "c".into(), name: "bash".into(), summary: "cargo build".into() }));
+        s.handle(ev("coder#1", EventKind::ToolProgress { call_id: String::new(), line: "Compiling serde v1.0.200".into() }));
+        s.busy.get_mut("coder#1").unwrap().since = Instant::now() - std::time::Duration::from_secs(75);
+        s.tick();
+        let out = buf.text();
+        assert!(out.contains("bash(cargo build) · 1m15s · Compiling serde v1.0.200"), "{out}");
+        assert!(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"].iter().any(|f| out.contains(f)), "spinner drawn");
+        // The master gets its own status line while it works.
+        s.handle(ev("master", EventKind::Thinking));
+        s.tick();
+        assert!(buf.text().contains("master") && buf.text().contains("thinking · 0s"));
+        // Idle clears it: no more redraws.
+        s.handle(ev("master", EventKind::Idle));
+        s.handle(ev("coder#1", EventKind::Idle));
+        s.handle(ev("coder#1", EventKind::DelegateEnd { worker: "coder#1".into(), ok: true }));
+        let before = buf.text().len();
+        s.tick();
+        assert_eq!(buf.text().len(), before, "nothing busy → tick draws nothing");
+    }
+
+    #[tokio::test]
+    async fn plain_output_prints_heartbeats_every_30s() {
+        let buf = Buf::default();
+        let screen = Screen::new(Box::new(buf.clone()), false, false, false);
+        let mut s = screen.lock().await;
+        s.handle(ev("coder#2", EventKind::ToolStart { call_id: "c".into(), name: "bash".into(), summary: "npm test".into() }));
+        s.tick();
+        assert!(!buf.text().contains("still running"), "no heartbeat before 30s");
+        s.busy.get_mut("coder#2").unwrap().since = Instant::now() - std::time::Duration::from_secs(31);
+        s.tick();
+        s.tick(); // same 30s window: printed once
+        assert_eq!(buf.text().matches("still running bash(npm test) (31s)").count(), 1, "{}", buf.text());
+        assert!(!buf.text().contains('\u{241b}'), "no ANSI escapes in plain mode");
+    }
 }

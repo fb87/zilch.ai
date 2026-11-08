@@ -81,9 +81,22 @@ fn parse_mode(s: &str) -> Result<ApprovalMode, String> {
     }
 }
 
-#[tokio::main]
-async fn main() {
-    match real_main().await {
+fn main() {
+    // Sandbox helper mode: must be handled before any threads exist (unshare(CLONE_NEWUSER)
+    // refuses multithreaded processes), i.e. before the async runtime starts.
+    let mut args = std::env::args();
+    if args.nth(1).as_deref() == Some("__sandbox") {
+        #[cfg(target_os = "linux")]
+        zilch_core::tools::sandbox_linux::helper_main(args);
+        #[cfg(not(target_os = "linux"))]
+        std::process::exit(126);
+    }
+    // The sandbox re-executes this same binary, so a single `zilch` is all a user needs.
+    if let Ok(exe) = std::env::current_exe() {
+        zilch_core::tools::sandbox::set_helper(exe, vec!["__sandbox".into()]);
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
+    match rt.block_on(real_main()) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("error: {e:#}");

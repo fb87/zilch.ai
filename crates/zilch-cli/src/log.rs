@@ -46,6 +46,8 @@ impl EventLog {
 
     pub fn handle(&mut self, ev: &AgentEvent) {
         let line = match &ev.kind {
+            // Live progress lines are UI-only (up to ~4/s per command); keep the log lean.
+            EventKind::ToolProgress { .. } => return,
             EventKind::TextDelta(t) => {
                 self.text.entry(ev.agent.clone()).or_default().push_str(t);
                 return;

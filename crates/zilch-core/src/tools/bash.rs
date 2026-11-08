@@ -1,5 +1,5 @@
 #[cfg(test)]
-use super::sandbox::bwrap_available;
+use super::sandbox::native_available;
 use super::sandbox::{self, BashSandbox};
 use super::{arg_opt_u64, arg_str, truncate_output, Tool, ToolCtx};
 use anyhow::Result;
@@ -58,7 +58,7 @@ impl Tool for Bash {
         let sandboxed = match ctx.policy.bash_sandbox {
             BashSandbox::Off => false,
             BashSandbox::Auto => sandbox::available(),
-            BashSandbox::Bwrap => {
+            BashSandbox::Required => {
                 if !sandbox::available() {
                     anyhow::bail!("bash sandbox is required (bash_sandbox = \"required\") but no OS sandbox (bubblewrap / sandbox-exec) works on this machine");
                 }
@@ -99,9 +99,27 @@ impl Tool for Bash {
 
         // Read output concurrently so a chatty command never blocks on a full pipe.
         let mut stdout = child.stdout.take().expect("stdout");
+        let (events, agent) = (ctx.events.clone(), ctx.agent_id.clone());
         let reader = tokio::spawn(async move {
             let mut buf = Vec::new();
-            let _ = stdout.read_to_end(&mut buf).await;
+            let mut chunk = [0u8; 8192];
+            let mut last_emit = std::time::Instant::now();
+            loop {
+                match stdout.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+                // Live progress for the UI: latest non-empty output line, at most ~4×/s.
+                if last_emit.elapsed() >= Duration::from_millis(250) {
+                    last_emit = std::time::Instant::now();
+                    let tail = &buf[buf.len().saturating_sub(4096)..];
+                    let text = String::from_utf8_lossy(tail);
+                    if let Some(line) = text.lines().rev().map(str::trim).find(|l| !l.is_empty()) {
+                        let line: String = line.chars().take(120).collect();
+                        events.emit(&agent, crate::agent::EventKind::ToolProgress { call_id: String::new(), line });
+                    }
+                }
+            }
             buf
         });
         let status = tokio::time::timeout(timeout, child.wait()).await;
@@ -177,7 +195,7 @@ mod tests {
 
     fn sandboxed_ctx(dir: &std::path::Path, network: bool, hide: Vec<String>) -> ToolCtx {
         let policy = crate::tools::ToolPolicy {
-            bash_sandbox: BashSandbox::Bwrap,
+            bash_sandbox: BashSandbox::Required,
             bash: crate::tools::sandbox::SandboxSpec { network, hide, writable: vec![], overlay: None, protect_git: true },
             ..Default::default()
         };
@@ -185,9 +203,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bwrap_confines_commands() {
-        if !bwrap_available() {
-            eprintln!("skipping: bubblewrap not available");
+    async fn sandbox_confines_commands() {
+        if !native_available() {
+            eprintln!("skipping: native sandbox not available");
             return;
         }
         let outer = tempfile::tempdir().unwrap();
@@ -234,8 +252,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bwrap_network_can_be_enabled_and_children_are_killed() {
-        if !bwrap_available() {
+    async fn sandbox_network_can_be_enabled_and_children_are_killed() {
+        if !native_available() {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -247,6 +265,25 @@ mod tests {
         assert!(out.contains("bg"));
         tokio::time::sleep(Duration::from_millis(2500)).await;
         assert!(!marker.exists(), "sandboxed background child outlived the call");
+    }
+
+    #[tokio::test]
+    async fn running_commands_stream_progress_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Arc::new(ApprovalGate::new(ApprovalMode::Auto, Arc::new(AutoApprove)));
+        let (sink, mut rx) = EventSink::new();
+        let c = ToolCtx::new("coder#1", dir.path().to_path_buf(), gate, sink, CancelCell::default(), FileLocks::default());
+        let out = Bash.call(json!({"command": "for i in 1 2 3 4; do echo step$i; sleep 0.3; done"}), &c).await.unwrap();
+        assert!(out.contains("step4"));
+        let mut lines = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let crate::agent::EventKind::ToolProgress { line, .. } = ev.kind {
+                assert_eq!(ev.agent, "coder#1");
+                lines.push(line);
+            }
+        }
+        assert!(lines.len() >= 2, "expected live progress while running, got {lines:?}");
+        assert!(lines.iter().all(|l| l.starts_with("step")), "{lines:?}");
     }
 
     #[test]
@@ -261,8 +298,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bwrap_protects_git_metadata() {
-        if !bwrap_available() {
+    async fn sandbox_protects_git_metadata() {
+        if !native_available() {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -284,7 +321,7 @@ mod tests {
         // Opt-out restores normal git usage.
         let open = ctx(dir.path()).with_policy(
             Arc::new(crate::tools::ToolPolicy {
-                bash_sandbox: BashSandbox::Bwrap,
+                bash_sandbox: BashSandbox::Required,
                 bash: crate::tools::sandbox::SandboxSpec { network: false, protect_git: false, ..Default::default() },
                 ..Default::default()
             }),

@@ -65,6 +65,7 @@ impl Agent {
         }
         let start = self.history.len();
         let res = self.run_turn(input).await;
+        self.emit(EventKind::Idle);
         if res.is_err() && !self.history[start..].iter().any(|m| m.role == crate::llm::Role::Assistant) {
             self.history.truncate(start);
         }
@@ -130,6 +131,7 @@ impl Agent {
             let events = self.ctx.events.clone();
             let id = self.id.clone();
             let llm = self.llm.clone();
+            self.emit(EventKind::Thinking);
             let (msg, usage) = tokio::select! {
                 r = complete(llm.as_ref(), &req, |t| events.emit(&id, EventKind::TextDelta(t.to_string()))) => r?,
                 _ = cancel.cancelled() => bail!("cancelled"),

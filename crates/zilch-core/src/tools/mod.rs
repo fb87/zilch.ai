@@ -5,6 +5,8 @@ pub mod delegate;
 pub mod edit;
 pub mod fs;
 pub mod sandbox;
+#[cfg(target_os = "linux")]
+pub mod sandbox_linux;
 pub mod search;
 pub mod todo_tools;
 
