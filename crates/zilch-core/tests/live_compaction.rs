@@ -13,7 +13,11 @@ fn call(id: &str, path: &str) -> Message {
     Message {
         role: Role::Assistant,
         content: None,
-        tool_calls: vec![ToolCall { id: id.into(), kind: "function".into(), function: FunctionCall { name: "read_file".into(), arguments: format!("{{\"path\":\"{path}\"}}") } }],
+        tool_calls: vec![ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: FunctionCall { name: "read_file".into(), arguments: format!("{{\"path\":\"{path}\"}}") },
+        }],
         tool_call_id: None,
         reasoning_content: None,
     }
@@ -27,7 +31,8 @@ const FACTS: &[(&str, &str)] = &[
 ];
 
 fn long_history() -> Vec<Message> {
-    let filler = |n: usize| (0..n).map(|i| format!("    let value_{i} = compute_{i}(input) * FACTOR; // routine line {i}\n")).collect::<String>();
+    let filler =
+        |n: usize| (0..n).map(|i| format!("    let value_{i} = compute_{i}(input) * FACTOR; // routine line {i}\n")).collect::<String>();
     let mut h = vec![Message::user(
         "TASK [t1]: Fix the EU invoice rounding bug. The failing integration test is test_invoice_rounding_eu. \
          Find the cause, fix it, and report.",
@@ -35,9 +40,7 @@ fn long_history() -> Vec<Message> {
     // Early turns carry the facts.
     h.push(call("c1", "src/billing/mod.rs"));
     h.push(Message::tool("c1", format!("pub mod tax;\npub mod invoice;\n{}", filler(120))));
-    h.push(Message::assistant(
-        "The rounding happens in the tax module. Reading src/billing/tax.rs next — I suspect the VAT constant.",
-    ));
+    h.push(Message::assistant("The rounding happens in the tax module. Reading src/billing/tax.rs next — I suspect the VAT constant."));
     h.push(call("c2", "src/billing/tax.rs"));
     h.push(Message::tool("c2", format!("pub const VAT_RATE: f64 = 0.16; // outdated\n{}", filler(150))));
     h.push(Message::assistant(
@@ -48,7 +51,10 @@ fn long_history() -> Vec<Message> {
     for i in 3..40 {
         h.push(call(&format!("c{i}"), &format!("src/other/module_{i}.rs")));
         h.push(Message::tool(format!("c{i}"), filler(60)));
-        h.push(Message::assistant(format!("module_{i}.rs looks fine; nothing related to invoices there. {}", "Checked every function. ".repeat(20))));
+        h.push(Message::assistant(format!(
+            "module_{i}.rs looks fine; nothing related to invoices there. {}",
+            "Checked every function. ".repeat(20)
+        )));
     }
     h
 }

@@ -28,7 +28,10 @@ impl Approver for TerminalApprover {
         let mut screen = self.0.lock().await;
         screen.clear_panel();
         let (y, b, d, r) = (screen.c(YELLOW), screen.c(BOLD), screen.c(DIM), screen.c(RESET));
-        screen.write_raw(&format!("\n{y}?{r} {b}{}{r} wants to run {b}{}{r}: {}\n  {d}[y]es / [n]o / [a]lways allow {}{r} › ", req.agent, req.tool, req.summary, req.tool));
+        screen.write_raw(&format!(
+            "\n{y}?{r} {b}{}{r} wants to run {b}{}{r}: {}\n  {d}[y]es / [n]o / [a]lways allow {}{r} › ",
+            req.agent, req.tool, req.summary, req.tool
+        ));
         let answer = read_line().await.unwrap_or_default().to_lowercase();
         screen.line("");
         match answer.as_str() {

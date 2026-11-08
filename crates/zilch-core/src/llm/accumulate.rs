@@ -44,10 +44,7 @@ impl Accumulator {
             .map(|(i, (id, name, args))| ToolCall {
                 id: if id.is_empty() { format!("call_{i}") } else { id },
                 kind: "function".into(),
-                function: FunctionCall {
-                    name,
-                    arguments: if args.trim().is_empty() { "{}".into() } else { args },
-                },
+                function: FunctionCall { name, arguments: if args.trim().is_empty() { "{}".into() } else { args } },
             })
             .collect();
         Message {

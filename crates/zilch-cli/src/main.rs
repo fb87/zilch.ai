@@ -1,13 +1,19 @@
 mod approver;
+mod log;
 mod render;
 
 use anyhow::{bail, Result};
 use clap::Parser;
 use render::{Screen, SharedScreen, BOLD, CYAN, DIM, GREEN, RED, RESET};
 use std::io::{IsTerminal, Read};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use zilch_core::team::todo::TodoStatus;
 use zilch_core::*;
+
+/// Exit code for a run stopped by the user (like SIGINT).
+const EXIT_CANCELLED: i32 = 130;
 
 #[derive(Parser, Debug)]
 #[command(name = "zilch", version, about = "A minimal, parallel, TODO-driven multi-agent coding assistant")]
@@ -30,6 +36,18 @@ struct Cli {
     /// Approve everything automatically (plans and actions). Same as --approval auto.
     #[arg(long)]
     yolo: bool,
+    /// Stop when the whole team has used this many tokens (prompt + completion).
+    #[arg(long, value_name = "TOKENS")]
+    max_tokens: Option<u64>,
+    /// Write the JSONL session log here (default: <data dir>/zilch/logs/).
+    #[arg(long, value_name = "FILE")]
+    log: Option<std::path::PathBuf>,
+    /// Don't write a session log.
+    #[arg(long)]
+    no_log: bool,
+    /// Check configuration and connectivity of every configured model, then exit.
+    #[arg(long)]
+    doctor: bool,
     /// Show worker output and tool calls.
     #[arg(short, long)]
     verbose: bool,
@@ -49,17 +67,58 @@ fn parse_mode(s: &str) -> Result<ApprovalMode, String> {
 
 #[tokio::main]
 async fn main() {
-    if let Err(e) = real_main().await {
-        eprintln!("error: {e:#}");
-        std::process::exit(1);
+    match real_main().await {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
+        }
     }
 }
 
-async fn real_main() -> Result<()> {
+/// Read piped stdin without hanging when stdin is an open pipe that never sends anything
+/// (CI runners, editors): wait briefly for the first byte or EOF, otherwise ignore stdin.
+fn read_piped_stdin() -> Option<String> {
+    if std::io::stdin().is_terminal() {
+        return None;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut first = [0u8; 1];
+        let mut stdin = std::io::stdin().lock();
+        match stdin.read(&mut first) {
+            Ok(0) | Err(_) => {
+                let _ = tx.send(None);
+            }
+            Ok(_) => {
+                let mut rest = Vec::new();
+                let _ = stdin.read_to_end(&mut rest);
+                let mut all = vec![first[0]];
+                all.extend(rest);
+                let _ = tx.send(Some(String::from_utf8_lossy(&all).into_owned()));
+            }
+        }
+    });
+    // Data that is actually piped in starts arriving immediately; a silent open pipe doesn't.
+    match rx.recv_timeout(Duration::from_millis(250)) {
+        Ok(v) => v,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // Something is writing slowly (e.g. `slow_cmd | zilch -p`): wait for it to finish.
+            if std::env::var_os("ZILCH_STDIN_WAIT").is_some() {
+                rx.recv().ok().flatten()
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+async fn real_main() -> Result<i32> {
     let cli = Cli::parse();
     let cwd = match &cli.cwd {
         Some(p) => std::fs::canonicalize(p)?,
-        None => std::env::current_dir()?,
+        None => std::env::current_dir()?.canonicalize()?,
     };
     let mut worker_models = Vec::new();
     for wm in &cli.worker_models {
@@ -71,9 +130,13 @@ async fn real_main() -> Result<()> {
         worker_models,
         max_workers: cli.workers,
         approval: if cli.yolo { Some(ApprovalMode::Auto) } else { cli.approval },
+        max_session_tokens: cli.max_tokens,
     };
     let cfg = Config::load(&cwd, &ov)?;
     let providers = cfg.build_providers()?;
+    if cli.doctor {
+        return doctor(&cfg, &providers).await;
+    }
 
     let one_shot = cli.prompt.is_some();
     let tty = std::io::stdout().is_terminal();
@@ -82,42 +145,137 @@ async fn real_main() -> Result<()> {
     let color = if one_shot { std::io::stderr().is_terminal() } else { tty } && std::env::var_os("NO_COLOR").is_none();
     let screen = Screen::new(out, color, cli.verbose, !one_shot);
 
+    let mut event_log = None;
+    if !cli.no_log {
+        if let Some(path) = cli.log.clone().or_else(log::EventLog::default_path) {
+            match log::EventLog::open(&path) {
+                Ok(mut l) => {
+                    l.record("session_start", serde_json::json!({"cwd": cwd, "version": env!("CARGO_PKG_VERSION"), "one_shot": one_shot}));
+                    event_log = Some(l);
+                }
+                Err(e) => eprintln!("warning: cannot open session log {}: {e}", path.display()),
+            }
+        }
+    }
+    let log_path = event_log.as_ref().map(|l| l.path.clone());
+
     let (sink, rx) = EventSink::new();
-    let renderer = render::spawn_renderer(screen.clone(), rx);
+    let renderer = render::spawn_renderer(screen.clone(), rx, event_log);
     let approver: Arc<dyn Approver> = Arc::new(approver::TerminalApprover(screen.clone()));
     let reviewer: Arc<dyn PlanReviewer> = Arc::new(approver::TerminalReviewer(screen.clone()));
     let team = Arc::new(Team::new(cfg, providers, approver, reviewer, sink)?);
 
-    // Ctrl-C cancels the running turn (master, scheduler and every worker).
+    // Ctrl-C cancels the running turn (master, scheduler and every worker); pressing it twice
+    // within 2s force-quits.
     {
         let team = team.clone();
+        let screen = screen.clone();
+        let last = Arc::new(AtomicU64::new(0));
+        let start = Instant::now();
         tokio::spawn(async move {
             while tokio::signal::ctrl_c().await.is_ok() {
+                let now = start.elapsed().as_millis() as u64;
+                let prev = last.swap(now, Ordering::SeqCst);
+                if prev != 0 && now - prev < 2_000 {
+                    eprintln!("\nforce quit");
+                    std::process::exit(EXIT_CANCELLED);
+                }
                 team.cancel();
+                if let Ok(mut s) = screen.try_lock() {
+                    s.line("⏹ cancelling… (press Ctrl-C again to force quit)");
+                }
             }
         });
     }
 
     if let Some(mut prompt) = cli.prompt {
-        if !std::io::stdin().is_terminal() {
-            let mut piped = String::new();
-            std::io::stdin().read_to_string(&mut piped)?;
-            if !piped.trim().is_empty() {
-                prompt = format!("{prompt}\n\n<stdin>\n{piped}\n</stdin>");
-            }
+        if let Some(piped) = read_piped_stdin().filter(|p| !p.trim().is_empty()) {
+            prompt = format!("{prompt}\n\n<stdin>\n{piped}\n</stdin>");
         }
         let res = team.run(&prompt).await;
         // The Ctrl-C task keeps the event sink alive, so give the renderer a moment instead of joining it.
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
         renderer.abort();
-        println!("{}", res?);
-        return Ok(());
+        return Ok(match res {
+            Ok(answer) => {
+                println!("{answer}");
+                0
+            }
+            Err(e) if e.to_string().contains("cancelled") => {
+                eprintln!("cancelled");
+                EXIT_CANCELLED
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                if let Some(p) = &log_path {
+                    eprintln!("session log: {}", p.display());
+                }
+                1
+            }
+        });
     }
 
-    repl(team, screen).await
+    repl(team, screen, log_path).await?;
+    Ok(0)
 }
 
-async fn repl(team: Arc<Team>, screen: SharedScreen) -> Result<()> {
+/// `zilch --doctor`: show the resolved configuration and ping every distinct (provider, model).
+async fn doctor(cfg: &Config, providers: &zilch_core::llm::Providers) -> Result<i32> {
+    println!("workspace   {}", cfg.cwd.display());
+    println!(
+        "approval    {:?} · sandbox {} · max workers {} · token cap {}",
+        cfg.approval,
+        if cfg.sandbox { "on" } else { "OFF" },
+        cfg.max_workers,
+        cfg.max_session_tokens.map_or("none".into(), |t| t.to_string())
+    );
+    println!("\nproviders");
+    for (name, p) in &cfg.providers {
+        let key = match (&p.api_key, &p.api_key_env) {
+            (Some(_), _) => "inline key".to_string(),
+            (None, Some(v)) => format!("${v} {}", if std::env::var(v).is_ok_and(|k| !k.is_empty()) { "set" } else { "NOT set" }),
+            _ => "no key".into(),
+        };
+        println!("  {name:<12} {}  ({key})", p.base_url.as_deref().unwrap_or("?"));
+    }
+    println!("\nagents");
+    for p in &cfg.profiles {
+        println!("  {:<12} {:<40} tools: {}", p.name, p.binding.key(), p.tools.join(","));
+    }
+    println!("\nconnectivity (tiny request per distinct model)");
+    let mut seen = std::collections::BTreeSet::new();
+    let mut failures = 0;
+    for p in &cfg.profiles {
+        if !seen.insert(p.binding.key()) {
+            continue;
+        }
+        let client = providers.get(&p.binding.provider)?;
+        let mut binding = p.binding.clone();
+        binding.max_tokens = Some(binding.max_tokens.unwrap_or(64).min(64));
+        let req = zilch_core::llm::ChatRequest {
+            binding,
+            messages: vec![zilch_core::llm::Message::user("Reply with the single word: OK")],
+            tools: vec![],
+            session: Some(zilch_core::agent::run::new_session_id("doctor")),
+        };
+        let t = Instant::now();
+        match tokio::time::timeout(Duration::from_secs(60), zilch_core::llm::complete(client.as_ref(), &req, |_| {})).await {
+            Ok(Ok(_)) => println!("  ✓ {:<40} {:>6} ms", p.binding.key(), t.elapsed().as_millis()),
+            Ok(Err(e)) => {
+                failures += 1;
+                println!("  ✗ {:<40} {e:#}", p.binding.key());
+            }
+            Err(_) => {
+                failures += 1;
+                println!("  ✗ {:<40} timed out after 60s", p.binding.key());
+            }
+        }
+    }
+    println!("\n{}", if failures == 0 { "all good".to_string() } else { format!("{failures} problem(s) found") });
+    Ok(if failures == 0 { 0 } else { 1 })
+}
+
+async fn repl(team: Arc<Team>, screen: SharedScreen, log_path: Option<std::path::PathBuf>) -> Result<()> {
     banner(&team, &screen).await;
     let mut rl = rustyline::DefaultEditor::new()?;
     let history = dirs::data_dir().map(|d| d.join("zilch").join("history.txt"));
@@ -152,7 +310,11 @@ async fn repl(team: Arc<Team>, screen: SharedScreen) -> Result<()> {
         let (i, o) = s.total_tokens();
         let msg = match res {
             Ok(_) => format!("{}↳ tokens: +{} in / +{} out{}", s.c(DIM), i - before_in, o - before_out, s.c(RESET)),
-            Err(e) => format!("{}error:{} {e:#}", s.c(RED), s.c(RESET)),
+            Err(e) => {
+                let hint =
+                    log_path.as_ref().map(|p| format!("\n{}session log: {}{}", s.c(DIM), p.display(), s.c(RESET))).unwrap_or_default();
+                format!("{}error:{} {e:#}{hint}", s.c(RED), s.c(RESET))
+            }
         };
         s.line(&msg);
     }

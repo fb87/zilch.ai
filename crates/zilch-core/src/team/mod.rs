@@ -11,7 +11,7 @@ use crate::config::{Config, READONLY_TOOLS};
 use crate::llm::{ModelBinding, Providers};
 use crate::profile::Profile;
 use crate::prompt::{self, PromptEnv};
-use crate::tools::{self, CancelCell, Scope, ToolCtx, ToolRegistry};
+use crate::tools::{self, CancelCell, Scope, TokenBudget, ToolCtx, ToolPolicy, ToolRegistry};
 use anyhow::{anyhow, bail, Result};
 use file_locks::FileLocks;
 use plan_state::PlanReviewer;
@@ -31,6 +31,8 @@ pub struct TeamShared {
     pub events: EventSink,
     pub cancel: CancelCell,
     pub file_locks: FileLocks,
+    pub policy: Arc<ToolPolicy>,
+    pub budget: Option<Arc<TokenBudget>>,
     worker_tools: ToolRegistry,
 }
 
@@ -92,7 +94,10 @@ impl TeamShared {
         let names = reg.names();
         let system = prompt::build(profile, &PromptEnv { cwd: &self.cfg.cwd, agent_id: &id, tools: &names, workers: &[] });
         let llm = self.providers.get(&binding.provider)?;
-        let ctx = Arc::new(ToolCtx::new(&id, self.cfg.cwd.clone(), self.gate.clone(), self.events.clone(), self.cancel.clone(), self.file_locks.clone()));
+        let ctx = Arc::new(
+            ToolCtx::new(&id, self.cfg.cwd.clone(), self.gate.clone(), self.events.clone(), self.cancel.clone(), self.file_locks.clone())
+                .with_policy(self.policy.clone(), self.budget.clone()),
+        );
         self.events.emit(&id, EventKind::InstanceSpawned { id: id.clone(), model: binding.key() });
         let agent = Agent {
             id: id.clone(),
@@ -115,7 +120,12 @@ impl TeamShared {
     }
 
     /// Get an instance for `worker` (a profile name or a specific instance id) and lock it.
-    pub async fn acquire(&self, worker: &str, binding: Option<ModelBinding>, readonly: bool) -> Result<(Arc<Instance>, OwnedMutexGuard<Agent>)> {
+    pub async fn acquire(
+        &self,
+        worker: &str,
+        binding: Option<ModelBinding>,
+        readonly: bool,
+    ) -> Result<(Arc<Instance>, OwnedMutexGuard<Agent>)> {
         if worker.contains('#') {
             let inst = self.pool.find(worker).ok_or_else(|| anyhow!("no worker instance '{worker}'"))?;
             if readonly && !inst.readonly {
@@ -200,8 +210,20 @@ pub struct Team {
 }
 
 impl Team {
-    pub fn new(cfg: Config, providers: Providers, approver: Arc<dyn Approver>, reviewer: Arc<dyn PlanReviewer>, events: EventSink) -> Result<Self> {
+    pub fn new(
+        cfg: Config,
+        providers: Providers,
+        approver: Arc<dyn Approver>,
+        reviewer: Arc<dyn PlanReviewer>,
+        events: EventSink,
+    ) -> Result<Self> {
         let gate = Arc::new(ApprovalGate::new(cfg.approval, approver));
+        // Every provider key variable is a secret, plus the generic secret-name heuristic.
+        let policy = Arc::new(ToolPolicy {
+            sandbox: cfg.sandbox,
+            secret_env: cfg.providers.values().filter_map(|p| p.api_key_env.clone()).collect(),
+            env_passthrough: cfg.bash_env_passthrough.clone(),
+        });
         let shared = Arc::new(TeamShared {
             pool: WorkerPool::new(cfg.max_workers),
             providers,
@@ -211,6 +233,8 @@ impl Team {
             events: events.clone(),
             cancel: CancelCell::default(),
             file_locks: FileLocks::default(),
+            policy,
+            budget: cfg.max_session_tokens.map(|l| Arc::new(TokenBudget::new(l))),
             worker_tools: tools::worker_tools(),
             cfg,
         });
@@ -226,7 +250,10 @@ impl Team {
         let names = reg.names();
         let workers = shared.worker_profiles();
         let system = prompt::build(&profile, &PromptEnv { cwd: &shared.cfg.cwd, agent_id: "master", tools: &names, workers: &workers });
-        let ctx = Arc::new(ToolCtx::new("master", shared.cfg.cwd.clone(), gate, events, shared.cancel.clone(), shared.file_locks.clone()));
+        let ctx = Arc::new(
+            ToolCtx::new("master", shared.cfg.cwd.clone(), gate, events, shared.cancel.clone(), shared.file_locks.clone())
+                .with_policy(shared.policy.clone(), shared.budget.clone()),
+        );
         let master = Agent {
             id: "master".into(),
             profile: "master".into(),
@@ -302,7 +329,8 @@ impl Team {
 
     /// (agent/profile, provider/model) for the master, every profile and every live instance.
     pub fn models(&self) -> Vec<(String, String)> {
-        let mut v: Vec<(String, String)> = self.shared.cfg.profiles.iter().map(|p| (format!("{} (profile)", p.name), p.binding.key())).collect();
+        let mut v: Vec<(String, String)> =
+            self.shared.cfg.profiles.iter().map(|p| (format!("{} (profile)", p.name), p.binding.key())).collect();
         v.extend(self.shared.pool.list().iter().map(|i| (i.id.clone(), i.binding.key())));
         v
     }

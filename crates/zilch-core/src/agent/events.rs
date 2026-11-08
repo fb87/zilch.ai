@@ -2,28 +2,55 @@
 
 use crate::llm::Usage;
 use crate::team::todo::{Todo, TodoStatus};
+use serde::Serialize;
 use tokio::sync::mpsc;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AgentEvent {
     /// "master", "coder#2", ...
     pub agent: String,
     pub kind: EventKind,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum EventKind {
     TextDelta(String),
     /// An assistant turn finished streaming text (used to end lines cleanly).
     TextDone,
-    ToolStart { call_id: String, name: String, summary: String },
-    ToolEnd { call_id: String, name: String, ok: bool, summary: String },
+    ToolStart {
+        call_id: String,
+        name: String,
+        summary: String,
+    },
+    ToolEnd {
+        call_id: String,
+        name: String,
+        ok: bool,
+        summary: String,
+    },
     TodosChanged(Vec<Todo>),
-    TodoStatus { id: String, status: TodoStatus, instance: Option<String> },
-    DelegateStart { worker: String, task: String },
-    DelegateEnd { worker: String, ok: bool },
-    InstanceSpawned { id: String, model: String },
-    Usage { model: String, usage: Usage },
+    TodoStatus {
+        id: String,
+        status: TodoStatus,
+        instance: Option<String>,
+    },
+    DelegateStart {
+        worker: String,
+        task: String,
+    },
+    DelegateEnd {
+        worker: String,
+        ok: bool,
+    },
+    InstanceSpawned {
+        id: String,
+        model: String,
+    },
+    Usage {
+        model: String,
+        usage: Usage,
+    },
     Notice(String),
 }
 

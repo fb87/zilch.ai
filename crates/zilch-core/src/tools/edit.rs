@@ -34,7 +34,7 @@ impl Tool for EditFile {
         args.get("path").and_then(Value::as_str).unwrap_or("?").to_string()
     }
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<String> {
-        let path = ctx.resolve(arg_str(&args, "path")?);
+        let path = ctx.resolve_checked(arg_str(&args, "path")?, true)?;
         let old = arg_str(&args, "old_string")?;
         let new = arg_str(&args, "new_string")?;
         let all = arg_bool(&args, "replace_all");

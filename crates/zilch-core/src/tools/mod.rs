@@ -9,8 +9,8 @@ pub mod todo_tools;
 
 use crate::agent::approval::ApprovalGate;
 use crate::agent::events::EventSink;
-use crate::team::file_locks::FileLocks;
 use crate::llm::ToolSpec;
+use crate::team::file_locks::FileLocks;
 use anyhow::Result;
 use async_trait::async_trait;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -40,7 +40,11 @@ pub trait Tool: Send + Sync {
     /// One-line human summary of a call, for UI and approval prompts.
     fn summarize(&self, args: &Value) -> String {
         let s = args.to_string();
-        if s.len() > 120 { format!("{}…", &s[..s.floor_char_boundary(120)]) } else { s }
+        if s.len() > 120 {
+            format!("{}…", &s[..s.floor_char_boundary(120)])
+        } else {
+            s
+        }
     }
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<String>;
 }
@@ -78,10 +82,76 @@ pub struct ToolCtx {
     pub read_hashes: Mutex<HashMap<PathBuf, String>>,
     /// Approved write scope for the task currently being executed (None = nothing pre-approved).
     pub scope: Mutex<Option<Scope>>,
+    /// Team-wide safety policy (sandbox, environment scrubbing).
+    pub policy: Arc<ToolPolicy>,
+    /// Team-wide token budget shared by every agent (None = unlimited).
+    pub budget: Option<Arc<TokenBudget>>,
+}
+
+/// Safety policy applied by the built-in tools.
+#[derive(Debug, Clone)]
+pub struct ToolPolicy {
+    /// Confine file tools to the workspace (no `..`, absolute paths or symlinks escaping it),
+    /// and forbid writes inside `.git/`.
+    pub sandbox: bool,
+    /// Environment variables never passed to `bash` (in addition to the secret-name heuristic).
+    pub secret_env: Vec<String>,
+    /// Variables passed to `bash` even if they look secret (e.g. `GITHUB_TOKEN` for `gh`).
+    pub env_passthrough: Vec<String>,
+}
+
+impl Default for ToolPolicy {
+    fn default() -> Self {
+        Self { sandbox: true, secret_env: vec![], env_passthrough: vec![] }
+    }
+}
+
+impl ToolPolicy {
+    /// Should `name` be removed from the environment of commands the model runs?
+    pub fn is_secret_env(&self, name: &str) -> bool {
+        if self.env_passthrough.iter().any(|p| p == name) {
+            return false;
+        }
+        let up = name.to_ascii_uppercase();
+        self.secret_env.iter().any(|s| s == name)
+            || ["_API_KEY", "_APIKEY", "_TOKEN", "_SECRET", "_PASSWORD", "_PASSWD", "_CREDENTIALS", "_PRIVATE_KEY"]
+                .iter()
+                .any(|s| up.ends_with(s))
+            || ["AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "GH_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"].contains(&up.as_str())
+    }
+}
+
+/// Token budget shared across the whole team; agents stop when it is exhausted.
+#[derive(Debug)]
+pub struct TokenBudget {
+    pub limit: u64,
+    used: std::sync::atomic::AtomicU64,
+}
+
+impl TokenBudget {
+    pub fn new(limit: u64) -> Self {
+        Self { limit, used: Default::default() }
+    }
+    pub fn add(&self, tokens: u64) {
+        self.used.fetch_add(tokens, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn used(&self) -> u64 {
+        self.used.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn exhausted(&self) -> bool {
+        self.used() >= self.limit
+    }
 }
 
 impl ToolCtx {
-    pub fn new(agent_id: impl Into<String>, cwd: PathBuf, gate: Arc<ApprovalGate>, events: EventSink, cancel: CancelCell, file_locks: FileLocks) -> Self {
+    pub fn new(
+        agent_id: impl Into<String>,
+        cwd: PathBuf,
+        gate: Arc<ApprovalGate>,
+        events: EventSink,
+        cancel: CancelCell,
+        file_locks: FileLocks,
+    ) -> Self {
         Self {
             agent_id: agent_id.into(),
             cwd,
@@ -91,13 +161,59 @@ impl ToolCtx {
             file_locks,
             read_hashes: Mutex::new(HashMap::new()),
             scope: Mutex::new(None),
+            policy: Arc::new(ToolPolicy::default()),
+            budget: None,
         }
     }
 
+    pub fn with_policy(mut self, policy: Arc<ToolPolicy>, budget: Option<Arc<TokenBudget>>) -> Self {
+        self.policy = policy;
+        self.budget = budget;
+        self
+    }
+
+    /// Lexical resolution against the workspace (no policy checks). Prefer [`Self::resolve_checked`].
     pub fn resolve(&self, p: &str) -> PathBuf {
         let path = Path::new(p);
         let abs = if path.is_absolute() { path.to_path_buf() } else { self.cwd.join(path) };
         normalize(&abs)
+    }
+
+    /// Resolve a model-supplied path and enforce the sandbox: the real location (after following
+    /// symlinks of every existing ancestor) must be inside the workspace; writes into `.git/` are
+    /// refused.
+    pub fn resolve_checked(&self, p: &str, write: bool) -> Result<PathBuf> {
+        let abs = self.resolve(p);
+        if !self.policy.sandbox {
+            return Ok(abs);
+        }
+        let root = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
+        // Canonicalize the deepest existing ancestor, then re-append the not-yet-existing tail.
+        let mut existing = abs.clone();
+        let mut tail = Vec::new();
+        while !existing.exists() {
+            match (existing.file_name().map(|s| s.to_os_string()), existing.parent()) {
+                (Some(name), Some(parent)) => {
+                    tail.push(name);
+                    existing = parent.to_path_buf();
+                }
+                _ => break,
+            }
+        }
+        let mut real = existing.canonicalize().unwrap_or(existing);
+        for part in tail.iter().rev() {
+            real.push(part);
+        }
+        if !real.starts_with(&root) {
+            anyhow::bail!(
+                "access denied: '{p}' is outside the workspace ({}). Only files inside the project can be accessed.",
+                root.display()
+            );
+        }
+        if write && real.strip_prefix(&root).ok().and_then(|r| r.components().next()).is_some_and(|c| c.as_os_str() == ".git") {
+            anyhow::bail!("access denied: writing inside .git/ is not allowed; use git commands via bash instead");
+        }
+        Ok(abs)
     }
 
     pub fn relative(&self, abs: &Path) -> String {

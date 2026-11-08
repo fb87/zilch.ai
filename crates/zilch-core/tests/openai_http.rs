@@ -88,3 +88,53 @@ async fn provider_errors_surface() {
     let err = complete(&client, &req, |_| {}).await.unwrap_err().to_string();
     assert!(err.contains("400") && err.contains("bad model"), "{err}");
 }
+
+#[tokio::test]
+async fn stalled_stream_times_out_instead_of_hanging() {
+    let s = MockServer::start().await;
+    // Headers arrive, then the body is delayed far beyond the idle timeout.
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(sse(&[r#"{"choices":[{"delta":{"content":"late"}}]}"#]))
+                .set_delay(std::time::Duration::from_secs(30)),
+        )
+        .mount(&s)
+        .await;
+    let client = zilch_core::llm::openai::OpenAiClient::new("t", format!("{}/v1", s.uri()), None, 2)
+        .with_idle_timeout(std::time::Duration::from_millis(300));
+    let req = ChatRequest { binding: Default::default(), messages: vec![Message::user("x")], tools: vec![], session: None };
+    let t = std::time::Instant::now();
+    let err = complete(&client, &req, |_| {}).await.unwrap_err().to_string();
+    assert!(t.elapsed() < std::time::Duration::from_secs(20), "hung for {:?}", t.elapsed());
+    assert!(err.contains("no response headers") || err.contains("stalled") || err.contains("failed"), "{err}");
+}
+
+#[tokio::test]
+async fn retry_after_is_honoured_then_succeeds() {
+    let s = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1").set_body_string("slow down"))
+        .up_to_n_times(1)
+        .mount(&s)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sse(&[r#"{"choices":[{"delta":{"content":"ok"}}]}"#])))
+        .mount(&s)
+        .await;
+    let client = zilch_core::llm::openai::OpenAiClient::new("t", format!("{}/v1", s.uri()), None, 2);
+    let req = ChatRequest { binding: Default::default(), messages: vec![Message::user("x")], tools: vec![], session: None };
+    let t = std::time::Instant::now();
+    let (msg, _) = complete(&client, &req, |_| {}).await.unwrap();
+    assert_eq!(msg.text(), "ok");
+    assert!(t.elapsed() >= std::time::Duration::from_millis(900), "Retry-After ignored: {:?}", t.elapsed());
+}
+
+#[tokio::test]
+async fn client_errors_are_not_retried() {
+    let s = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(401).set_body_string("bad key")).expect(1).mount(&s).await;
+    let client = zilch_core::llm::openai::OpenAiClient::new("t", format!("{}/v1", s.uri()), None, 2);
+    let req = ChatRequest { binding: Default::default(), messages: vec![Message::user("x")], tools: vec![], session: None };
+    assert!(complete(&client, &req, |_| {}).await.unwrap_err().to_string().contains("401"));
+}

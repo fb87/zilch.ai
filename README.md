@@ -138,3 +138,17 @@ OPENCODE_API_KEY=... cargo test -p zilch-core --test live_compaction -- --ignore
 Fuzzed properties cover the SSE decoder/parser, tool-call reassembly, `edit_file` semantics,
 output truncation, path normalization, file scopes, TODO graphs, and history compaction
 (never splitting a tool call from its results).
+
+## Safety & operations
+
+| Concern | What zilch does | Config |
+|---|---|---|
+| File access | File tools are **sandboxed to the workspace**: `..`, absolute paths and symlinks that resolve outside it are refused; writes into `.git/` are refused | `sandbox = false` to disable |
+| Secrets | `bash` runs **without secret env vars** (every provider `api_key_env`, plus `*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, …) so a prompt-injected `env` can't leak keys | `bash_env_passthrough = ["GITHUB_TOKEN"]` |
+| Runaway commands | each `bash` call runs in its own process group; on finish/timeout/cancel the **whole group is killed** (no orphaned servers) | `timeout_secs` per call (max 600) |
+| Runaway cost | optional **team-wide token cap**; agents stop with a clear error when it's reached (soft cap: checked before each request) | `max_session_tokens = 2_000_000` / `--max-tokens` |
+| Hung providers | no headers or no stream data for `idle_timeout_secs` → error instead of hanging; 429/408/5xx retried with backoff, `Retry-After` honoured, 4xx not retried | `[providers.x] idle_timeout_secs = 180` |
+| Context overflow | history compaction near each agent's `context_tokens` (see above) | `context_tokens = 128000` |
+| Debugging | every session writes a **JSONL event log** (mode 0600) to `<data dir>/zilch/logs/`; its path is printed on errors | `--log FILE`, `--no-log` |
+| Setup problems | `zilch --doctor` prints the resolved config and pings every distinct model | |
+| Interrupts | Ctrl-C cancels the turn (all agents); twice within 2s force-quits; `-p` exits 130 when cancelled, 1 on error | |

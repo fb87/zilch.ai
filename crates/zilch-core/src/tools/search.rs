@@ -42,7 +42,7 @@ impl Tool for GlobTool {
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<String> {
         let pattern = arg_str(&args, "pattern")?;
         let matcher = Glob::new(pattern)?.compile_matcher();
-        let root = ctx.resolve(arg_opt_str(&args, "path").unwrap_or("."));
+        let root = ctx.resolve_checked(arg_opt_str(&args, "path").unwrap_or("."), false)?;
         let cwd = ctx.cwd.clone();
         tokio::task::spawn_blocking(move || {
             let mut hits: Vec<String> = walk(root.clone())
@@ -88,11 +88,9 @@ impl Tool for GrepTool {
         args.get("pattern").and_then(Value::as_str).unwrap_or("?").to_string()
     }
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<String> {
-        let re = regex::RegexBuilder::new(arg_str(&args, "pattern")?)
-            .case_insensitive(arg_bool(&args, "case_insensitive"))
-            .build()?;
+        let re = regex::RegexBuilder::new(arg_str(&args, "pattern")?).case_insensitive(arg_bool(&args, "case_insensitive")).build()?;
         let filter = arg_opt_str(&args, "glob").map(Glob::new).transpose()?.map(|g| g.compile_matcher());
-        let root = ctx.resolve(arg_opt_str(&args, "path").unwrap_or("."));
+        let root = ctx.resolve_checked(arg_opt_str(&args, "path").unwrap_or("."), false)?;
         let cwd = ctx.cwd.clone();
         tokio::task::spawn_blocking(move || {
             let mut out = Vec::new();

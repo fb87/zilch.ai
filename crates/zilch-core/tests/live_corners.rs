@@ -47,7 +47,10 @@ async fn unicode_paths_and_content() {
     std::fs::create_dir_all(dir.path().join("tài_liệu")).unwrap();
     std::fs::write(dir.path().join("tài_liệu/ghi_chú.md"), "Mật khẩu kho: 🦀-ĐẶC-BIỆT-42\n日本語の行\n").unwrap();
     let mut a = agent(dir.path(), None, 10);
-    let out = a.run("Find the markdown file in this project and tell me the exact 'Mật khẩu kho' value. Reply with only the value.").await.unwrap();
+    let out = a
+        .run("Find the markdown file in this project and tell me the exact 'Mật khẩu kho' value. Reply with only the value.")
+        .await
+        .unwrap();
     println!("unicode → {out}");
     assert!(out.contains("🦀-ĐẶC-BIỆT-42"), "got: {out}");
 }
@@ -77,7 +80,8 @@ async fn missing_files_and_bad_tool_input_are_recoverable() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("real.txt"), "the real content is BANANA").unwrap();
     let mut a = agent(dir.path(), None, 10);
-    let out = a.run("Read the file ghost.txt. If it does not exist, read real.txt instead and tell me the uppercase word in it.").await.unwrap();
+    let out =
+        a.run("Read the file ghost.txt. If it does not exist, read real.txt instead and tell me the uppercase word in it.").await.unwrap();
     println!("missing → {out}");
     assert!(out.contains("BANANA"), "got: {out}");
     // The model may detect the missing file via glob or via a read_file error; both are fine.

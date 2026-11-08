@@ -42,8 +42,8 @@ impl Tool for TodoWrite {
         format!("{n} item(s)")
     }
     async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<String> {
-        let items: Vec<TodoInput> = serde_json::from_value(args.get("items").cloned().unwrap_or(Value::Null))
-            .map_err(|e| anyhow::anyhow!("invalid items: {e}"))?;
+        let items: Vec<TodoInput> =
+            serde_json::from_value(args.get("items").cloned().unwrap_or(Value::Null)).map_err(|e| anyhow::anyhow!("invalid items: {e}"))?;
         for i in &items {
             if let Some(w) = &i.worker {
                 if !w.contains('#') && self.0.cfg.workers().all(|p| &p.name != w) {
@@ -109,9 +109,9 @@ impl Tool for ProposePlan {
                 self.0.todos_changed();
                 "The user APPROVED the plan. Call run_todos now.".into()
             }
-            PlanDecision::Feedback(f) => format!(
-                "The user wants changes before approving:\n{f}\n\nRevise the TODOs with todo_write, then call propose_plan again."
-            ),
+            PlanDecision::Feedback(f) => {
+                format!("The user wants changes before approving:\n{f}\n\nRevise the TODOs with todo_write, then call propose_plan again.")
+            }
             PlanDecision::Reject(r) => format!(
                 "The user REJECTED the plan{}. Do not run it. Ask the user how they want to proceed.",
                 if r.is_empty() { String::new() } else { format!(": {r}") }

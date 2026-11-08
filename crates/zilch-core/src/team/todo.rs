@@ -198,8 +198,7 @@ impl TodoList {
         let mut remaining: Vec<&str> = self.items.iter().filter(|t| !t.status.is_terminal()).map(|t| t.id.as_str()).collect();
         let mut waves = Vec::new();
         while !remaining.is_empty() {
-            let (ready, rest): (Vec<&str>, Vec<&str>) =
-                remaining.iter().partition(|id| deps[*id].iter().all(|d| done.contains(d)));
+            let (ready, rest): (Vec<&str>, Vec<&str>) = remaining.iter().partition(|id| deps[*id].iter().all(|d| done.contains(d)));
             if ready.is_empty() {
                 bail!("dependency cycle among: {}", rest.join(", "));
             }
@@ -249,9 +248,7 @@ fn within(files: &[String], scope: &[String]) -> bool {
     if files.is_empty() {
         return false; // "touches anything" is never implicitly in scope
     }
-    files.iter().all(|f| {
-        scope.iter().any(|s| s == f || globset::Glob::new(s).map(|g| g.compile_matcher().is_match(f)).unwrap_or(false))
-    })
+    files.iter().all(|f| scope.iter().any(|s| s == f || globset::Glob::new(s).map(|g| g.compile_matcher().is_match(f)).unwrap_or(false)))
 }
 
 /// Conservative overlap test between two file scopes.

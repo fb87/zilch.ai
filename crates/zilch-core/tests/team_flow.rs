@@ -34,7 +34,12 @@ impl LlmClient for FakeLlm {
 }
 
 fn call(id: &str, name: &str, args: serde_json::Value) -> LlmEvent {
-    LlmEvent::ToolCallDelta { index: id.trim_start_matches(|c: char| !c.is_ascii_digit()).parse().unwrap_or(0), id: Some(id.into()), name: Some(name.into()), args: args.to_string() }
+    LlmEvent::ToolCallDelta {
+        index: id.trim_start_matches(|c: char| !c.is_ascii_digit()).parse().unwrap_or(0),
+        id: Some(id.into()),
+        name: Some(name.into()),
+        args: args.to_string(),
+    }
 }
 fn text(s: &str) -> LlmEvent {
     LlmEvent::TextDelta(s.into())
@@ -56,7 +61,11 @@ impl Approver for DenyAll {
     }
 }
 
-fn setup(dir: &std::path::Path, max_workers: usize, script: Box<Script>) -> (Team, Arc<FakeLlm>, Arc<DenyAll>, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
+fn setup(
+    dir: &std::path::Path,
+    max_workers: usize,
+    script: Box<Script>,
+) -> (Team, Arc<FakeLlm>, Arc<DenyAll>, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
     let env: BTreeMap<String, String> = [("OPENAI_API_KEY".to_string(), "test".to_string())].into();
     let ov = Overrides { max_workers: Some(max_workers), approval: Some(ApprovalMode::Plan), ..Default::default() };
     let cfg = Config::load_from(dir, &[], &env, &ov).unwrap();
@@ -93,11 +102,15 @@ async fn master_plans_and_workers_run_in_parallel() {
         }
         match assistant_turns(req) {
             0 => vec![call("c0", "read_file", json!({"path":"README.md"})), call("c1", "glob", json!({"pattern":"*"}))],
-            1 => vec![call("c0", "todo_write", json!({"items":[
-                {"id":"a","title":"A","task":"make a","files":["a.txt"]},
-                {"id":"b","title":"B","task":"make b","files":["b.txt"]},
-                {"id":"c","title":"C","task":"make c","files":["c.txt"],"depends_on":["a","b"]}
-            ]}))],
+            1 => vec![call(
+                "c0",
+                "todo_write",
+                json!({"items":[
+                    {"id":"a","title":"A","task":"make a","files":["a.txt"]},
+                    {"id":"b","title":"B","task":"make b","files":["b.txt"]},
+                    {"id":"c","title":"C","task":"make c","files":["c.txt"],"depends_on":["a","b"]}
+                ]}),
+            )],
             2 => vec![call("c0", "propose_plan", json!({"summary":"three files"}))],
             3 => vec![call("c0", "run_todos", json!({}))],
             _ => vec![text("All done.")],
@@ -157,7 +170,8 @@ async fn master_plans_and_workers_run_in_parallel() {
         }
     }
     // Each worker instance got its own composed system prompt (coder default + contract + its id).
-    let sys: Vec<String> = reqs.iter().filter(|r| !r.messages[0].text().contains("MASTER")).map(|r| r.messages[0].text().to_string()).collect();
+    let sys: Vec<String> =
+        reqs.iter().filter(|r| !r.messages[0].text().contains("MASTER")).map(|r| r.messages[0].text().to_string()).collect();
     assert!(sys.iter().all(|s| s.contains("You are a CODER") && s.contains("STATUS: done | failed")));
     assert!(sys.iter().any(|s| s.contains("coder#1")) && sys.iter().any(|s| s.contains("coder#2")));
 }

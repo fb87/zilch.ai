@@ -80,10 +80,7 @@ pub struct FunctionSpec {
 
 impl ToolSpec {
     pub fn new(name: impl Into<String>, description: impl Into<String>, parameters: Value) -> Self {
-        Self {
-            kind: "function",
-            function: FunctionSpec { name: name.into(), description: description.into(), parameters },
-        }
+        Self { kind: "function", function: FunctionSpec { name: name.into(), description: description.into(), parameters } }
     }
 }
 

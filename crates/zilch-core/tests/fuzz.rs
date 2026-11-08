@@ -187,24 +187,27 @@ proptest! {
 // ---------- TODO graphs ----------
 
 fn todo_inputs() -> impl Strategy<Value = Vec<TodoInput>> {
-    proptest::collection::vec((0u8..12, proptest::collection::vec(0u8..12, 0..4), proptest::collection::vec("[a-c]\\.rs|src/\\*\\*", 0..3)), 0..12)
-        .prop_map(|items| {
-            items
-                .into_iter()
-                .map(|(id, deps, files)| TodoInput {
-                    id: format!("t{id}"),
-                    title: None,
-                    task: Some(format!("do t{id}")),
-                    worker: None,
-                    files: Some(files),
-                    depends_on: Some(deps.into_iter().map(|d| format!("t{d}")).collect()),
-                    model: None,
-                    provider: None,
-                    status: None,
-                    remove: false,
-                })
-                .collect()
-        })
+    proptest::collection::vec(
+        (0u8..12, proptest::collection::vec(0u8..12, 0..4), proptest::collection::vec("[a-c]\\.rs|src/\\*\\*", 0..3)),
+        0..12,
+    )
+    .prop_map(|items| {
+        items
+            .into_iter()
+            .map(|(id, deps, files)| TodoInput {
+                id: format!("t{id}"),
+                title: None,
+                task: Some(format!("do t{id}")),
+                worker: None,
+                files: Some(files),
+                depends_on: Some(deps.into_iter().map(|d| format!("t{d}")).collect()),
+                model: None,
+                provider: None,
+                status: None,
+                remove: false,
+            })
+            .collect()
+    })
 }
 
 proptest! {
@@ -253,27 +256,39 @@ proptest! {
 
 fn history_strategy() -> impl Strategy<Value = Vec<Message>> {
     // Generate well-formed histories: user turns containing assistant tool-call groups.
-    proptest::collection::vec((
-        "\\PC{0,40}",
-        proptest::collection::vec((0usize..3, 0usize..6000, 0usize..2000), 0..5),
-    ), 1..12)
-    .prop_map(|turns| {
-        let mut h = vec![];
-        let mut id = 0;
-        for (utext, groups) in turns {
-            h.push(Message::user(utext));
-            for (ncalls, out_len, text_len) in groups {
-                let calls: Vec<ToolCall> = (0..ncalls.max(1)).map(|_| {
-                    id += 1;
-                    ToolCall { id: format!("c{id}"), kind: "function".into(), function: FunctionCall { name: "read_file".into(), arguments: "{}".into() } }
-                }).collect();
-                h.push(Message { role: Role::Assistant, content: Some("t".repeat(text_len)), tool_calls: calls.clone(), tool_call_id: None, reasoning_content: None });
-                for c in calls { h.push(Message::tool(c.id, "o".repeat(out_len))); }
+    proptest::collection::vec(("\\PC{0,40}", proptest::collection::vec((0usize..3, 0usize..6000, 0usize..2000), 0..5)), 1..12).prop_map(
+        |turns| {
+            let mut h = vec![];
+            let mut id = 0;
+            for (utext, groups) in turns {
+                h.push(Message::user(utext));
+                for (ncalls, out_len, text_len) in groups {
+                    let calls: Vec<ToolCall> = (0..ncalls.max(1))
+                        .map(|_| {
+                            id += 1;
+                            ToolCall {
+                                id: format!("c{id}"),
+                                kind: "function".into(),
+                                function: FunctionCall { name: "read_file".into(), arguments: "{}".into() },
+                            }
+                        })
+                        .collect();
+                    h.push(Message {
+                        role: Role::Assistant,
+                        content: Some("t".repeat(text_len)),
+                        tool_calls: calls.clone(),
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    });
+                    for c in calls {
+                        h.push(Message::tool(c.id, "o".repeat(out_len)));
+                    }
+                }
+                h.push(Message::assistant("done"));
             }
-            h.push(Message::assistant("done"));
-        }
-        h
-    })
+            h
+        },
+    )
 }
 
 fn well_formed(h: &[Message]) -> Result<(), String> {

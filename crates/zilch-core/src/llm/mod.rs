@@ -21,11 +21,7 @@ pub trait LlmClient: Send + Sync {
 }
 
 /// Run a request to completion, forwarding text deltas to `on_text`.
-pub async fn complete(
-    client: &dyn LlmClient,
-    req: &ChatRequest,
-    mut on_text: impl FnMut(&str) + Send,
-) -> Result<(Message, Usage)> {
+pub async fn complete(client: &dyn LlmClient, req: &ChatRequest, mut on_text: impl FnMut(&str) + Send) -> Result<(Message, Usage)> {
     let mut stream = client.stream(req).await?;
     let mut acc = accumulate::Accumulator::default();
     while let Some(ev) = stream.next().await {

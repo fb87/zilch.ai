@@ -95,7 +95,11 @@ fn transcript(msgs: &[Message]) -> String {
             Role::Tool => "tool result",
         };
         let text = m.text();
-        let text: String = if m.role == Role::Tool && text.len() > 2_000 { format!("{}… [clipped]", &text[..text.floor_char_boundary(2_000)]) } else { text.to_string() };
+        let text: String = if m.role == Role::Tool && text.len() > 2_000 {
+            format!("{}… [clipped]", &text[..text.floor_char_boundary(2_000)])
+        } else {
+            text.to_string()
+        };
         if !text.is_empty() {
             s.push_str(&format!("[{who}] {text}\n"));
         }
@@ -114,10 +118,19 @@ facts about the codebase the agent will need again (paths, names, conventions). 
 output. Use terse bullet points.";
 
 /// Step 2: summarize `history[..cut]` and splice the summary in. Returns the new history.
-pub async fn summarize(llm: &dyn LlmClient, binding: &ModelBinding, session: Option<String>, history: &[Message], cut: usize) -> anyhow::Result<Vec<Message>> {
+pub async fn summarize(
+    llm: &dyn LlmClient,
+    binding: &ModelBinding,
+    session: Option<String>,
+    history: &[Message],
+    cut: usize,
+) -> anyhow::Result<Vec<Message>> {
     let req = ChatRequest {
         binding: ModelBinding { max_tokens: Some(binding.max_tokens.unwrap_or(4_000).min(4_000)), ..binding.clone() },
-        messages: vec![Message::system(SUMMARY_PROMPT), Message::user(format!("Conversation to summarize:\n\n{}", transcript(&history[..cut])))],
+        messages: vec![
+            Message::system(SUMMARY_PROMPT),
+            Message::user(format!("Conversation to summarize:\n\n{}", transcript(&history[..cut]))),
+        ],
         tools: vec![],
         session,
     };
@@ -129,7 +142,10 @@ pub async fn summarize(llm: &dyn LlmClient, binding: &ModelBinding, session: Opt
     // If the cut falls inside a turn, the instruction being worked on is in the summarized part:
     // quote it verbatim so the agent never loses its task.
     let current_task = if history[cut].role == Role::Assistant {
-        history[..cut].iter().rposition(|m| m.role == Role::User && !m.text().starts_with("<conversation-summary>")).map(|i| history[i].text().to_string())
+        history[..cut]
+            .iter()
+            .rposition(|m| m.role == Role::User && !m.text().starts_with("<conversation-summary>"))
+            .map(|i| history[i].text().to_string())
     } else {
         None
     };
@@ -216,7 +232,11 @@ mod tests {
         Message {
             role: Role::Assistant,
             content: None,
-            tool_calls: vec![ToolCall { id: id.into(), kind: "function".into(), function: FunctionCall { name: "read_file".into(), arguments: "{}".into() } }],
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                kind: "function".into(),
+                function: FunctionCall { name: "read_file".into(), arguments: "{}".into() },
+            }],
             tool_call_id: None,
             reasoning_content: None,
         }
@@ -255,7 +275,9 @@ mod tests {
             if self.fail {
                 anyhow::bail!("provider down");
             }
-            Ok(Box::pin(futures::stream::iter(vec![Ok(crate::llm::LlmEvent::TextDelta("- user wants tasks 0-9 done\n- tasks 0-5 done".into()))])))
+            Ok(Box::pin(futures::stream::iter(vec![Ok(crate::llm::LlmEvent::TextDelta(
+                "- user wants tasks 0-9 done\n- tasks 0-5 done".into(),
+            ))])))
         }
     }
 

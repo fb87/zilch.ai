@@ -80,6 +80,11 @@ impl Agent {
             if cancel.is_cancelled() {
                 bail!("cancelled");
             }
+            if let Some(b) = &self.ctx.budget {
+                if b.exhausted() {
+                    bail!("session token budget exhausted ({} of {} tokens used); raise max_session_tokens to continue", b.used(), b.limit);
+                }
+            }
             let specs = self.tools.specs();
             if let Some(r) = super::compact::maybe_compact(
                 self.llm.as_ref(),
@@ -93,7 +98,12 @@ impl Agent {
             .await
             {
                 let how = if r.summarized { "summarized older turns" } else { "elided old tool output" };
-                self.emit(EventKind::Notice(format!("{}: compacted history ~{:.1}k → ~{:.1}k tokens ({how})", self.id, r.before as f64 / 1000.0, r.after as f64 / 1000.0)));
+                self.emit(EventKind::Notice(format!(
+                    "{}: compacted history ~{:.1}k → ~{:.1}k tokens ({how})",
+                    self.id,
+                    r.before as f64 / 1000.0,
+                    r.after as f64 / 1000.0
+                )));
             }
             let mut messages = Vec::with_capacity(self.history.len() + 2);
             messages.push(Message::system(&self.system));
@@ -111,6 +121,9 @@ impl Agent {
                 _ = cancel.cancelled() => bail!("cancelled"),
             };
             self.usage += usage;
+            if let Some(b) = &self.ctx.budget {
+                b.add(usage.prompt_tokens + usage.completion_tokens);
+            }
             self.emit(EventKind::Usage { model: self.binding.key(), usage });
             if msg.content.is_some() {
                 self.emit(EventKind::TextDone);
@@ -155,7 +168,10 @@ impl Agent {
             let args: Value = match serde_json::from_str(&call.function.arguments) {
                 Ok(v @ Value::Object(_)) => v,
                 Ok(_) | Err(_) => {
-                    prepared.push(Prepared::Done(format!("Error: arguments for '{name}' must be a JSON object; got: {}", call.function.arguments)));
+                    prepared.push(Prepared::Done(format!(
+                        "Error: arguments for '{name}' must be a JSON object; got: {}",
+                        call.function.arguments
+                    )));
                     continue;
                 }
             };
@@ -163,7 +179,9 @@ impl Agent {
                 let in_scope = tool.target_path(&args).is_some_and(|p| self.ctx.in_scope(&p));
                 let req = ApprovalRequest { agent: self.id.clone(), tool: name.clone(), summary: tool.summarize(&args) };
                 if !self.ctx.gate.check(&req, in_scope).await {
-                    prepared.push(Prepared::Done("Error: the user denied this action. Do not retry it; adjust your approach or report back.".into()));
+                    prepared.push(Prepared::Done(
+                        "Error: the user denied this action. Do not retry it; adjust your approach or report back.".into(),
+                    ));
                     continue;
                 }
             }
@@ -189,7 +207,8 @@ impl Agent {
                     Ok(s) => (true, s),
                     Err(e) => (false, format!("Error: {e:#}")),
                 };
-                let first = out.lines().next().unwrap_or("").chars().take(100).collect::<String>();
+                // Failures keep more detail: the reason is usually what the user needs to see.
+                let first = out.lines().next().unwrap_or("").chars().take(if ok { 100 } else { 400 }).collect::<String>();
                 self.emit(EventKind::ToolEnd { call_id: call.id.clone(), name: call.function.name.clone(), ok, summary: first });
                 out
             }

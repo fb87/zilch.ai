@@ -28,7 +28,7 @@ impl Tool for ReadFile {
         args.get("path").and_then(Value::as_str).unwrap_or("?").to_string()
     }
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<String> {
-        let path = ctx.resolve(arg_str(&args, "path")?);
+        let path = ctx.resolve_checked(arg_str(&args, "path")?, false)?;
         let bytes = tokio::fs::read(&path).await.with_context(|| format!("cannot read {}", path.display()))?;
         ctx.read_hashes.lock().unwrap().insert(path.clone(), sha256(&bytes));
         if bytes.iter().take(8000).any(|b| *b == 0) {
@@ -81,7 +81,7 @@ impl Tool for WriteFile {
         format!("{} ({n} lines)", args.get("path").and_then(Value::as_str).unwrap_or("?"))
     }
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<String> {
-        let path = ctx.resolve(arg_str(&args, "path")?);
+        let path = ctx.resolve_checked(arg_str(&args, "path")?, true)?;
         let content = arg_str(&args, "content")?;
         let _guard = ctx.file_locks.lock(&path).await;
         check_fresh(ctx, &path, true).await?;
@@ -152,5 +152,61 @@ mod tests {
         EditFile.call(edit("2", "two"), &w2).await.unwrap();
         // New files can be created without reading.
         WriteFile.call(json!({"path":"sub/new.txt","content":"n"}), &w1).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod sandbox_tests {
+    use super::*;
+    use crate::agent::{ApprovalGate, ApprovalMode, AutoApprove, EventSink};
+    use crate::team::file_locks::FileLocks;
+    use crate::tools::search::{GlobTool, GrepTool};
+    use crate::tools::{edit::EditFile, CancelCell, ToolPolicy};
+    use std::sync::Arc;
+
+    fn ctx(dir: &Path, sandbox: bool) -> ToolCtx {
+        let gate = Arc::new(ApprovalGate::new(ApprovalMode::Auto, Arc::new(AutoApprove)));
+        ToolCtx::new("t", dir.to_path_buf(), gate, EventSink::null(), CancelCell::default(), FileLocks::default())
+            .with_policy(Arc::new(ToolPolicy { sandbox, ..Default::default() }), None)
+    }
+
+    #[tokio::test]
+    async fn escapes_are_denied() {
+        let outer = tempfile::tempdir().unwrap();
+        let ws = outer.path().join("ws");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        std::fs::write(outer.path().join("secret.txt"), "TOP SECRET").unwrap();
+        std::fs::write(ws.join("ok.txt"), "fine").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outer.path(), ws.join("link_out")).unwrap();
+        let c = ctx(&ws, true);
+        let denied = |r: Result<String>| r.unwrap_err().to_string().contains("access denied");
+
+        assert!(denied(ReadFile.call(json!({"path":"../secret.txt"}), &c).await));
+        assert!(denied(ReadFile.call(json!({"path": outer.path().join("secret.txt").display().to_string()}), &c).await));
+        assert!(denied(ReadFile.call(json!({"path":"sub/../../secret.txt"}), &c).await));
+        #[cfg(unix)]
+        {
+            assert!(denied(ReadFile.call(json!({"path":"link_out/secret.txt"}), &c).await), "symlink escape");
+            assert!(denied(WriteFile.call(json!({"path":"link_out/new.txt","content":"x"}), &c).await), "write via symlink");
+        }
+        assert!(denied(WriteFile.call(json!({"path":"../evil.txt","content":"x"}), &c).await));
+        assert!(denied(WriteFile.call(json!({"path":".git/config","content":"x"}), &c).await), ".git writes");
+        assert!(denied(EditFile.call(json!({"path":"/etc/hostname","old_string":"a","new_string":"b"}), &c).await));
+        assert!(denied(GrepTool.call(json!({"pattern":"SECRET","path":".."}), &c).await));
+        assert!(denied(GlobTool.call(json!({"pattern":"*","path":"/"}), &c).await));
+        assert!(!outer.path().join("evil.txt").exists());
+
+        // Inside the workspace everything still works, including new nested files.
+        assert!(ReadFile.call(json!({"path":"ok.txt"}), &c).await.unwrap().contains("fine"));
+        assert!(ReadFile.call(json!({"path":"./sub/../ok.txt"}), &c).await.is_ok());
+        WriteFile.call(json!({"path":"deep/new/file.txt","content":"x"}), &c).await.unwrap();
+        // Reading .git is allowed (git metadata is useful), writing isn't.
+        std::fs::write(ws.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        assert!(ReadFile.call(json!({"path":".git/HEAD"}), &c).await.is_ok());
+
+        // Opt-out works.
+        let open = ctx(&ws, false);
+        assert!(ReadFile.call(json!({"path":"../secret.txt"}), &open).await.unwrap().contains("TOP SECRET"));
     }
 }

@@ -29,6 +29,8 @@ pub struct ProviderCfg {
     pub headers: Option<BTreeMap<String, String>>,
     /// Header carrying each agent's stable conversation id (e.g. "x-opencode-session").
     pub session_header: Option<String>,
+    /// Seconds without any data before a request/stream is considered stalled (default 180).
+    pub idle_timeout_secs: Option<u64>,
 }
 
 impl ProviderCfg {
@@ -39,6 +41,7 @@ impl ProviderCfg {
         merge_opt(&mut self.max_concurrent, o.max_concurrent);
         merge_opt(&mut self.headers, o.headers);
         merge_opt(&mut self.session_header, o.session_header);
+        merge_opt(&mut self.idle_timeout_secs, o.idle_timeout_secs);
     }
 }
 
@@ -102,6 +105,9 @@ fn merge_opt<T>(dst: &mut Option<T>, src: Option<T>) {
 pub struct FileConfig {
     pub max_workers: Option<usize>,
     pub approval: Option<ApprovalMode>,
+    pub sandbox: Option<bool>,
+    pub bash_env_passthrough: Option<Vec<String>>,
+    pub max_session_tokens: Option<u64>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderCfg>,
     pub defaults: Option<RoleCfg>,
@@ -117,6 +123,7 @@ pub struct Overrides {
     pub worker_models: Vec<(String, String)>,
     pub max_workers: Option<usize>,
     pub approval: Option<ApprovalMode>,
+    pub max_session_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +131,12 @@ pub struct Config {
     pub cwd: PathBuf,
     pub max_workers: usize,
     pub approval: ApprovalMode,
+    /// Confine file tools to the workspace (default true).
+    pub sandbox: bool,
+    /// Secret-looking env vars still passed to bash (e.g. GITHUB_TOKEN).
+    pub bash_env_passthrough: Vec<String>,
+    /// Team-wide token cap per session (prompt + completion), None = unlimited.
+    pub max_session_tokens: Option<u64>,
     pub providers: BTreeMap<String, ProviderCfg>,
     /// Master first, then workers.
     pub profiles: Vec<Profile>,
@@ -163,10 +176,12 @@ impl Config {
             }
             let agents = dir.join("agents");
             if let Ok(rd) = std::fs::read_dir(&agents) {
-                let mut paths: Vec<_> = rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|e| e == "toml")).collect();
+                let mut paths: Vec<_> =
+                    rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|e| e == "toml")).collect();
                 paths.sort();
                 for p in paths {
-                    let mut rc: RoleCfg = toml::from_str(&std::fs::read_to_string(&p)?).with_context(|| format!("parsing {}", p.display()))?;
+                    let mut rc: RoleCfg =
+                        toml::from_str(&std::fs::read_to_string(&p)?).with_context(|| format!("parsing {}", p.display()))?;
                     rc.absolutize(dir);
                     let name = rc.name.clone().or_else(|| p.file_stem().map(|s| s.to_string_lossy().into_owned())).unwrap();
                     agent_files.entry(name).or_default().merge(rc);
@@ -214,6 +229,9 @@ impl Config {
             cwd: cwd.to_path_buf(),
             max_workers: ov.max_workers.or(fc.max_workers).unwrap_or(4).max(1),
             approval: ov.approval.or(fc.approval).unwrap_or_default(),
+            sandbox: fc.sandbox.unwrap_or(true),
+            bash_env_passthrough: fc.bash_env_passthrough.unwrap_or_default(),
+            max_session_tokens: ov.max_session_tokens.or(fc.max_session_tokens),
             providers: fc.providers,
             profiles,
         };
@@ -256,7 +274,8 @@ impl Config {
             let headers = c.headers.clone().unwrap_or_default().into_iter().collect();
             let client = OpenAiClient::new(name, c.base_url.clone().unwrap_or_default(), key, c.max_concurrent.unwrap_or(8))
                 .with_headers(headers)
-                .with_session_header(c.session_header.clone());
+                .with_session_header(c.session_header.clone())
+                .with_idle_timeout(std::time::Duration::from_secs(c.idle_timeout_secs.unwrap_or(180).max(5)));
             out.insert(name.clone(), Arc::new(client));
         }
         Ok(out)
@@ -266,6 +285,9 @@ impl Config {
 fn merge_file(dst: &mut FileConfig, src: FileConfig, base: &Path) {
     merge_opt(&mut dst.max_workers, src.max_workers);
     merge_opt(&mut dst.approval, src.approval);
+    merge_opt(&mut dst.sandbox, src.sandbox);
+    merge_opt(&mut dst.bash_env_passthrough, src.bash_env_passthrough);
+    merge_opt(&mut dst.max_session_tokens, src.max_session_tokens);
     for (k, v) in src.providers {
         dst.providers.entry(k).or_default().merge(v);
     }
@@ -282,8 +304,18 @@ fn merge_file(dst: &mut FileConfig, src: FileConfig, base: &Path) {
 fn build_profile(name: &str, rc: RoleCfg, defaults: &RoleCfg) -> Result<Profile> {
     let (role, default_prompt, default_desc, default_tools): (_, &str, &str, &[&str]) = match name {
         "master" => (AgentRole::Master, prompt::MASTER_PROMPT, "Team lead; plans and coordinates", MASTER_TOOLS),
-        "coder" => (AgentRole::Worker, prompt::CODER_PROMPT, "Implements changes: reads, writes and edits files, runs commands and tests", WORKER_TOOLS),
-        "explorer" => (AgentRole::Worker, prompt::EXPLORER_PROMPT, "Read-only investigation: finds code, answers questions about the codebase", READONLY_TOOLS),
+        "coder" => (
+            AgentRole::Worker,
+            prompt::CODER_PROMPT,
+            "Implements changes: reads, writes and edits files, runs commands and tests",
+            WORKER_TOOLS,
+        ),
+        "explorer" => (
+            AgentRole::Worker,
+            prompt::EXPLORER_PROMPT,
+            "Read-only investigation: finds code, answers questions about the codebase",
+            READONLY_TOOLS,
+        ),
         _ => (AgentRole::Worker, prompt::WORKER_PROMPT, "General worker", WORKER_TOOLS),
     };
 

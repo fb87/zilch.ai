@@ -34,7 +34,10 @@ pub async fn run(shared: &Arc<TeamShared>, ids: Option<Vec<String>>) -> Result<S
         selected.iter().map(|t| t.id.clone()).collect()
     };
     if targets.is_empty() {
-        return Ok("Nothing to run: no approved pending TODOs (failed/blocked items must be reset to \"pending\" with todo_write to retry).".into());
+        return Ok(
+            "Nothing to run: no approved pending TODOs (failed/blocked items must be reset to \"pending\" with todo_write to retry)."
+                .into(),
+        );
     }
     let target_set: HashSet<String> = targets.iter().cloned().collect();
     let cancel = shared.cancel.current();
@@ -54,9 +57,12 @@ pub async fn run(shared: &Arc<TeamShared>, ids: Option<Vec<String>>) -> Result<S
                 }
             }
             let mut picked: Vec<Todo> = Vec::new();
-            for t in l.items.iter().filter(|t| target_set.contains(&t.id) && t.status == TodoStatus::Pending && !running.contains_key(&t.id)) {
+            for t in
+                l.items.iter().filter(|t| target_set.contains(&t.id) && t.status == TodoStatus::Pending && !running.contains_key(&t.id))
+            {
                 let deps_done = t.depends_on.iter().all(|d| matches!(status.get(d), Some(TodoStatus::Done | TodoStatus::Cancelled)));
-                let conflict = running.values().any(|f| scopes_overlap(f, &t.files)) || picked.iter().any(|p| scopes_overlap(&p.files, &t.files));
+                let conflict =
+                    running.values().any(|f| scopes_overlap(f, &t.files)) || picked.iter().any(|p| scopes_overlap(&p.files, &t.files));
                 if deps_done && !conflict {
                     picked.push(t.clone());
                 }
@@ -111,7 +117,13 @@ pub async fn run(shared: &Arc<TeamShared>, ids: Option<Vec<String>>) -> Result<S
     let mut out = String::from("Execution finished.\n");
     for id in &targets {
         let Some(t) = l.get(id) else { continue };
-        out.push_str(&format!("\n### [{}] {} — {:?}{}\n", t.id, t.title, t.status, t.instance.as_ref().map(|i| format!(" ({i})")).unwrap_or_default()));
+        out.push_str(&format!(
+            "\n### [{}] {} — {:?}{}\n",
+            t.id,
+            t.title,
+            t.status,
+            t.instance.as_ref().map(|i| format!(" ({i})")).unwrap_or_default()
+        ));
         match (&t.status, &t.report) {
             (TodoStatus::Pending, _) => out.push_str(&format!("Not run: waiting on {}\n", t.depends_on.join(", "))),
             (_, Some(r)) => out.push_str(&truncate_output(r.trim(), 4000)),
@@ -133,7 +145,13 @@ async fn run_one(sh: Arc<TeamShared>, t: Todo) -> Result<(String, String)> {
     let (inst, mut agent) = sh.acquire(&t.worker, binding, false).await?;
     sh.set_todo_status(&t.id, TodoStatus::InProgress, Some(inst.id.clone()), None);
     let scope = if t.files.is_empty() { None } else { Some(Scope::new(&t.files)?) };
-    let brief = format!("TODO [{}] {}\n\n{}\n\nFiles in scope: {}", t.id, t.title, t.task, if t.files.is_empty() { "(not restricted)".into() } else { t.files.join(", ") });
+    let brief = format!(
+        "TODO [{}] {}\n\n{}\n\nFiles in scope: {}",
+        t.id,
+        t.title,
+        t.task,
+        if t.files.is_empty() { "(not restricted)".into() } else { t.files.join(", ") }
+    );
     let report = sh.run_task(&mut agent, &brief, scope, false).await?;
     Ok((inst.id.clone(), report))
 }

@@ -1,6 +1,6 @@
 pub mod approval;
-pub mod events;
 pub mod compact;
+pub mod events;
 pub mod run;
 
 pub use approval::{ApprovalGate, ApprovalMode, ApprovalRequest, Approver, AutoApprove, Decision};

@@ -60,7 +60,11 @@ fn event_data(event: &[u8]) -> Option<String> {
         .filter_map(|l| l.strip_prefix("data:"))
         .map(|d| d.strip_prefix(' ').unwrap_or(d))
         .collect();
-    if data.is_empty() { None } else { Some(data.join("\n")) }
+    if data.is_empty() {
+        None
+    } else {
+        Some(data.join("\n"))
+    }
 }
 
 /// Decode one `data:` payload into events. Returns `None` for `[DONE]`.
@@ -69,8 +73,7 @@ pub fn parse_chunk(data: &str) -> anyhow::Result<Option<Vec<LlmEvent>>> {
     if data == "[DONE]" {
         return Ok(None);
     }
-    let v: Value = serde_json::from_str(data)
-        .map_err(|e| anyhow::anyhow!("bad stream chunk: {e}: {data}"))?;
+    let v: Value = serde_json::from_str(data).map_err(|e| anyhow::anyhow!("bad stream chunk: {e}: {data}"))?;
     if let Some(err) = v.get("error") {
         anyhow::bail!("provider error: {err}");
     }
@@ -97,11 +100,7 @@ pub fn parse_chunk(data: &str) -> anyhow::Result<Option<Vec<LlmEvent>>> {
                         index,
                         id: c.get("id").and_then(Value::as_str).map(str::to_string),
                         name: f.and_then(|f| f.get("name")).and_then(Value::as_str).map(str::to_string),
-                        args: f
-                            .and_then(|f| f.get("arguments"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
+                        args: f.and_then(|f| f.get("arguments")).and_then(Value::as_str).unwrap_or("").to_string(),
                     });
                 }
             }
@@ -156,7 +155,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(ev[0], LlmEvent::TextDelta("hi".into()));
-        assert!(matches!(&ev[1], LlmEvent::ToolCallDelta { index: 0, id: Some(id), name: Some(n), args } if id == "c1" && n == "read_file" && args == "{\"pa"));
+        assert!(
+            matches!(&ev[1], LlmEvent::ToolCallDelta { index: 0, id: Some(id), name: Some(n), args } if id == "c1" && n == "read_file" && args == "{\"pa")
+        );
         assert!(parse_chunk("[DONE]").unwrap().is_none());
     }
 }

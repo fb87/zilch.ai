@@ -55,7 +55,11 @@ impl Screen {
     }
 
     pub fn c(&self, code: &'static str) -> &'static str {
-        if self.color { code } else { "" }
+        if self.color {
+            code
+        } else {
+            ""
+        }
     }
 
     /// Erase the panel so normal output (or a prompt) can be printed.
@@ -107,7 +111,17 @@ impl Screen {
         for t in &running {
             let inst = t.instance.clone().unwrap_or_else(|| "queued".into());
             let act = self.activity.get(&inst).cloned().unwrap_or_else(|| "thinking…".into());
-            lines.push(format!("  {}◐{} [{}] {} {}· {} · {}{}", self.c(YELLOW), self.c(RESET), t.id, t.title, self.c(DIM), inst, act, self.c(RESET)));
+            lines.push(format!(
+                "  {}◐{} [{}] {} {}· {} · {}{}",
+                self.c(YELLOW),
+                self.c(RESET),
+                t.id,
+                t.title,
+                self.c(DIM),
+                inst,
+                act,
+                self.c(RESET)
+            ));
         }
         for (inst, task) in &self.delegations {
             let act = self.activity.get(inst).cloned().unwrap_or_else(|| "thinking…".into());
@@ -181,7 +195,11 @@ impl Screen {
             }
             EventKind::ToolEnd { ok, summary, name, .. } => {
                 if master && (self.verbose || !["todo_write", "propose_plan", "run_todos", "delegate"].contains(&name.as_str())) {
-                    let mark = if ok { format!("{}⎿{}", self.c(DIM), self.c(RESET)) } else { format!("{}⎿ ✗{}", self.c(RED), self.c(RESET)) };
+                    let mark = if ok {
+                        format!("{}⎿{}", self.c(DIM), self.c(RESET))
+                    } else {
+                        format!("{}⎿ ✗{}", self.c(RED), self.c(RESET))
+                    };
                     let msg = format!("  {mark} {}{}{}", self.c(DIM), summary, self.c(RESET));
                     self.line(&msg);
                 } else if !master && !ok && self.verbose {
@@ -196,7 +214,15 @@ impl Screen {
                 if first {
                     let mut s = format!("{}● TODOs{}", self.c(CYAN), self.c(RESET));
                     for t in &new {
-                        s.push_str(&format!("\n  {} [{}] {} {}({}){}", t.status.icon(), t.id, t.title, self.c(DIM), t.worker, self.c(RESET)));
+                        s.push_str(&format!(
+                            "\n  {} [{}] {} {}({}){}",
+                            t.status.icon(),
+                            t.id,
+                            t.title,
+                            self.c(DIM),
+                            t.worker,
+                            self.c(RESET)
+                        ));
                     }
                     self.line(&s);
                 }
@@ -208,9 +234,27 @@ impl Screen {
                     let inst = t.instance.clone().unwrap_or_default();
                     let summary = t.report.as_deref().and_then(summary_line).unwrap_or_default();
                     let msg = match t.status {
-                        TodoStatus::Done => format!("  {}✓{} [{}] {} {}({inst}) {summary}{}", self.c(GREEN), self.c(RESET), t.id, t.title, self.c(DIM), self.c(RESET)),
-                        TodoStatus::Failed => format!("  {}✗{} [{}] {} {}({inst}) {summary}{}", self.c(RED), self.c(RESET), t.id, t.title, self.c(DIM), self.c(RESET)),
-                        TodoStatus::Blocked => format!("  {}⊘{} [{}] {} blocked by a failed dependency", self.c(YELLOW), self.c(RESET), t.id, t.title),
+                        TodoStatus::Done => format!(
+                            "  {}✓{} [{}] {} {}({inst}) {summary}{}",
+                            self.c(GREEN),
+                            self.c(RESET),
+                            t.id,
+                            t.title,
+                            self.c(DIM),
+                            self.c(RESET)
+                        ),
+                        TodoStatus::Failed => format!(
+                            "  {}✗{} [{}] {} {}({inst}) {summary}{}",
+                            self.c(RED),
+                            self.c(RESET),
+                            t.id,
+                            t.title,
+                            self.c(DIM),
+                            self.c(RESET)
+                        ),
+                        TodoStatus::Blocked => {
+                            format!("  {}⊘{} [{}] {} blocked by a failed dependency", self.c(YELLOW), self.c(RESET), t.id, t.title)
+                        }
                         TodoStatus::Cancelled => format!("  – [{}] {} cancelled", t.id, t.title),
                         _ => {
                             if !first && before.is_none() {
@@ -277,7 +321,10 @@ impl Screen {
 }
 
 fn summary_line(report: &str) -> Option<String> {
-    report.lines().find_map(|l| l.trim().strip_prefix("SUMMARY:").map(|s| s.trim().to_string())).or_else(|| report.lines().next().map(|s| s.chars().take(100).collect()))
+    report
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("SUMMARY:").map(|s| s.trim().to_string()))
+        .or_else(|| report.lines().next().map(|s| s.chars().take(100).collect()))
 }
 
 fn terminal_width() -> usize {
@@ -313,9 +360,16 @@ fn clip(s: &str, width: usize) -> String {
     out
 }
 
-pub fn spawn_renderer(screen: SharedScreen, mut rx: mpsc::UnboundedReceiver<AgentEvent>) -> tokio::task::JoinHandle<()> {
+pub fn spawn_renderer(
+    screen: SharedScreen,
+    mut rx: mpsc::UnboundedReceiver<AgentEvent>,
+    mut log: Option<crate::log::EventLog>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
+            if let Some(l) = log.as_mut() {
+                l.handle(&ev);
+            }
             screen.lock().await.handle(ev);
         }
     })
