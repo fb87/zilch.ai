@@ -107,3 +107,41 @@ async fn empty_and_reasoning_only_replies_are_handled() {
     assert_eq!(a.run("go").await.unwrap(), "");
     assert_eq!(a.history[1].reasoning_content.as_deref(), Some("thinking…"));
 }
+
+#[tokio::test]
+async fn caps_refuse_before_sending_and_costs_are_recorded() {
+    use zilch_core::llm::catalog::{CostMeter, ModelInfo};
+    use zilch_core::tools::{TokenBudget, ToolPolicy};
+    let dir = tempfile::tempdir().unwrap();
+
+    // Token cap: the next request alone would exceed it → refused with NO provider call
+    // (the script is empty, so any call would panic).
+    let mut a = agent(dir.path(), vec![]);
+    let ctx =
+        ToolCtx::new("t", dir.path().to_path_buf(), a.ctx.gate.clone(), EventSink::null(), CancelCell::default(), FileLocks::default())
+            .with_policy(Arc::new(ToolPolicy::default()), Some(Arc::new(TokenBudget::new(50))));
+    a.ctx = Arc::new(ctx);
+    let err = a.run("a request whose prompt (system prompt + tool schemas) is well over fifty tokens").await.unwrap_err().to_string();
+    assert!(err.contains("token budget reached"), "{err}");
+
+    // Cost: recorded per response; the cap refuses the next request once it would be exceeded.
+    let meter = Arc::new(CostMeter::new(Some(0.02)));
+    meter.catalog.write().unwrap().insert("/".into(), ModelInfo { context: None, input_per_mtok: Some(10.0), output_per_mtok: Some(10.0) });
+    let mut b = agent(
+        dir.path(),
+        vec![Some(vec![
+            LlmEvent::Usage(zilch_core::llm::Usage { prompt_tokens: 1500, completion_tokens: 10 }),
+            LlmEvent::TextDelta("ok".into()),
+        ])],
+    );
+    let ctx =
+        ToolCtx::new("t", dir.path().to_path_buf(), b.ctx.gate.clone(), EventSink::null(), CancelCell::default(), FileLocks::default())
+            .with_meter(meter.clone());
+    b.ctx = Arc::new(ctx);
+    assert_eq!(b.run("first").await.unwrap(), "ok");
+    assert!((meter.spent() - 0.0151).abs() < 1e-9, "spent {}", meter.spent());
+    // First request: ~0.007 estimated < 0.02. Second: 0.0151 spent + ~0.007 > 0.02 → refused.
+    assert!(b.history.len() == 2);
+    let err = b.run("second").await.unwrap_err().to_string();
+    assert!(err.contains("cost cap"), "{err}");
+}

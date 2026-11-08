@@ -87,6 +87,8 @@ pub struct ToolCtx {
     pub policy: Arc<ToolPolicy>,
     /// Team-wide token budget shared by every agent (None = unlimited).
     pub budget: Option<Arc<TokenBudget>>,
+    /// Team-wide cost accounting (prices + optional dollar cap).
+    pub meter: Arc<crate::llm::catalog::CostMeter>,
 }
 
 /// Safety policy applied by the built-in tools.
@@ -174,7 +176,13 @@ impl ToolCtx {
             scope: Mutex::new(None),
             policy: Arc::new(ToolPolicy::default()),
             budget: None,
+            meter: Arc::new(crate::llm::catalog::CostMeter::new(None)),
         }
+    }
+
+    pub fn with_meter(mut self, meter: Arc<crate::llm::catalog::CostMeter>) -> Self {
+        self.meter = meter;
+        self
     }
 
     pub fn with_policy(mut self, policy: Arc<ToolPolicy>, budget: Option<Arc<TokenBudget>>) -> Self {

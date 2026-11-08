@@ -30,6 +30,10 @@ pub struct Profile {
     pub max_steps: usize,
     /// Context window budget in tokens; history is compacted near this limit.
     pub context_tokens: usize,
+    /// True if context_tokens was set in config (otherwise it may be discovered).
+    pub context_explicit: bool,
+    /// Explicitly configured prices (override discovered ones).
+    pub pricing: crate::llm::catalog::ModelInfo,
     /// Built-in default prompt for this profile.
     pub default_prompt: String,
     /// User-provided prompt text (inline or loaded from file).

@@ -80,11 +80,6 @@ impl Agent {
             if cancel.is_cancelled() {
                 bail!("cancelled");
             }
-            if let Some(b) = &self.ctx.budget {
-                if b.exhausted() {
-                    bail!("session token budget exhausted ({} of {} tokens used); raise max_session_tokens to continue", b.used(), b.limit);
-                }
-            }
             let specs = self.tools.specs();
             if let Some(r) = super::compact::maybe_compact(
                 self.llm.as_ref(),
@@ -112,6 +107,25 @@ impl Agent {
                 messages.push(Message::user(format!("<system-context>\n{extra}\n</system-context>")));
             }
             let req = ChatRequest { binding: self.binding.clone(), messages, tools: specs, session: Some(self.session.clone()) };
+            // Strict caps: refuse to SEND a request that would exceed the token or dollar budget,
+            // instead of noticing after the fact.
+            let estimate = super::compact::estimate_tokens("", &req.messages, &req.tools) as u64;
+            if let Some(b) = &self.ctx.budget {
+                if b.used() + estimate > b.limit {
+                    bail!(
+                        "session token budget reached ({} used + ~{estimate} for the next request > {}); raise max_session_tokens to continue",
+                        b.used(),
+                        b.limit
+                    );
+                }
+            }
+            if self.ctx.meter.would_exceed(&self.binding.key(), estimate) {
+                bail!(
+                    "session cost cap of ${:.4} would be exceeded (spent ${:.4}); raise max_session_cost to continue",
+                    self.ctx.meter.limit_usd.unwrap_or(0.0),
+                    self.ctx.meter.spent()
+                );
+            }
 
             let events = self.ctx.events.clone();
             let id = self.id.clone();
@@ -124,7 +138,8 @@ impl Agent {
             if let Some(b) = &self.ctx.budget {
                 b.add(usage.prompt_tokens + usage.completion_tokens);
             }
-            self.emit(EventKind::Usage { model: self.binding.key(), usage });
+            let cost = self.ctx.meter.record(&self.binding.key(), &usage);
+            self.emit(EventKind::Usage { model: self.binding.key(), usage, cost });
             if msg.content.is_some() {
                 self.emit(EventKind::TextDone);
             }

@@ -40,6 +40,9 @@ struct Cli {
     /// Stop when the whole team has used this many tokens (prompt + completion).
     #[arg(long, value_name = "TOKENS")]
     max_tokens: Option<u64>,
+    /// Stop before the team's spend would exceed this many USD (needs known prices).
+    #[arg(long, value_name = "USD")]
+    max_cost: Option<f64>,
     /// Write the JSONL session log here (default: <data dir>/zilch/logs/).
     #[arg(long, value_name = "FILE")]
     log: Option<std::path::PathBuf>,
@@ -144,14 +147,19 @@ async fn real_main() -> Result<i32> {
         max_workers: cli.workers,
         approval: if cli.yolo { Some(ApprovalMode::Auto) } else { cli.approval },
         max_session_tokens: cli.max_tokens,
+        max_session_cost: cli.max_cost,
     };
     let cfg = Config::load(&cwd, &ov)?;
+    let mut cfg = cfg;
+    // Prices and context windows from the providers' model lists (best effort, ~5s max).
+    let catalog = cfg.discover().await;
+    cfg.apply_catalog(&catalog);
     let providers = cfg.build_providers()?;
     if cli.sessions {
         return list_sessions(&cwd);
     }
     if cli.doctor {
-        return doctor(&cfg, &providers).await;
+        return doctor(&cfg, &providers, &catalog).await;
     }
 
     let one_shot = cli.prompt.is_some();
@@ -184,6 +192,7 @@ async fn real_main() -> Result<i32> {
     if let Some(s) = store.clone() {
         team = team.with_store(s);
     }
+    team.set_catalog(catalog);
     let team = Arc::new(team);
     // Resume a previous session if asked.
     let resume_id = match (&cli.resume, cli.r#continue) {
@@ -260,14 +269,19 @@ async fn real_main() -> Result<i32> {
 }
 
 /// `zilch --doctor`: show the resolved configuration and ping every distinct (provider, model).
-async fn doctor(cfg: &Config, providers: &zilch_core::llm::Providers) -> Result<i32> {
+async fn doctor(
+    cfg: &Config,
+    providers: &zilch_core::llm::Providers,
+    catalog: &std::collections::HashMap<String, zilch_core::llm::catalog::ModelInfo>,
+) -> Result<i32> {
     println!("workspace   {}", cfg.cwd.display());
     println!(
-        "approval    {:?} · file sandbox {} · max workers {} · token cap {}",
+        "approval    {:?} · file sandbox {} · max workers {} · token cap {} · cost cap {}",
         cfg.approval,
         if cfg.sandbox { "on" } else { "OFF" },
         cfg.max_workers,
-        cfg.max_session_tokens.map_or("none".into(), |t| t.to_string())
+        cfg.max_session_tokens.map_or("none".into(), |t| t.to_string()),
+        cfg.max_session_cost.map_or("none".into(), |c| format!("${c}"))
     );
     let (confined, why) = zilch_core::tools::sandbox::status(cfg.bash_sandbox, cfg.bash_network);
     println!("bash        {} {why}", if confined { "✓" } else { "⚠" });
@@ -282,7 +296,13 @@ async fn doctor(cfg: &Config, providers: &zilch_core::llm::Providers) -> Result<
     }
     println!("\nagents");
     for p in &cfg.profiles {
-        println!("  {:<12} {:<40} tools: {}", p.name, p.binding.key(), p.tools.join(","));
+        let info = catalog.get(&p.binding.key()).copied().unwrap_or_default();
+        let price = match (info.input_per_mtok, info.output_per_mtok) {
+            (Some(i), Some(o)) if i == 0.0 && o == 0.0 => "free".to_string(),
+            (Some(i), Some(o)) => format!("${i}/${o} per 1M"),
+            _ => "price unknown".into(),
+        };
+        println!("  {:<12} {:<40} {:<18} ctx {:>7}  tools: {}", p.name, p.binding.key(), price, p.context_tokens, p.tools.join(","));
     }
     println!("\nconnectivity (tiny request per distinct model)");
     let mut seen = std::collections::BTreeSet::new();
@@ -345,13 +365,20 @@ async fn repl(team: Arc<Team>, screen: SharedScreen, log_path: Option<std::path:
             continue;
         }
         let (before_in, before_out) = screen.lock().await.total_tokens();
+        let before_cost = screen.lock().await.total_cost();
         let res = team.run(input).await;
         // Let the renderer drain pending events before printing the footer.
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         let mut s = screen.lock().await;
         let (i, o) = s.total_tokens();
         let msg = match res {
-            Ok(_) => format!("{}↳ tokens: +{} in / +{} out{}", s.c(DIM), i - before_in, o - before_out, s.c(RESET)),
+            Ok(_) => {
+                let cost = match (s.total_cost(), before_cost) {
+                    (Some(now), b) => format!(" · ${:.4} (session ${now:.4})", now - b.unwrap_or(0.0)),
+                    _ => String::new(),
+                };
+                format!("{}↳ tokens: +{} in / +{} out{cost}{}", s.c(DIM), i - before_in, o - before_out, s.c(RESET))
+            }
             Err(e) => {
                 let hint =
                     log_path.as_ref().map(|p| format!("\n{}session log: {}{}", s.c(DIM), p.display(), s.c(RESET))).unwrap_or_default();

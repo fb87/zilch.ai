@@ -34,6 +34,8 @@ pub struct ProviderCfg {
     pub idle_timeout_secs: Option<u64>,
     /// Wire protocol: chat (default) | responses | anthropic.
     pub protocol: Option<crate::llm::protocol::Protocol>,
+    /// Fetch prices and context sizes from `{base_url}/models` at startup (default true).
+    pub discover: Option<bool>,
 }
 
 impl ProviderCfg {
@@ -46,6 +48,7 @@ impl ProviderCfg {
         merge_opt(&mut self.session_header, o.session_header);
         merge_opt(&mut self.idle_timeout_secs, o.idle_timeout_secs);
         merge_opt(&mut self.protocol, o.protocol);
+        merge_opt(&mut self.discover, o.discover);
     }
 }
 
@@ -64,6 +67,10 @@ pub struct RoleCfg {
     pub tools: Option<Vec<String>>,
     pub max_steps: Option<usize>,
     pub context_tokens: Option<usize>,
+    /// USD per 1M input tokens (overrides discovered pricing).
+    pub price_in: Option<f64>,
+    /// USD per 1M output tokens (overrides discovered pricing).
+    pub price_out: Option<f64>,
     pub system_prompt: Option<String>,
     pub system_prompt_file: Option<PathBuf>,
     pub prompt_mode: Option<PromptMode>,
@@ -83,6 +90,8 @@ impl RoleCfg {
         merge_opt(&mut self.tools, o.tools);
         merge_opt(&mut self.max_steps, o.max_steps);
         merge_opt(&mut self.context_tokens, o.context_tokens);
+        merge_opt(&mut self.price_in, o.price_in);
+        merge_opt(&mut self.price_out, o.price_out);
         if o.system_prompt.is_some() || o.system_prompt_file.is_some() {
             self.system_prompt = o.system_prompt;
             self.system_prompt_file = o.system_prompt_file;
@@ -117,6 +126,7 @@ pub struct FileConfig {
     pub bash_writable: Option<Vec<String>>,
     pub bash_overlay: Option<Vec<String>>,
     pub max_session_tokens: Option<u64>,
+    pub max_session_cost: Option<f64>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderCfg>,
     pub defaults: Option<RoleCfg>,
@@ -133,6 +143,7 @@ pub struct Overrides {
     pub max_workers: Option<usize>,
     pub approval: Option<ApprovalMode>,
     pub max_session_tokens: Option<u64>,
+    pub max_session_cost: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +167,8 @@ pub struct Config {
     pub bash_overlay: Option<Vec<String>>,
     /// Team-wide token cap per session (prompt + completion), None = unlimited.
     pub max_session_tokens: Option<u64>,
+    /// Team-wide spend cap in USD per session (needs known prices), None = unlimited.
+    pub max_session_cost: Option<f64>,
     pub providers: BTreeMap<String, ProviderCfg>,
     /// Master first, then workers.
     pub profiles: Vec<Profile>,
@@ -256,6 +269,7 @@ impl Config {
             bash_writable: fc.bash_writable.unwrap_or_default(),
             bash_overlay: fc.bash_overlay,
             max_session_tokens: ov.max_session_tokens.or(fc.max_session_tokens),
+            max_session_cost: ov.max_session_cost.or(fc.max_session_cost),
             providers: fc.providers,
             profiles,
         };
@@ -318,6 +332,7 @@ fn merge_file(dst: &mut FileConfig, src: FileConfig, base: &Path) {
     merge_opt(&mut dst.bash_writable, src.bash_writable);
     merge_opt(&mut dst.bash_overlay, src.bash_overlay);
     merge_opt(&mut dst.max_session_tokens, src.max_session_tokens);
+    merge_opt(&mut dst.max_session_cost, src.max_session_cost);
     for (k, v) in src.providers {
         dst.providers.entry(k).or_default().merge(v);
     }
@@ -394,6 +409,12 @@ fn build_profile(name: &str, rc: RoleCfg, defaults: &RoleCfg) -> Result<Profile>
         default_prompt: default_prompt.to_string(),
         custom_prompt,
         prompt_mode: rc.prompt_mode.unwrap_or_default(),
+        context_explicit: rc.context_tokens.or(defaults.context_tokens).is_some(),
+        pricing: crate::llm::catalog::ModelInfo {
+            context: None,
+            input_per_mtok: rc.price_in.or(defaults.price_in),
+            output_per_mtok: rc.price_out.or(defaults.price_out),
+        },
     })
 }
 
@@ -486,5 +507,76 @@ prompt_mode = "replace"
         std::fs::write(proj.join("config.toml"), "[roles.coder]\nprovider = \"nope\"\n").unwrap();
         let err = Config::load_from(dir.path(), &[proj], &env(&[("OPENAI_API_KEY", "k")]), &Overrides::default()).unwrap_err();
         assert!(err.to_string().contains("unknown provider"));
+    }
+}
+
+impl Config {
+    /// Discover context sizes and prices from every used provider's `/models` (best effort, in
+    /// parallel, ~5s max), keyed "provider/model", with explicitly configured prices on top.
+    pub async fn discover(&self) -> std::collections::HashMap<String, crate::llm::catalog::ModelInfo> {
+        use crate::llm::catalog::{fetch_models, ModelInfo};
+        let used: std::collections::BTreeSet<&str> = self.profiles.iter().map(|p| p.binding.provider.as_str()).collect();
+        let fetches = used.into_iter().filter_map(|name| {
+            let c = self.providers.get(name)?;
+            // Only OpenAI-style catalogs are understood; skip when disabled.
+            if c.discover == Some(false) || c.protocol == Some(crate::llm::protocol::Protocol::Anthropic) {
+                return None;
+            }
+            let key = c.api_key.clone().or_else(|| c.api_key_env.as_ref().and_then(|v| std::env::var(v).ok())).filter(|k| !k.is_empty());
+            let headers: Vec<(String, String)> = c.headers.clone().unwrap_or_default().into_iter().collect();
+            let base = c.base_url.clone().unwrap_or_default();
+            let name = name.to_string();
+            Some(async move { (name, fetch_models(&base, key.as_deref(), &headers).await) })
+        });
+        let mut cat = std::collections::HashMap::new();
+        for (provider, models) in futures::future::join_all(fetches).await {
+            for (id, info) in models {
+                cat.insert(format!("{provider}/{id}"), info);
+            }
+        }
+        for p in &self.profiles {
+            let entry: &mut ModelInfo = cat.entry(p.binding.key()).or_default();
+            *entry = entry.merged(p.pricing);
+        }
+        cat
+    }
+
+    /// Use discovered context windows for profiles that didn't set `context_tokens` explicitly.
+    pub fn apply_catalog(&mut self, cat: &std::collections::HashMap<String, crate::llm::catalog::ModelInfo>) {
+        for p in &mut self.profiles {
+            if p.context_explicit {
+                continue;
+            }
+            if let Some(ctx) = cat.get(&p.binding.key()).and_then(|i| i.context) {
+                p.context_tokens = (ctx as usize).max(16_000);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    use crate::llm::catalog::ModelInfo;
+
+    #[test]
+    fn discovered_context_only_fills_unset_profiles_and_prices_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let z = dir.path().join(".zilch");
+        std::fs::create_dir_all(&z).unwrap();
+        std::fs::write(z.join("config.toml"), "[roles.coder]\ncontext_tokens = 50000\nprice_in = 1.0\nprice_out = 2.0\n").unwrap();
+        let env: BTreeMap<String, String> = [("OPENAI_API_KEY".into(), "k".into())].into();
+        let mut cfg = Config::load_from(dir.path(), &[z], &env, &Overrides::default()).unwrap();
+        let mut cat = std::collections::HashMap::new();
+        cat.insert(
+            "openai/gpt-4.1".to_string(),
+            ModelInfo { context: Some(1_000_000), input_per_mtok: Some(2.0), output_per_mtok: Some(8.0) },
+        );
+        cfg.apply_catalog(&cat);
+        assert_eq!(cfg.master().context_tokens, 1_000_000, "discovered");
+        assert_eq!(cfg.profile("coder").unwrap().context_tokens, 50_000, "explicit wins");
+        let coder = cfg.profile("coder").unwrap();
+        let merged = cat["openai/gpt-4.1"].merged(coder.pricing);
+        assert_eq!((merged.input_per_mtok, merged.output_per_mtok), (Some(1.0), Some(2.0)), "configured prices override discovered ones");
     }
 }

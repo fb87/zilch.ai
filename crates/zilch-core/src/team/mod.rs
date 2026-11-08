@@ -34,6 +34,7 @@ pub struct TeamShared {
     pub file_locks: FileLocks,
     pub policy: Arc<ToolPolicy>,
     pub budget: Option<Arc<TokenBudget>>,
+    pub meter: Arc<crate::llm::catalog::CostMeter>,
     worker_tools: ToolRegistry,
 }
 
@@ -102,7 +103,8 @@ impl TeamShared {
         let llm = self.providers.get(&binding.provider)?;
         let ctx = Arc::new(
             ToolCtx::new(&id, self.cfg.cwd.clone(), self.gate.clone(), self.events.clone(), self.cancel.clone(), self.file_locks.clone())
-                .with_policy(self.policy.clone(), self.budget.clone()),
+                .with_policy(self.policy.clone(), self.budget.clone())
+                .with_meter(self.meter.clone()),
         );
         self.events.emit(&id, EventKind::InstanceSpawned { id: id.clone(), model: binding.key() });
         let agent = Agent {
@@ -257,6 +259,7 @@ impl Team {
             file_locks: FileLocks::default(),
             policy,
             budget: cfg.max_session_tokens.map(|l| Arc::new(TokenBudget::new(l))),
+            meter: Arc::new(crate::llm::catalog::CostMeter::new(cfg.max_session_cost)),
             worker_tools: tools::worker_tools(),
             cfg,
         });
@@ -274,7 +277,8 @@ impl Team {
         let system = prompt::build(&profile, &PromptEnv { cwd: &shared.cfg.cwd, agent_id: "master", tools: &names, workers: &workers });
         let ctx = Arc::new(
             ToolCtx::new("master", shared.cfg.cwd.clone(), gate, events, shared.cancel.clone(), shared.file_locks.clone())
-                .with_policy(shared.policy.clone(), shared.budget.clone()),
+                .with_policy(shared.policy.clone(), shared.budget.clone())
+                .with_meter(shared.meter.clone()),
         );
         let master = Agent {
             id: "master".into(),
@@ -299,6 +303,16 @@ impl Team {
     pub fn with_store(self, store: session::SessionStore) -> Self {
         self.persist.lock().unwrap().store = Some(store);
         self
+    }
+
+    /// Install discovered/configured model info (prices, context) for cost tracking.
+    pub fn set_catalog(&self, cat: std::collections::HashMap<String, crate::llm::catalog::ModelInfo>) {
+        *self.shared.meter.catalog.write().unwrap() = cat;
+    }
+
+    /// Total USD spent this process (only models with known prices count).
+    pub fn spent_usd(&self) -> f64 {
+        self.shared.meter.spent()
     }
 
     pub fn session_id(&self) -> String {

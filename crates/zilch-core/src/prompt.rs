@@ -131,6 +131,8 @@ mod tests {
             tools: vec![],
             max_steps: 10,
             context_tokens: 128_000,
+            context_explicit: false,
+            pricing: Default::default(),
             default_prompt: "DEFAULT PROMPT".into(),
             custom_prompt: custom.map(str::to_string),
             prompt_mode: mode,

@@ -47,9 +47,11 @@ pub enum EventKind {
         id: String,
         model: String,
     },
+    /// `cost` is USD for this response when the model's price is known.
     Usage {
         model: String,
         usage: Usage,
+        cost: Option<f64>,
     },
     Notice(String),
 }

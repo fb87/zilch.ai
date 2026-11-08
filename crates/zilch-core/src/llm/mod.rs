@@ -1,4 +1,5 @@
 pub mod accumulate;
+pub mod catalog;
 pub mod openai;
 pub mod protocol;
 pub mod sse;

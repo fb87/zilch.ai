@@ -33,6 +33,7 @@ pub struct Screen {
     delegations: BTreeMap<String, String>,
     worker_text: HashMap<String, String>,
     pub usage: BTreeMap<(String, String), Usage>,
+    pub cost: BTreeMap<(String, String), f64>,
 }
 
 pub type SharedScreen = Arc<Mutex<Screen>>;
@@ -51,6 +52,7 @@ impl Screen {
             delegations: BTreeMap::new(),
             worker_text: HashMap::new(),
             usage: BTreeMap::new(),
+            cost: BTreeMap::new(),
         }))
     }
 
@@ -292,8 +294,12 @@ impl Screen {
                     self.line(&msg);
                 }
             }
-            EventKind::Usage { model, usage } => {
-                *self.usage.entry((ev.agent, model)).or_default() += usage;
+            EventKind::Usage { model, usage, cost } => {
+                let key = (ev.agent, model);
+                if let Some(c) = cost {
+                    *self.cost.entry(key.clone()).or_default() += c;
+                }
+                *self.usage.entry(key).or_default() += usage;
             }
             EventKind::Notice(n) => {
                 let msg = format!("{}{n}{}", self.c(DIM), self.c(RESET));
@@ -306,17 +312,33 @@ impl Screen {
     pub fn usage_report(&self) -> String {
         let mut s = String::new();
         let (mut pi, mut co) = (0, 0);
+        let mut total_cost: Option<f64> = None;
         for ((agent, model), u) in &self.usage {
-            s.push_str(&format!("  {agent:<14} {model:<36} in {:>8}  out {:>7}\n", u.prompt_tokens, u.completion_tokens));
+            let cost = self.cost.get(&(agent.clone(), model.clone())).copied();
+            let c = cost.map_or("      ?".to_string(), |c| format!("${c:>8.4}"));
+            s.push_str(&format!("  {agent:<14} {model:<36} in {:>8}  out {:>7}  {c}\n", u.prompt_tokens, u.completion_tokens));
             pi += u.prompt_tokens;
             co += u.completion_tokens;
+            if let Some(c) = cost {
+                *total_cost.get_or_insert(0.0) += c;
+            }
         }
-        s.push_str(&format!("  {:<51} in {pi:>8}  out {co:>7}", "total"));
+        let tc = total_cost.map_or("(prices unknown)".to_string(), |c| format!("${c:>8.4}"));
+        s.push_str(&format!("  {:<51} in {pi:>8}  out {co:>7}  {tc}", "total"));
         s
     }
 
     pub fn total_tokens(&self) -> (u64, u64) {
         self.usage.values().fold((0, 0), |(a, b), u| (a + u.prompt_tokens, b + u.completion_tokens))
+    }
+
+    /// Total USD across agents whose model price is known (None if no price is known at all).
+    pub fn total_cost(&self) -> Option<f64> {
+        if self.cost.is_empty() {
+            None
+        } else {
+            Some(self.cost.values().sum())
+        }
     }
 }
 
