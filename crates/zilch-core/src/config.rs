@@ -32,6 +32,8 @@ pub struct ProviderCfg {
     pub session_header: Option<String>,
     /// Seconds without any data before a request/stream is considered stalled (default 180).
     pub idle_timeout_secs: Option<u64>,
+    /// Wire protocol: chat (default) | responses | anthropic.
+    pub protocol: Option<crate::llm::protocol::Protocol>,
 }
 
 impl ProviderCfg {
@@ -43,6 +45,7 @@ impl ProviderCfg {
         merge_opt(&mut self.headers, o.headers);
         merge_opt(&mut self.session_header, o.session_header);
         merge_opt(&mut self.idle_timeout_secs, o.idle_timeout_secs);
+        merge_opt(&mut self.protocol, o.protocol);
     }
 }
 
@@ -296,7 +299,8 @@ impl Config {
             let client = OpenAiClient::new(name, c.base_url.clone().unwrap_or_default(), key, c.max_concurrent.unwrap_or(8))
                 .with_headers(headers)
                 .with_session_header(c.session_header.clone())
-                .with_idle_timeout(std::time::Duration::from_secs(c.idle_timeout_secs.unwrap_or(180).max(5)));
+                .with_idle_timeout(std::time::Duration::from_secs(c.idle_timeout_secs.unwrap_or(180).max(5)))
+                .with_protocol(c.protocol.unwrap_or_default());
             out.insert(name.clone(), Arc::new(client));
         }
         Ok(out)

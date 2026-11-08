@@ -151,3 +151,24 @@ async fn blank_input_does_not_break_the_loop() {
     println!("after blank → {r2}");
     assert!(r2.contains("PONG"));
 }
+
+/// The OpenAI Responses protocol end to end on a FREE model: tool call → function_call_output →
+/// answer, through the real agent loop.
+#[tokio::test]
+#[ignore = "live"]
+async fn responses_protocol_tool_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("answer.txt"), "The magic number is 4817.").unwrap();
+    let mut a = agent(dir.path(), Some("crouton-alpha-free"), 8);
+    let key = std::env::var("OPENCODE_API_KEY").unwrap();
+    a.llm = Arc::new(
+        OpenAiClient::new("live", "https://opencode.ai/inference/go/openai/v1", Some(key), 2)
+            .with_session_header(Some("x-opencode-session".into()))
+            .with_protocol(zilch_core::llm::protocol::Protocol::Responses),
+    );
+    let out = a.run("Use read_file to read answer.txt and reply with only the magic number.").await.unwrap();
+    println!("responses → {out}  (usage {:?})", a.usage);
+    assert!(out.contains("4817"), "got: {out}");
+    assert!(a.history.iter().any(|m| m.role == zilch_core::llm::Role::Tool), "a tool round trip happened");
+    assert!(a.usage.prompt_tokens > 0, "usage reported");
+}

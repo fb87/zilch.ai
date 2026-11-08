@@ -138,3 +138,42 @@ async fn client_errors_are_not_retried() {
     let req = ChatRequest { binding: Default::default(), messages: vec![Message::user("x")], tools: vec![], session: None };
     assert!(complete(&client, &req, |_| {}).await.unwrap_err().to_string().contains("401"));
 }
+
+#[tokio::test]
+async fn anthropic_protocol_over_http() {
+    use wiremock::matchers::header_exists;
+    let s = MockServer::start().await;
+    let body = [
+        r#"{"type":"message_start","message":{"usage":{"input_tokens":11}}}"#,
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_9","name":"glob"}}"#,
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"pattern\":\"*\"}"}}"#,
+        r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}"#,
+        r#"{"type":"message_stop"}"#,
+    ]
+    .iter()
+    .map(|c| format!("event: x\ndata: {c}\n\n"))
+    .collect::<String>();
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header("x-api-key", "ak"))
+        .and(header("anthropic-version", "2023-06-01"))
+        .and(body_partial_json(serde_json::json!({"model":"claude-x","stream":true,"system":"S","max_tokens":8192})))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .expect(1)
+        .mount(&s)
+        .await;
+    // A bearer token must NOT be sent to an Anthropic endpoint.
+    Mock::given(method("POST")).and(header_exists("authorization")).respond_with(ResponseTemplate::new(400)).mount(&s).await;
+    let client = zilch_core::llm::openai::OpenAiClient::new("a", format!("{}/v1", s.uri()), Some("ak".into()), 2)
+        .with_protocol(zilch_core::llm::protocol::Protocol::Anthropic);
+    let req = ChatRequest {
+        binding: zilch_core::llm::ModelBinding { model: "claude-x".into(), ..Default::default() },
+        messages: vec![Message::system("S"), Message::user("go")],
+        tools: vec![],
+        session: None,
+    };
+    let (msg, usage) = complete(&client, &req, |_| {}).await.unwrap();
+    assert_eq!(msg.tool_calls[0].id, "toolu_9");
+    assert_eq!(msg.tool_calls[0].function.arguments, r#"{"pattern":"*"}"#);
+    assert_eq!((usage.prompt_tokens, usage.completion_tokens), (11, 5));
+}

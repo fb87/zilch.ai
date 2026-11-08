@@ -1,6 +1,7 @@
 //! OpenAI-compatible streaming client (OpenAI, OpenRouter, Ollama, vLLM, llama.cpp, ...).
 
-use super::sse::{parse_chunk, SseDecoder};
+use super::protocol::Protocol;
+use super::sse::SseDecoder;
 use super::types::{ChatRequest, LlmEvent};
 use super::{EventStream, LlmClient};
 use anyhow::{bail, Context, Result};
@@ -19,6 +20,7 @@ pub struct OpenAiClient {
     max_retries: u32,
     headers: Vec<(String, String)>,
     session_header: Option<String>,
+    protocol: Protocol,
     idle_timeout: Duration,
 }
 
@@ -35,6 +37,7 @@ impl OpenAiClient {
             max_retries: 4,
             headers: vec![],
             session_header: None,
+            protocol: Protocol::Chat,
             idle_timeout: Duration::from_secs(180),
         }
     }
@@ -52,6 +55,12 @@ impl OpenAiClient {
     }
 
     /// Send each agent's stable conversation id in this header (e.g. `x-opencode-session`).
+    /// Wire protocol (Chat Completions by default).
+    pub fn with_protocol(mut self, p: Protocol) -> Self {
+        self.protocol = p;
+        self
+    }
+
     pub fn with_session_header(mut self, name: Option<String>) -> Self {
         self.session_header = name;
         self
@@ -63,14 +72,18 @@ impl LlmClient for OpenAiClient {
     async fn stream(&self, req: &ChatRequest) -> Result<EventStream> {
         // Hold a provider slot for the whole lifetime of the stream.
         let permit = self.limiter.clone().acquire_owned().await?;
-        let url = format!("{}/chat/completions", self.base_url);
-        let body = req.to_body();
+        let url = format!("{}{}", self.base_url, self.protocol.path());
+        let body = self.protocol.body(req);
+        let protocol = self.protocol;
 
         let mut attempt = 0;
         let resp = loop {
             let mut rb = self.http.post(&url).json(&body);
-            if let Some(k) = &self.api_key {
-                rb = rb.bearer_auth(k);
+            match (self.protocol, &self.api_key) {
+                (Protocol::Anthropic, Some(k)) => rb = rb.header("x-api-key", k).header("anthropic-version", "2023-06-01"),
+                (Protocol::Anthropic, None) => rb = rb.header("anthropic-version", "2023-06-01"),
+                (_, Some(k)) => rb = rb.bearer_auth(k),
+                (_, None) => {}
             }
             for (k, v) in &self.headers {
                 rb = rb.header(k, v);
@@ -118,6 +131,7 @@ impl LlmClient for OpenAiClient {
         let stream = async_stream(move |tx| async move {
             let _permit = permit;
             let mut dec = SseDecoder::default();
+            let mut parser = protocol.parser();
             loop {
                 // A provider that stops sending mid-stream must not hang the agent forever.
                 let chunk = match tokio::time::timeout(idle, bytes.next()).await {
@@ -136,7 +150,7 @@ impl LlmClient for OpenAiClient {
                     }
                 };
                 for data in dec.push(&chunk) {
-                    match parse_chunk(&data) {
+                    match parser.parse(&data) {
                         Ok(None) => return,
                         Ok(Some(evs)) => {
                             for ev in evs {
@@ -153,7 +167,7 @@ impl LlmClient for OpenAiClient {
                 }
             }
             for data in dec.finish() {
-                if let Ok(Some(evs)) = parse_chunk(&data) {
+                if let Ok(Some(evs)) = parser.parse(&data) {
                     for ev in evs {
                         let _ = tx.send(Ok(ev)).await;
                     }

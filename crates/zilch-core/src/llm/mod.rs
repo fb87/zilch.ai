@@ -1,5 +1,6 @@
 pub mod accumulate;
 pub mod openai;
+pub mod protocol;
 pub mod sse;
 pub mod types;
 
