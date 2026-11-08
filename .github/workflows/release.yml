@@ -35,7 +35,18 @@ jobs:
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: test
-        run: cargo test --locked --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --no-fail-fast --target ${{ matrix.target }} 2>&1 | tee test.log
+      # Job logs need auth to download; annotations are public, so surface failures there.
+      - name: report failures
+        if: failure()
+        shell: bash
+        run: |
+          [ -f test.log ] || exit 0
+          grep -E -A3 "^---- |panicked at|^error|error\\[" test.log | head -80 |
+            while IFS= read -r line; do echo "::error title=${{ matrix.target }}::${line}"; done
       - name: build
         run: cargo build --release --locked --target ${{ matrix.target }} -p zilch-cli
       - name: package

@@ -436,7 +436,7 @@ fn terminal_width(fd: i32) -> usize {
     #[cfg(unix)]
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+        if libc::ioctl(fd, libc::TIOCGWINSZ as libc::Ioctl, &mut ws) == 0 && ws.ws_col > 0 {
             return ws.ws_col as usize;
         }
     }

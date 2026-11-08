@@ -207,7 +207,8 @@ async fn real_main() -> Result<i32> {
     }
     team.set_catalog(catalog);
     let team = Arc::new(team);
-    // Resume a previous session if asked.
+    // Resume a previous session if asked (the recap is shown so the user can pick the next step).
+    let mut recap: Option<String> = None;
     let resume_id = match (&cli.resume, cli.r#continue) {
         (Some(id), _) => Some(id.clone()),
         (None, true) => match store.as_ref().and_then(|s| s.latest(&cwd)) {
@@ -218,10 +219,12 @@ async fn real_main() -> Result<i32> {
     };
     if let Some(id) = resume_id {
         let Some(store) = &store else { bail!("--resume needs session storage (remove --no-session)") };
-        for w in team.resume(store.load(&id)?).await? {
+        let state = store.load(&id)?;
+        let summary = state.recap();
+        for w in team.resume(state).await? {
             eprintln!("warning: {w}");
         }
-        eprintln!("resumed session {id}");
+        recap = Some(summary);
     }
 
     // Ctrl-C cancels the running turn (master, scheduler and every worker); pressing it twice
@@ -248,6 +251,10 @@ async fn real_main() -> Result<i32> {
     }
 
     if let Some(mut prompt) = cli.prompt {
+        if let Some(r) = &recap {
+            // Progress output goes to stderr in -p mode; stdout stays reserved for the answer.
+            eprintln!("{r}\n");
+        }
         if let Some(piped) = read_piped_stdin().filter(|p| !p.trim().is_empty()) {
             prompt = format!("{prompt}\n\n<stdin>\n{piped}\n</stdin>");
         }
@@ -277,7 +284,7 @@ async fn real_main() -> Result<i32> {
         });
     }
 
-    repl(team, screen, log_path).await?;
+    repl(team, screen, log_path, recap).await?;
     Ok(0)
 }
 
@@ -350,8 +357,16 @@ async fn doctor(
     Ok(if failures == 0 { 0 } else { 1 })
 }
 
-async fn repl(team: Arc<Team>, screen: SharedScreen, log_path: Option<std::path::PathBuf>) -> Result<()> {
+async fn repl(team: Arc<Team>, screen: SharedScreen, log_path: Option<std::path::PathBuf>, recap: Option<String>) -> Result<()> {
     banner(&team, &screen).await;
+    if let Some(r) = recap {
+        let mut s = screen.lock().await;
+        let (c, d, x) = (s.c(CYAN), s.c(DIM), s.c(RESET));
+        let mut lines = r.lines();
+        let head = lines.next().unwrap_or_default().to_string();
+        let body: Vec<String> = lines.map(|l| format!("{d}{l}{x}")).collect();
+        s.line(&format!("\n{c}{head}{x}\n{}\n", body.join("\n")));
+    }
     let mut rl = rustyline::DefaultEditor::new()?;
     let history = dirs::data_dir().map(|d| d.join("zilch").join("history.txt"));
     if let Some(h) = &history {
@@ -443,6 +458,7 @@ async fn command(team: &Team, screen: &SharedScreen, input: &str) -> bool {
 /prompt <agent>   print the composed system prompt (master, coder, coder#2, …)
 /usage            token usage per agent and model
 /reset <instance> drop a worker instance (its history and context)
+/recap            what this session has done so far (requests, last answer, TODOs, workers)
 /sessions         list saved sessions for this directory
 /clear            start a fresh session (the current one stays resumable)
 /exit             quit"
@@ -518,6 +534,7 @@ async fn command(team: &Team, screen: &SharedScreen, input: &str) -> bool {
                 format!("No instance '{arg}'. See /team.")
             }
         }
+        "/recap" => team.snapshot().await.recap().replacen("↺ Resumed session", "↺ Session", 1),
         "/sessions" => {
             let _ = list_sessions(&team.shared.cfg.cwd);
             format!("current session: {}", team.session_id())

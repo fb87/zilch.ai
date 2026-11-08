@@ -85,6 +85,10 @@ fn mount_points() -> Vec<PathBuf> {
         .collect()
 }
 
+/// statvfs flag for relatime. glibc's libc bindings export it, musl's don't; the value is fixed by
+/// the kernel ABI (include/linux/statfs.h).
+const ST_RELATIME: libc::c_ulong = 0x1000;
+
 /// Flags of an existing mount that must be preserved on a bind-remount inside a user namespace
 /// (the kernel locks them; dropping one fails with EPERM).
 unsafe fn locked_flags(p: &Path) -> libc::c_ulong {
@@ -101,7 +105,7 @@ unsafe fn locked_flags(p: &Path) -> libc::c_ulong {
         (libc::ST_NOEXEC, libc::MS_NOEXEC),
         (libc::ST_NOATIME, libc::MS_NOATIME),
         (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
-        (libc::ST_RELATIME, libc::MS_RELATIME),
+        (ST_RELATIME, libc::MS_RELATIME),
     ] {
         if f & st_flag != 0 {
             out |= ms_flag;
@@ -119,9 +123,9 @@ unsafe fn loopback_up() {
     for (i, b) in b"lo".iter().enumerate() {
         ifr.ifr_name[i] = *b as libc::c_char;
     }
-    if libc::ioctl(fd, libc::SIOCGIFFLAGS, &mut ifr) == 0 {
+    if libc::ioctl(fd, libc::SIOCGIFFLAGS as libc::Ioctl, &mut ifr) == 0 {
         ifr.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
-        libc::ioctl(fd, libc::SIOCSIFFLAGS, &ifr);
+        libc::ioctl(fd, libc::SIOCSIFFLAGS as libc::Ioctl, &ifr);
     }
     libc::close(fd);
 }

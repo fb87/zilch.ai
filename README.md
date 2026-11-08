@@ -161,7 +161,7 @@ Every turn is saved automatically (after success, failure or Ctrl-C) to
 master history, TODO list and approvals, every worker instance with its history and model.
 
 ```sh
-zilch -c                      # continue the latest session in this directory (REPL)
+zilch -c                      # continue the latest session in this directory (REPL); shows a recap
 zilch -c -p "now add tests"   # continue it non-interactively
 zilch --sessions              # list sessions for this directory
 zilch --resume <id>           # resume a specific one
@@ -170,6 +170,11 @@ zilch --no-session            # don't save
 On resume, TODOs that were in progress go back to pending, a crash mid-turn is trimmed back to a
 consistent point, and workers must re-read files before editing them (stale-edit protection is
 never trusted across processes). `/clear` starts a new session; the old one stays resumable.
+
+Resuming prints a short recap (no model call) so you can decide what to do next: the first and
+last request, the last answer (or a warning if the last request was interrupted), TODO progress
+with unfinished and failed items first, and the workers that kept their context. `/recap` shows it
+again at any time.
 
 ## Protocols, costs and releases
 
