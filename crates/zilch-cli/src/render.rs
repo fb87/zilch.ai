@@ -535,7 +535,13 @@ fn terminal_width(fd: i32) -> usize {
     #[cfg(unix)]
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(fd, libc::TIOCGWINSZ as libc::Ioctl, &mut ws) == 0 && ws.ws_col > 0 {
+        // The request type differs per platform: libc::Ioctl (int on musl, unsigned long on glibc)
+        // exists only for Linux; macOS/BSD take an unsigned long, which TIOCGWINSZ already is.
+        #[cfg(target_os = "linux")]
+        let request = libc::TIOCGWINSZ as libc::Ioctl;
+        #[cfg(not(target_os = "linux"))]
+        let request = libc::TIOCGWINSZ;
+        if libc::ioctl(fd, request, &mut ws) == 0 && ws.ws_col > 0 {
             return ws.ws_col as usize;
         }
     }

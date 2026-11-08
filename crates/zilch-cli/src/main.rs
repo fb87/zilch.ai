@@ -1,10 +1,13 @@
 mod approver;
 mod inbox;
+mod ipc;
+mod lanes;
 mod log;
 mod render;
 
 use anyhow::{bail, Result};
 use clap::Parser;
+use lanes::{Dispatcher, Lane};
 use render::{Screen, SharedScreen, BOLD, CYAN, DIM, GREEN, RED, RESET};
 use std::io::{IsTerminal, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -381,34 +384,6 @@ async fn doctor(
     Ok(if failures == 0 { 0 } else { 1 })
 }
 
-/// The two interaction lanes. Switching only changes which one receives input; both keep running.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Lane {
-    Code,
-    Spec,
-}
-
-impl Lane {
-    fn root(self) -> &'static str {
-        match self {
-            Lane::Code => "master",
-            Lane::Spec => "spec",
-        }
-    }
-    fn name(self) -> &'static str {
-        match self {
-            Lane::Code => "code",
-            Lane::Spec => "spec",
-        }
-    }
-    fn other(self) -> Lane {
-        match self {
-            Lane::Code => Lane::Spec,
-            Lane::Spec => Lane::Code,
-        }
-    }
-}
-
 async fn repl(
     team: Arc<Team>,
     screen: SharedScreen,
@@ -432,30 +407,37 @@ async fn repl(
         let _ = rl.load_history(h);
     }
 
-    let mut active = Lane::Code;
-    let mut tasks: std::collections::HashMap<&'static str, tokio::task::JoinHandle<()>> = Default::default();
-    let busy = |tasks: &std::collections::HashMap<&'static str, tokio::task::JoinHandle<()>>, lane: Lane| {
-        tasks.get(lane.name()).is_some_and(|h| !h.is_finished())
+    let lanes = Dispatcher::new(team.clone(), screen.clone(), log_path);
+    // Editor integration (Neovim plugin): selections + comments arrive over a local socket.
+    let _ipc = match ipc::serve(lanes.clone(), &team.shared.cfg.cwd).await {
+        Ok(Some(guard)) => {
+            let mut s = screen.lock().await;
+            let msg =
+                format!("{}editor link: {} (Neovim: :ZilchSend){}", s.c(DIM), ipc::socket_path(&team.shared.cfg.cwd).display(), s.c(RESET));
+            s.line(&msg);
+            Some(guard)
+        }
+        Ok(None) => {
+            screen.lock().await.line("editor link: another zilch already serves this workspace; not listening");
+            None
+        }
+        Err(e) => {
+            screen.lock().await.line(&format!("editor link unavailable: {e}"));
+            None
+        }
     };
 
     loop {
-        let prompt = match inbox.prompt() {
-            Some(p) => p.to_string(),
-            None => {
-                // Just the lane: a prompt cannot be updated once shown, so busy markers would go
-                // stale the moment a lane finishes. Finish notices and /status cover activity.
-                format!("[{}] › ", active.name())
-            }
-        };
+        // Just the lane: a prompt cannot be updated once shown, so busy markers would go stale
+        // the moment a lane finishes. Finish notices and /status cover activity.
+        let prompt = inbox.prompt().map(str::to_string).unwrap_or_else(|| format!("[{}] › ", lanes.active().name()));
         let line = match tokio::task::block_in_place(|| rl.readline(&prompt)) {
             Ok(l) => l,
             Err(rustyline::error::ReadlineError::Interrupted) => {
                 // Ctrl-C cancels the active lane's running turn (the other lane keeps going).
-                if busy(&tasks, active) {
-                    match active {
-                        Lane::Code => team.cancel(),
-                        Lane::Spec => team.cancel_spec(),
-                    }
+                let active = lanes.active();
+                if lanes.busy(active) {
+                    lanes.cancel(active);
                     screen.lock().await.line(&format!("⏹ cancelling the {} lane…", active.name()));
                 } else {
                     screen.lock().await.line("(Ctrl-D to quit)");
@@ -478,7 +460,8 @@ async fn repl(
 
         match input {
             "/spec" | "/code" => {
-                active = if input == "/spec" { Lane::Spec } else { Lane::Code };
+                let active = if input == "/spec" { Lane::Spec } else { Lane::Code };
+                lanes.set_active(active);
                 let mut s = screen.lock().await;
                 s.switch_lane(active.root());
                 let msg = match active {
@@ -496,16 +479,15 @@ async fn repl(
                 continue;
             }
             "/status" => {
-                let mut s = screen.lock().await;
-                let lane = |l: Lane| if busy(&tasks, l) { "working" } else { "idle" };
+                let state = |l: Lane| if lanes.busy(l) { "working" } else { "idle" };
                 let msg = format!(
                     "lanes: code {} · spec {} (active: {})\n{}",
-                    lane(Lane::Code),
-                    lane(Lane::Spec),
-                    active.name(),
+                    state(Lane::Code),
+                    state(Lane::Spec),
+                    lanes.active().name(),
                     team.spec_status().describe(&team.shared.spec_store.dir)
                 );
-                s.line(&msg);
+                screen.lock().await.line(&msg);
                 continue;
             }
             _ if input.starts_with('/') => {
@@ -516,56 +498,14 @@ async fn repl(
             }
             _ => {}
         }
-
-        if busy(&tasks, active) {
-            screen.lock().await.line(&format!(
-                "The {} lane is still working on your previous message. Wait for it, switch lanes (/{}), or press Ctrl-C to cancel it.",
-                active.name(),
-                active.other().name()
-            ));
-            continue;
+        // Runs in the background: the prompt comes back immediately, so the user can switch lanes
+        // and keep working while this one runs.
+        if let Err(e) = lanes.submit(lanes.active(), input.to_string()) {
+            screen.lock().await.line(&format!("{}{}", e[..1].to_uppercase(), &e[1..]));
         }
-
-        // Run the turn in the background: the prompt comes back immediately, so the user can
-        // switch lanes and keep working while this one runs.
-        let (team2, screen2, log2, input2, lane) = (team.clone(), screen.clone(), log_path.clone(), input.to_string(), active);
-        let handle = tokio::spawn(async move {
-            let (before_in, before_out) = screen2.lock().await.total_tokens();
-            let res = match lane {
-                Lane::Code => team2.run(&input2).await,
-                Lane::Spec => team2.run_spec(&input2).await,
-            };
-            // Let the renderer drain pending events before printing the footer.
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-            let mut s = screen2.lock().await;
-            let (i, o) = s.total_tokens();
-            let msg = match res {
-                Ok(_) if s.active == lane.root() => {
-                    let cost = s.total_cost().map(|c| format!(" · session ${c:.4}")).unwrap_or_default();
-                    format!("{}↳ {} · +{} in / +{} out tokens{cost}{}", s.c(DIM), lane.name(), i - before_in, o - before_out, s.c(RESET))
-                }
-                Ok(_) => return, // background lane: the renderer already announced it
-                Err(e) => {
-                    let hint =
-                        log2.as_ref().map(|p| format!("\n{}session log: {}{}", s.c(DIM), p.display(), s.c(RESET))).unwrap_or_default();
-                    format!("{}error ({} lane):{} {e:#}{hint}", s.c(RED), lane.name(), s.c(RESET))
-                }
-            };
-            s.line(&msg);
-        });
-        tasks.insert(active.name(), handle);
     }
 
-    // Leaving: stop anything still running, then save.
-    if busy(&tasks, Lane::Code) {
-        team.cancel();
-    }
-    if busy(&tasks, Lane::Spec) {
-        team.cancel_spec();
-    }
-    for (_, h) in tasks {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), h).await;
-    }
+    lanes.shutdown().await;
     if let Some(h) = &history {
         let _ = rl.save_history(h);
     }

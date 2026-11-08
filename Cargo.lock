@@ -2479,6 +2479,7 @@ dependencies = [
  "dirs",
  "libc",
  "rustyline",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
