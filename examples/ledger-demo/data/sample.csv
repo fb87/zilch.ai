@@ -1,0 +1,7 @@
+date,category,amount,currency,note
+2026-01-03,salary,"3,200.00",EUR,January pay
+2026-01-05,groceries,-82.40,EUR,"weekly shop, market"
+2026-01-17,rent,-950.00,EUR,
+2026-02-02,salary,"3,200.00",EUR,February pay
+2026-02-09,books,-12.99,GBP,
+2026-02-21,groceries,-64.15,EUR,

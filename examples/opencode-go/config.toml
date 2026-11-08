@@ -1,0 +1,35 @@
+# OpenCode Go (https://opencode.ai/v2/docs/console/go/) — FREE models only ($0, no usage allowance consumed).
+# Free models with OpenAI chat-completions + tools (checked via /zen/go/v1/models on 2026-11-08).
+# Free/stealth models rotate; if one disappears, re-check:  curl https://opencode.ai/zen/go/v1/models
+#
+# Use:  export OPENCODE_API_KEY=oc_sk_...
+#       mkdir -p .zilch && cp examples/opencode-go/config.toml .zilch/config.toml
+#       zilch
+
+max_workers = 3
+
+[providers.opencode]
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+max_concurrent = 4
+# Go requires a stable per-conversation id; zilch gives every agent instance its own.
+session_header = "x-opencode-session"
+
+[defaults]
+provider = "opencode"
+model = "beam-free"
+
+# Planner/coordinator: Beam Free (MoE reasoning model for coding/agentic work, 1M ctx).
+[roles.master]
+model = "beam-free"
+
+# Implementer.
+[roles.coder]
+model = "beam-free"
+
+# Read-only exploration. (iceman-contributor-free is also $0 but TRAINS ON YOUR REQUESTS and needs
+# "Allow paid endpoints that train on request data" enabled in the OpenCode console privacy settings.)
+[roles.explorer]
+model = "beam-free"
+
+# Paid alternatives (NOT for testing): deepseek-v4-pro, glm-5.3, kimi-k2.7-code, deepseek-v4.1-flash.

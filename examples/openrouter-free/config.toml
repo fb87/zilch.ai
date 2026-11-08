@@ -1,0 +1,34 @@
+# Free-tier test setup on OpenRouter (all models below are $0 and support tool calling,
+# per https://openrouter.ai/api/v1/models on 2026-11-08 — free models rotate, re-check if one 404s).
+#
+# Use:  export OPENROUTER_API_KEY=sk-or-...   (free account at https://openrouter.ai/keys)
+#       mkdir -p .zilch && cp examples/openrouter-free/config.toml .zilch/config.toml
+#       zilch
+
+# Free models are rate-limited (roughly 20 req/min, plus a daily cap), so keep parallelism modest.
+max_workers = 2
+
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+max_concurrent = 3
+
+[defaults]
+provider = "openrouter"
+model = "nvidia/nemotron-3.5-lightning:free"
+
+# Strongest free model plans and coordinates.
+[roles.master]
+model = "nvidia/nemotron-3-ultra-550b-a55b:free"
+
+# Code-specialised model does the edits.
+[roles.coder]
+model = "cohere/north-mini-code:free"
+temperature = 0.2
+
+# Fast model for read-only exploration.
+[roles.explorer]
+model = "nvidia/nemotron-3.5-lightning:free"
+
+# Fallback: "openrouter/free" picks a random free tool-capable model per request
+# (handy if a specific model is rate-limited, but behaviour varies between calls).
