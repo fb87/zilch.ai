@@ -212,3 +212,55 @@ async fn nothing_is_saved_without_a_conversation_and_clear_starts_a_new_session(
     t.run("two").await.unwrap();
     assert_eq!(store.list(Some(ws.path())).len(), 2, "both sessions kept on disk");
 }
+
+#[tokio::test]
+async fn checkpoints_are_written_during_run_todos() {
+    let ws = tempfile::tempdir().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(store_dir.path());
+    let seen: Arc<Mutex<Option<(TodoStatus, bool, bool)>>> = Arc::new(Mutex::new(None));
+    let (seen2, store2) = (seen.clone(), store.clone());
+    let ws_path = ws.path().to_path_buf();
+    let (t, _) = team(
+        ws.path(),
+        &store,
+        Box::new(move |r| {
+            if !is_master(r) {
+                // While TODO b runs (it depends on a), look at what is ON DISK right now —
+                // exactly what a crash at this moment would leave behind.
+                if last_user(r).contains("FILE=b.txt") && r.messages.last().unwrap().role == Role::User {
+                    if let Some(info) = store2.latest(&ws_path) {
+                        let s = store2.load(&info.id).unwrap();
+                        let a = s.todos.items.iter().find(|t| t.id == "a").unwrap();
+                        let note = s.master.history.iter().any(|m| m.text().contains("still in progress"));
+                        let req = s.master.history.iter().any(|m| m.text() == "do a then b");
+                        *seen2.lock().unwrap() = Some((a.status.clone(), note, req && a.report.is_some()));
+                    }
+                }
+                return worker(r);
+            }
+            match turn_tool_results(r) {
+                0 => vec![call(
+                    0,
+                    "todo_write",
+                    json!({"items":[
+                        {"id":"a","task":"FILE=a.txt","files":["a.txt"]},
+                        {"id":"b","task":"FILE=b.txt","files":["b.txt"],"depends_on":["a"]}
+                    ]}),
+                )],
+                1 => vec![call(0, "propose_plan", json!({"summary":"a then b"}))],
+                2 => vec![call(0, "run_todos", json!({}))],
+                _ => vec![text("both done")],
+            }
+        }),
+    );
+    t.run("do a then b").await.unwrap();
+    let (a_status, note, with_request_and_report) = seen.lock().unwrap().clone().expect("a checkpoint existed while b was running");
+    assert_eq!(a_status, TodoStatus::Done, "finished TODO persisted mid-run");
+    assert!(note, "master checkpoint marks the turn as in progress");
+    assert!(with_request_and_report, "checkpoint keeps the user's request and a's report");
+    // After the turn completes, the full save replaces the checkpoint (no stale note).
+    let s = store.load(&t.session_id()).unwrap();
+    assert!(!s.master.history.iter().any(|m| m.text().contains("still in progress")));
+    assert!(s.todos.items.iter().all(|t| t.status == TodoStatus::Done));
+}

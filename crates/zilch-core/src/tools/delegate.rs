@@ -85,6 +85,7 @@ impl Tool for Delegate {
             task.to_string()
         };
         let res = sh.run_task(&mut agent, &brief, scope, fresh).await;
+        drop(agent); // release the instance so the checkpoint records its new history
         let ok = res.as_ref().is_ok_and(|r| report_ok(r));
         sh.events.emit("master", EventKind::DelegateEnd { worker: inst.id.clone(), ok });
         if let Some(id) = todo_id {
@@ -94,6 +95,7 @@ impl Tool for Delegate {
             };
             sh.set_todo_status(id, st, Some(inst.id.clone()), Some(rep));
         }
+        sh.checkpoint();
         Ok(format!("[report from {}]\n{}", inst.id, res?))
     }
 }

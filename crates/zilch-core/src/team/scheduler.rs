@@ -110,6 +110,8 @@ pub async fn run(shared: &Arc<TeamShared>, ids: Option<Vec<String>>) -> Result<S
             }
             Err(e) => shared.set_todo_status(&id, TodoStatus::Failed, None, Some(format!("Error: {e:#}"))),
         }
+        // Persist progress now: a crash later in this run must not lose finished TODOs.
+        shared.checkpoint();
     }
 
     // Digest for the master.

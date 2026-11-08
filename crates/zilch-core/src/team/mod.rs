@@ -9,7 +9,7 @@ pub mod todo;
 
 use crate::agent::{Agent, ApprovalGate, Approver, EventKind, EventSink, TurnHooks};
 use crate::config::{Config, READONLY_TOOLS};
-use crate::llm::{ModelBinding, Providers};
+use crate::llm::{Message, ModelBinding, Providers};
 use crate::profile::Profile;
 use crate::prompt::{self, PromptEnv};
 use crate::tools::{self, CancelCell, Scope, TokenBudget, ToolCtx, ToolPolicy, ToolRegistry};
@@ -35,6 +35,7 @@ pub struct TeamShared {
     pub policy: Arc<ToolPolicy>,
     pub budget: Option<Arc<TokenBudget>>,
     pub meter: Arc<crate::llm::catalog::CostMeter>,
+    persist: Mutex<Persist>,
     worker_tools: ToolRegistry,
 }
 
@@ -59,6 +60,51 @@ impl TeamShared {
         }
         self.events.emit("master", EventKind::TodoStatus { id: id.to_string(), status, instance });
         self.todos_changed();
+    }
+
+    /// Save a mid-turn checkpoint (called after each TODO / delegation finishes) so a crash during
+    /// a long run_todos loses at most the work in flight. Busy workers are recorded with their last
+    /// known state; in-progress TODOs are reset to pending on load.
+    pub fn checkpoint(&self) {
+        let (store, master) = {
+            let p = self.persist.lock().unwrap();
+            (p.store.clone(), p.master_checkpoint.clone())
+        };
+        let (Some(store), Some(master)) = (store, master) else { return };
+        let mut workers = Vec::new();
+        for inst in self.pool.list() {
+            let state = match inst.agent.try_lock() {
+                Ok(a) => Some(session::WorkerState {
+                    id: inst.id.clone(),
+                    profile: inst.profile.clone(),
+                    binding: inst.binding.clone(),
+                    readonly: inst.readonly,
+                    agent: session::AgentState { history: a.history.clone(), session: a.session.clone(), usage: a.usage },
+                }),
+                Err(_) => self.persist.lock().unwrap().worker_cache.get(&inst.id).cloned(),
+            };
+            if let Some(s) = state {
+                self.persist.lock().unwrap().worker_cache.insert(s.id.clone(), s.clone());
+                workers.push(s);
+            }
+        }
+        let p = self.persist.lock().unwrap();
+        let state = session::SessionState {
+            version: session::FORMAT_VERSION,
+            id: p.id.clone(),
+            cwd: self.cfg.cwd.clone(),
+            created_ms: p.created_ms,
+            updated_ms: session::now_ms(),
+            title: p.title.clone(),
+            master,
+            workers,
+            todos: self.todos.lock().unwrap().clone(),
+            counters: self.pool.counters(),
+        };
+        drop(p);
+        if let Err(e) = store.save(&state) {
+            self.events.emit("master", EventKind::Notice(format!("warning: checkpoint failed: {e:#}")));
+        }
     }
 
     pub fn worker_profiles(&self) -> Vec<(String, String)> {
@@ -215,15 +261,18 @@ pub struct Team {
     pub shared: Arc<TeamShared>,
     master: AsyncMutex<Agent>,
     master_system: String,
-    persist: Mutex<Persist>,
 }
 
-/// Where and as what this team's session is saved.
+/// Where and as what this team's session is saved (shared so the scheduler can checkpoint).
 struct Persist {
     store: Option<session::SessionStore>,
     id: String,
     created_ms: u64,
     title: String,
+    /// Master state to write in mid-turn checkpoints (history up to the current request).
+    master_checkpoint: Option<session::AgentState>,
+    /// Last known state of each worker, used when it is busy during a checkpoint.
+    worker_cache: std::collections::HashMap<String, session::WorkerState>,
 }
 
 impl Team {
@@ -257,6 +306,14 @@ impl Team {
             events: events.clone(),
             cancel: CancelCell::default(),
             file_locks: FileLocks::default(),
+            persist: Mutex::new(Persist {
+                store: None,
+                id: session::new_session_id(),
+                created_ms: session::now_ms(),
+                title: String::new(),
+                master_checkpoint: None,
+                worker_cache: Default::default(),
+            }),
             policy,
             budget: cfg.max_session_tokens.map(|l| Arc::new(TokenBudget::new(l))),
             meter: Arc::new(crate::llm::catalog::CostMeter::new(cfg.max_session_cost)),
@@ -295,13 +352,12 @@ impl Team {
             usage: Default::default(),
             session: crate::agent::run::new_session_id("master"),
         };
-        let persist = Persist { store: None, id: session::new_session_id(), created_ms: session::now_ms(), title: String::new() };
-        Ok(Self { shared, master: AsyncMutex::new(master), master_system: system, persist: Mutex::new(persist) })
+        Ok(Self { shared, master: AsyncMutex::new(master), master_system: system })
     }
 
     /// Save the session to `store` after every turn.
     pub fn with_store(self, store: session::SessionStore) -> Self {
-        self.persist.lock().unwrap().store = Some(store);
+        self.shared.persist.lock().unwrap().store = Some(store);
         self
     }
 
@@ -316,20 +372,32 @@ impl Team {
     }
 
     pub fn session_id(&self) -> String {
-        self.persist.lock().unwrap().id.clone()
+        self.shared.persist.lock().unwrap().id.clone()
     }
 
     /// The single entry point for the user.
     pub async fn run(&self, input: &str) -> Result<String> {
         self.shared.cancel.reset();
         {
-            let mut p = self.persist.lock().unwrap();
+            let mut p = self.shared.persist.lock().unwrap();
             if p.title.is_empty() {
                 p.title = input.chars().take(120).collect();
             }
         }
         let res = {
             let mut m = self.master.lock().await;
+            // What a mid-turn checkpoint records for the master: everything before this request,
+            // the request itself, and a note so a resumed master knows the turn was interrupted.
+            {
+                let mut history = m.history.clone();
+                history.push(Message::user(input));
+                history.push(Message::assistant(
+                    "[This request was still in progress when the session was last saved. The TODO list shows what was \
+                     completed; check it and continue from there.]",
+                ));
+                self.shared.persist.lock().unwrap().master_checkpoint =
+                    Some(session::AgentState { history, session: m.session.clone(), usage: m.usage });
+            }
             let res = m.run(input).await;
             if res.is_err() {
                 // Leave history consistent: drop an assistant tool call whose results are missing.
@@ -366,7 +434,7 @@ impl Team {
                 agent: session::AgentState { history: a.history.clone(), session: a.session.clone(), usage: a.usage },
             });
         }
-        let p = self.persist.lock().unwrap();
+        let p = self.shared.persist.lock().unwrap();
         session::SessionState {
             version: session::FORMAT_VERSION,
             id: p.id.clone(),
@@ -383,7 +451,7 @@ impl Team {
 
     /// Save now (no-op without a store). Returns the file written.
     pub async fn save(&self) -> Result<Option<std::path::PathBuf>> {
-        let Some(store) = self.persist.lock().unwrap().store.clone() else { return Ok(None) };
+        let Some(store) = self.shared.persist.lock().unwrap().store.clone() else { return Ok(None) };
         let state = self.snapshot().await;
         if state.master.history.is_empty() {
             return Ok(None); // nothing worth saving yet
@@ -430,7 +498,7 @@ impl Team {
         }
         *self.shared.todos.lock().unwrap() = state.todos;
         {
-            let mut p = self.persist.lock().unwrap();
+            let mut p = self.shared.persist.lock().unwrap();
             p.id = state.id;
             p.created_ms = state.created_ms;
             p.title = state.title;
@@ -450,7 +518,7 @@ impl Team {
         self.shared.pool.clear();
         *self.shared.todos.lock().unwrap() = TodoList::default();
         {
-            let mut p = self.persist.lock().unwrap();
+            let mut p = self.shared.persist.lock().unwrap();
             p.id = session::new_session_id();
             p.created_ms = session::now_ms();
             p.title.clear();
