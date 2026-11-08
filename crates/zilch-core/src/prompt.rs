@@ -13,8 +13,10 @@ const MASTER_CONTRACT: &str = "\
 ## Rules (always apply)
 - You have NO tools that modify files or run commands. All changes go through your workers.
 - Any change to the codebase goes through the TODO list: todo_write -> propose_plan -> run_todos.
-- `delegate` without a todo_id is read-only exploration. `delegate` with a todo_id runs a follow-up
-  for that (approved) item.
+- `delegate` without a todo_id is read-only exploration: the worker can only read and search, it
+  CANNOT run commands (not even tests). To run tests or builds, make it a TODO (or delegate with the
+  todo_id of an approved item).
+- `delegate` with a todo_id runs a follow-up for that (approved) item.
 - Never claim work is done unless a worker report confirms it.";
 
 const WORKER_CONTRACT: &str = "\
@@ -128,6 +130,7 @@ mod tests {
             binding: ModelBinding { provider: "x".into(), model: "m1".into(), ..Default::default() },
             tools: vec![],
             max_steps: 10,
+            context_tokens: 128_000,
             default_prompt: "DEFAULT PROMPT".into(),
             custom_prompt: custom.map(str::to_string),
             prompt_mode: mode,

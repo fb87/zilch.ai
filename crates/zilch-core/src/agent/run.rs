@@ -30,6 +30,7 @@ pub struct Agent {
     pub tools: ToolRegistry,
     pub history: Vec<Message>,
     pub max_steps: usize,
+    pub context_tokens: usize,
     pub ctx: Arc<ToolCtx>,
     pub hooks: Option<Arc<dyn TurnHooks>>,
     pub usage: Usage,
@@ -63,13 +64,28 @@ impl Agent {
             if cancel.is_cancelled() {
                 bail!("cancelled");
             }
+            let specs = self.tools.specs();
+            if let Some(r) = super::compact::maybe_compact(
+                self.llm.as_ref(),
+                &self.binding,
+                Some(self.session.clone()),
+                &self.system,
+                &specs,
+                &mut self.history,
+                self.context_tokens,
+            )
+            .await
+            {
+                let how = if r.summarized { "summarized older turns" } else { "elided old tool output" };
+                self.emit(EventKind::Notice(format!("{}: compacted history ~{:.1}k → ~{:.1}k tokens ({how})", self.id, r.before as f64 / 1000.0, r.after as f64 / 1000.0)));
+            }
             let mut messages = Vec::with_capacity(self.history.len() + 2);
             messages.push(Message::system(&self.system));
             messages.extend(self.history.iter().cloned());
             if let Some(extra) = self.hooks.as_ref().and_then(|h| h.context()) {
                 messages.push(Message::user(format!("<system-context>\n{extra}\n</system-context>")));
             }
-            let req = ChatRequest { binding: self.binding.clone(), messages, tools: self.tools.specs(), session: Some(self.session.clone()) };
+            let req = ChatRequest { binding: self.binding.clone(), messages, tools: specs, session: Some(self.session.clone()) };
 
             let events = self.ctx.events.clone();
             let id = self.id.clone();

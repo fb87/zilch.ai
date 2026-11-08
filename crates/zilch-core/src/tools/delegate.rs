@@ -74,7 +74,17 @@ impl Tool for Delegate {
         if let Some(id) = todo_id {
             sh.set_todo_status(id, TodoStatus::InProgress, Some(inst.id.clone()), None);
         }
-        let res = sh.run_task(&mut agent, task, scope, fresh).await;
+        // Read-only workers must not burn their step budget on something they can't do.
+        let brief = if readonly {
+            format!(
+                "{task}\n\n(Note: this is a READ-ONLY assignment — you have no shell and cannot modify files. If the request \
+                 requires running commands or editing, do not attempt workarounds: answer what you can from reading, then \
+                 end with STATUS: failed and explain what needs a todo_id/write access.)"
+            )
+        } else {
+            task.to_string()
+        };
+        let res = sh.run_task(&mut agent, &brief, scope, fresh).await;
         let ok = res.as_ref().is_ok_and(|r| report_ok(r));
         sh.events.emit("master", EventKind::DelegateEnd { worker: inst.id.clone(), ok });
         if let Some(id) = todo_id {

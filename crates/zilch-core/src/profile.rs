@@ -28,6 +28,8 @@ pub struct Profile {
     /// Tool allowlist (empty = role default).
     pub tools: Vec<String>,
     pub max_steps: usize,
+    /// Context window budget in tokens; history is compacted near this limit.
+    pub context_tokens: usize,
     /// Built-in default prompt for this profile.
     pub default_prompt: String,
     /// User-provided prompt text (inline or loaded from file).

@@ -56,6 +56,7 @@ pub struct RoleCfg {
     pub extra: Option<Map<String, Value>>,
     pub tools: Option<Vec<String>>,
     pub max_steps: Option<usize>,
+    pub context_tokens: Option<usize>,
     pub system_prompt: Option<String>,
     pub system_prompt_file: Option<PathBuf>,
     pub prompt_mode: Option<PromptMode>,
@@ -74,6 +75,7 @@ impl RoleCfg {
         merge_opt(&mut self.extra, o.extra);
         merge_opt(&mut self.tools, o.tools);
         merge_opt(&mut self.max_steps, o.max_steps);
+        merge_opt(&mut self.context_tokens, o.context_tokens);
         if o.system_prompt.is_some() || o.system_prompt_file.is_some() {
             self.system_prompt = o.system_prompt;
             self.system_prompt_file = o.system_prompt_file;
@@ -326,6 +328,7 @@ fn build_profile(name: &str, rc: RoleCfg, defaults: &RoleCfg) -> Result<Profile>
         binding,
         tools,
         max_steps: rc.max_steps.or(defaults.max_steps).unwrap_or(if role == AgentRole::Master { 60 } else { 80 }),
+        context_tokens: rc.context_tokens.or(defaults.context_tokens).unwrap_or(128_000).max(16_000),
         default_prompt: default_prompt.to_string(),
         custom_prompt,
         prompt_mode: rc.prompt_mode.unwrap_or_default(),
