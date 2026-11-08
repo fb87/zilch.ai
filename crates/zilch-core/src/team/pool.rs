@@ -78,3 +78,13 @@ impl WorkerPool {
         self.instances.lock().unwrap().clone()
     }
 }
+
+impl WorkerPool {
+    /// Instance-number counters per profile (persisted so resumed sessions keep unique ids).
+    pub fn counters(&self) -> HashMap<String, usize> {
+        self.counters.lock().unwrap().clone()
+    }
+    pub fn set_counters(&self, c: HashMap<String, usize>) {
+        *self.counters.lock().unwrap() = c;
+    }
+}

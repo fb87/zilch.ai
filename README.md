@@ -153,3 +153,20 @@ output truncation, path normalization, file scopes, TODO graphs, and history com
 | Debugging | every session writes a **JSONL event log** (mode 0600) to `<data dir>/zilch/logs/`; its path is printed on errors | `--log FILE`, `--no-log` |
 | Setup problems | `zilch --doctor` prints the resolved config and pings every distinct model | |
 | Interrupts | Ctrl-C cancels the turn (all agents); twice within 2s force-quits; `-p` exits 130 when cancelled, 1 on error | |
+
+## Sessions
+
+Every turn is saved automatically (after success, failure or Ctrl-C) to
+`<data dir>/zilch/sessions/<id>.json` (owner-only, atomic writes, outside the repo):
+master history, TODO list and approvals, every worker instance with its history and model.
+
+```sh
+zilch -c                      # continue the latest session in this directory (REPL)
+zilch -c -p "now add tests"   # continue it non-interactively
+zilch --sessions              # list sessions for this directory
+zilch --resume <id>           # resume a specific one
+zilch --no-session            # don't save
+```
+On resume, TODOs that were in progress go back to pending, a crash mid-turn is trimmed back to a
+consistent point, and workers must re-read files before editing them (stale-edit protection is
+never trusted across processes). `/clear` starts a new session; the old one stays resumable.

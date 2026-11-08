@@ -69,7 +69,7 @@ pub struct TodoInput {
     pub remove: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TodoList {
     pub items: Vec<Todo>,
     /// Union of file globs from every approved item (used to auto-approve in-scope follow-ups).

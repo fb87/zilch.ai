@@ -9,6 +9,7 @@ use std::io::{IsTerminal, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use zilch_core::team::session;
 use zilch_core::team::todo::TodoStatus;
 use zilch_core::*;
 
@@ -45,6 +46,18 @@ struct Cli {
     /// Don't write a session log.
     #[arg(long)]
     no_log: bool,
+    /// Continue the most recent session in this directory.
+    #[arg(short = 'c', long = "continue")]
+    r#continue: bool,
+    /// Resume a specific session by id (see --sessions).
+    #[arg(long, value_name = "ID")]
+    resume: Option<String>,
+    /// List saved sessions for this directory, then exit.
+    #[arg(long)]
+    sessions: bool,
+    /// Don't save this session.
+    #[arg(long)]
+    no_session: bool,
     /// Check configuration and connectivity of every configured model, then exit.
     #[arg(long)]
     doctor: bool,
@@ -134,6 +147,9 @@ async fn real_main() -> Result<i32> {
     };
     let cfg = Config::load(&cwd, &ov)?;
     let providers = cfg.build_providers()?;
+    if cli.sessions {
+        return list_sessions(&cwd);
+    }
     if cli.doctor {
         return doctor(&cfg, &providers).await;
     }
@@ -163,7 +179,28 @@ async fn real_main() -> Result<i32> {
     let renderer = render::spawn_renderer(screen.clone(), rx, event_log);
     let approver: Arc<dyn Approver> = Arc::new(approver::TerminalApprover(screen.clone()));
     let reviewer: Arc<dyn PlanReviewer> = Arc::new(approver::TerminalReviewer(screen.clone()));
-    let team = Arc::new(Team::new(cfg, providers, approver, reviewer, sink)?);
+    let mut team = Team::new(cfg, providers, approver, reviewer, sink)?;
+    let store = if cli.no_session { None } else { session::SessionStore::default_store() };
+    if let Some(s) = store.clone() {
+        team = team.with_store(s);
+    }
+    let team = Arc::new(team);
+    // Resume a previous session if asked.
+    let resume_id = match (&cli.resume, cli.r#continue) {
+        (Some(id), _) => Some(id.clone()),
+        (None, true) => match store.as_ref().and_then(|s| s.latest(&cwd)) {
+            Some(info) => Some(info.id),
+            None => bail!("no previous session for {}", cwd.display()),
+        },
+        _ => None,
+    };
+    if let Some(id) = resume_id {
+        let Some(store) = &store else { bail!("--resume needs session storage (remove --no-session)") };
+        for w in team.resume(store.load(&id)?).await? {
+            eprintln!("warning: {w}");
+        }
+        eprintln!("resumed session {id}");
+    }
 
     // Ctrl-C cancels the running turn (master, scheduler and every worker); pressing it twice
     // within 2s force-quits.
@@ -199,6 +236,9 @@ async fn real_main() -> Result<i32> {
         return Ok(match res {
             Ok(answer) => {
                 println!("{answer}");
+                if !cli.no_session {
+                    eprintln!("session {} — continue with: zilch -c -p \"...\"", team.session_id());
+                }
                 0
             }
             Err(e) if e.to_string().contains("cancelled") => {
@@ -323,6 +363,10 @@ async fn repl(team: Arc<Team>, screen: SharedScreen, log_path: Option<std::path:
     if let Some(h) = &history {
         let _ = rl.save_history(h);
     }
+    if team.save().await.ok().flatten().is_some() {
+        let s = screen.lock().await;
+        println!("{}resume this session with: zilch --resume {}{}", s.c(DIM), team.session_id(), s.c(RESET));
+    }
     Ok(())
 }
 
@@ -332,12 +376,13 @@ async fn banner(team: &Team, screen: &SharedScreen) {
     let (c, b, d, r) = (s.c(CYAN), s.c(BOLD), s.c(DIM), s.c(RESET));
     let workers: Vec<String> = cfg.workers().map(|p| format!("{} {d}({}){r}", p.name, p.binding.key())).collect();
     let msg = format!(
-        "{c}{b}zilch{r} {d}· {}{r}\n  master  {d}{}{r}\n  workers {}\n  {d}max {} parallel · approval: {:?} · /help for commands{r}{}",
+        "{c}{b}zilch{r} {d}· {}{r}\n  master  {d}{}{r}\n  workers {}\n  {d}max {} parallel · approval: {:?} · session {} · /help for commands{r}{}",
         cfg.cwd.display(),
         cfg.master().binding.key(),
         workers.join(", "),
         cfg.max_workers,
         cfg.approval,
+        team.session_id(),
         match zilch_core::tools::sandbox::status(cfg.bash_sandbox, cfg.bash_network) {
             (true, _) => String::new(),
             (false, why) => format!("\n  {}⚠ bash sandbox {why}{r}", s.c(render::YELLOW)),
@@ -358,7 +403,8 @@ async fn command(team: &Team, screen: &SharedScreen, input: &str) -> bool {
 /prompt <agent>   print the composed system prompt (master, coder, coder#2, …)
 /usage            token usage per agent and model
 /reset <instance> drop a worker instance (its history and context)
-/clear            forget everything: master history, workers, TODOs
+/sessions         list saved sessions for this directory
+/clear            start a fresh session (the current one stays resumable)
 /exit             quit"
             .to_string(),
         "/todos" => {
@@ -432,6 +478,10 @@ async fn command(team: &Team, screen: &SharedScreen, input: &str) -> bool {
                 format!("No instance '{arg}'. See /team.")
             }
         }
+        "/sessions" => {
+            let _ = list_sessions(&team.shared.cfg.cwd);
+            format!("current session: {}", team.session_id())
+        }
         "/clear" => {
             team.clear().await;
             "Cleared master history, workers and TODOs.".into()
@@ -440,4 +490,28 @@ async fn command(team: &Team, screen: &SharedScreen, input: &str) -> bool {
     };
     screen.lock().await.line(&out);
     true
+}
+
+/// `zilch --sessions`: saved sessions for this directory, newest first.
+fn list_sessions(cwd: &std::path::Path) -> Result<i32> {
+    let Some(store) = session::SessionStore::default_store() else { bail!("no data directory for session storage") };
+    let list = store.list(Some(cwd));
+    if list.is_empty() {
+        println!("No saved sessions for {}.", cwd.display());
+        return Ok(0);
+    }
+    let now = session::now_ms();
+    for s in list {
+        let age = (now.saturating_sub(s.updated_ms)) / 1000;
+        let ago = match age {
+            a if a < 120 => format!("{a}s ago"),
+            a if a < 7200 => format!("{}m ago", a / 60),
+            a if a < 172_800 => format!("{}h ago", a / 3600),
+            a => format!("{}d ago", a / 86_400),
+        };
+        let open = if s.todos_open > 0 { format!(" · {} open TODOs", s.todos_open) } else { String::new() };
+        println!("{}  {:>8}  {} turns{open}  {}", s.id, ago, s.turns, s.title.replace('\n', " "));
+    }
+    println!("\nresume with: zilch --resume <id>   (or zilch -c for the latest)");
+    Ok(0)
 }

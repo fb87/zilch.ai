@@ -4,6 +4,7 @@ pub mod file_locks;
 pub mod plan_state;
 pub mod pool;
 pub mod scheduler;
+pub mod session;
 pub mod todo;
 
 use crate::agent::{Agent, ApprovalGate, Approver, EventKind, EventSink, TurnHooks};
@@ -87,6 +88,11 @@ impl TeamShared {
     /// Spawn a new worker instance: system prompt and model are fixed here, at spawn time.
     fn spawn(&self, profile: &Profile, binding: ModelBinding, readonly: bool) -> Result<Arc<Instance>> {
         let id = self.pool.next_id(&profile.name);
+        self.spawn_as(id, profile, binding, readonly)
+    }
+
+    /// Spawn with a given instance id (used when restoring a saved session).
+    fn spawn_as(&self, id: String, profile: &Profile, binding: ModelBinding, readonly: bool) -> Result<Arc<Instance>> {
         let mut reg = self.worker_tools.subset(&profile.tools);
         if readonly {
             reg = reg.filter(|t| !t.mutating());
@@ -207,6 +213,15 @@ pub struct Team {
     pub shared: Arc<TeamShared>,
     master: AsyncMutex<Agent>,
     master_system: String,
+    persist: Mutex<Persist>,
+}
+
+/// Where and as what this team's session is saved.
+struct Persist {
+    store: Option<session::SessionStore>,
+    id: String,
+    created_ms: u64,
+    title: String,
 }
 
 impl Team {
@@ -276,37 +291,156 @@ impl Team {
             usage: Default::default(),
             session: crate::agent::run::new_session_id("master"),
         };
-        Ok(Self { shared, master: AsyncMutex::new(master), master_system: system })
+        let persist = Persist { store: None, id: session::new_session_id(), created_ms: session::now_ms(), title: String::new() };
+        Ok(Self { shared, master: AsyncMutex::new(master), master_system: system, persist: Mutex::new(persist) })
+    }
+
+    /// Save the session to `store` after every turn.
+    pub fn with_store(self, store: session::SessionStore) -> Self {
+        self.persist.lock().unwrap().store = Some(store);
+        self
+    }
+
+    pub fn session_id(&self) -> String {
+        self.persist.lock().unwrap().id.clone()
     }
 
     /// The single entry point for the user.
     pub async fn run(&self, input: &str) -> Result<String> {
         self.shared.cancel.reset();
-        let mut m = self.master.lock().await;
-        let res = m.run(input).await;
-        if res.is_err() {
-            // Leave history consistent: drop a dangling assistant tool-call turn if cancelled mid-way.
-            while m.history.last().is_some_and(|msg| !msg.tool_calls.is_empty()) {
-                m.history.pop();
-            }
-            // Any item left in progress by a cancelled run goes back to pending.
-            let mut l = self.shared.todos.lock().unwrap();
-            for t in l.items.iter_mut().filter(|t| t.status == TodoStatus::InProgress) {
-                t.status = TodoStatus::Pending;
+        {
+            let mut p = self.persist.lock().unwrap();
+            if p.title.is_empty() {
+                p.title = input.chars().take(120).collect();
             }
         }
+        let res = {
+            let mut m = self.master.lock().await;
+            let res = m.run(input).await;
+            if res.is_err() {
+                // Leave history consistent: drop an assistant tool call whose results are missing.
+                session::trim_dangling(&mut m.history);
+                // Any item left in progress by a cancelled run goes back to pending.
+                let mut l = self.shared.todos.lock().unwrap();
+                for t in l.items.iter_mut().filter(|t| t.status == TodoStatus::InProgress) {
+                    t.status = TodoStatus::Pending;
+                }
+            }
+            res
+        };
+        // Persist after every turn — success, failure or cancellation — so nothing is lost.
+        if let Err(e) = self.save().await {
+            self.shared.events.emit("master", EventKind::Notice(format!("warning: could not save session: {e:#}")));
+        }
         res
+    }
+
+    /// Capture the full team state (call between turns, when no worker is running).
+    pub async fn snapshot(&self) -> session::SessionState {
+        let master = {
+            let m = self.master.lock().await;
+            session::AgentState { history: m.history.clone(), session: m.session.clone(), usage: m.usage }
+        };
+        let mut workers = Vec::new();
+        for inst in self.shared.pool.list() {
+            let a = inst.agent.lock().await;
+            workers.push(session::WorkerState {
+                id: inst.id.clone(),
+                profile: inst.profile.clone(),
+                binding: inst.binding.clone(),
+                readonly: inst.readonly,
+                agent: session::AgentState { history: a.history.clone(), session: a.session.clone(), usage: a.usage },
+            });
+        }
+        let p = self.persist.lock().unwrap();
+        session::SessionState {
+            version: session::FORMAT_VERSION,
+            id: p.id.clone(),
+            cwd: self.shared.cfg.cwd.clone(),
+            created_ms: p.created_ms,
+            updated_ms: session::now_ms(),
+            title: p.title.clone(),
+            master,
+            workers,
+            todos: self.shared.todos.lock().unwrap().clone(),
+            counters: self.shared.pool.counters(),
+        }
+    }
+
+    /// Save now (no-op without a store). Returns the file written.
+    pub async fn save(&self) -> Result<Option<std::path::PathBuf>> {
+        let Some(store) = self.persist.lock().unwrap().store.clone() else { return Ok(None) };
+        let state = self.snapshot().await;
+        if state.master.history.is_empty() {
+            return Ok(None); // nothing worth saving yet
+        }
+        store.save(&state).map(Some)
+    }
+
+    /// Continue a saved session. Returns warnings (e.g. workers whose profile no longer exists).
+    pub async fn resume(&self, mut state: session::SessionState) -> Result<Vec<String>> {
+        if state.cwd != self.shared.cfg.cwd {
+            bail!(
+                "session {} belongs to {}, not {}; run zilch from that directory (or with -C)",
+                state.id,
+                state.cwd.display(),
+                self.shared.cfg.cwd.display()
+            );
+        }
+        state.sanitize();
+        let mut warnings = Vec::new();
+        {
+            let mut m = self.master.lock().await;
+            m.history = state.master.history;
+            m.session = state.master.session;
+            m.usage = state.master.usage;
+        }
+        self.shared.pool.clear();
+        self.shared.pool.set_counters(state.counters);
+        for w in state.workers {
+            let Some(profile) = self.shared.cfg.workers().find(|p| p.name == w.profile).cloned() else {
+                warnings.push(format!("dropped {}: worker profile '{}' no longer exists", w.id, w.profile));
+                continue;
+            };
+            if !self.shared.providers.contains(&w.binding.provider) {
+                warnings.push(format!("dropped {}: provider '{}' is no longer configured", w.id, w.binding.provider));
+                continue;
+            }
+            // Instances keep the model they were spawned with; the system prompt is rebuilt.
+            let inst = self.shared.spawn_as(w.id.clone(), &profile, w.binding, w.readonly)?;
+            let mut a = inst.agent.lock().await;
+            a.history = w.agent.history;
+            a.session = w.agent.session;
+            a.usage = w.agent.usage;
+            // File hashes are not persisted: workers must re-read files before editing them.
+        }
+        *self.shared.todos.lock().unwrap() = state.todos;
+        {
+            let mut p = self.persist.lock().unwrap();
+            p.id = state.id;
+            p.created_ms = state.created_ms;
+            p.title = state.title;
+        }
+        self.shared.todos_changed();
+        Ok(warnings)
     }
 
     pub fn cancel(&self) {
         self.shared.cancel.cancel();
     }
 
-    /// Forget everything: master history, workers, TODOs.
+    /// Forget everything: master history, workers, TODOs. Starts a new session (the old one stays
+    /// on disk and can still be resumed).
     pub async fn clear(&self) {
         self.master.lock().await.reset();
         self.shared.pool.clear();
         *self.shared.todos.lock().unwrap() = TodoList::default();
+        {
+            let mut p = self.persist.lock().unwrap();
+            p.id = session::new_session_id();
+            p.created_ms = session::now_ms();
+            p.title.clear();
+        }
         self.shared.todos_changed();
     }
 
