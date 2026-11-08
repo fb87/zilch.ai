@@ -17,6 +17,9 @@ use std::sync::Arc;
 pub const MASTER_TOOLS: &[&str] = &["read_file", "glob", "grep", "todo_write", "propose_plan", "run_todos", "delegate"];
 pub const WORKER_TOOLS: &[&str] = &["read_file", "write_file", "edit_file", "glob", "grep", "bash"];
 pub const READONLY_TOOLS: &[&str] = &["read_file", "glob", "grep"];
+/// The /spec lane: read the code, write only the documents in the spec directory.
+pub const SPEC_TOOLS: &[&str] = &["read_file", "glob", "grep", "write_doc", "edit_doc", "release_spec"];
+pub const SPEC_ONLY_TOOLS: &[&str] = &["write_doc", "edit_doc", "release_spec"];
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -117,6 +120,7 @@ fn merge_opt<T>(dst: &mut Option<T>, src: Option<T>) {
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
     pub max_workers: Option<usize>,
+    pub spec_dir: Option<String>,
     pub approval: Option<ApprovalMode>,
     pub sandbox: Option<bool>,
     pub bash_env_passthrough: Option<Vec<String>>,
@@ -145,12 +149,16 @@ pub struct Overrides {
     pub approval: Option<ApprovalMode>,
     pub max_session_tokens: Option<u64>,
     pub max_session_cost: Option<f64>,
+    /// Where the spec lane keeps its documents (relative to the workspace or absolute).
+    pub spec_dir: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cwd: PathBuf,
     pub max_workers: usize,
+    /// Directory of the spec lane's documents (spec.md, design.md, plan.md, versions/); default <workspace>/specs.
+    pub spec_dir: PathBuf,
     pub approval: ApprovalMode,
     /// Confine file tools to the workspace (default true).
     pub sandbox: bool,
@@ -182,7 +190,7 @@ impl Config {
         self.profiles.iter().find(|p| p.is_master()).expect("master profile")
     }
     pub fn workers(&self) -> impl Iterator<Item = &Profile> {
-        self.profiles.iter().filter(|p| !p.is_master())
+        self.profiles.iter().filter(|p| p.role == AgentRole::Worker)
     }
     pub fn profile(&self, name: &str) -> Option<&Profile> {
         self.profiles.iter().find(|p| p.name == name)
@@ -252,7 +260,7 @@ impl Config {
         }
 
         // Build profiles: built-ins first, then user-defined workers.
-        let mut names = vec!["master".to_string(), "coder".to_string(), "explorer".to_string()];
+        let mut names = vec!["master".to_string(), "spec".to_string(), "coder".to_string(), "explorer".to_string()];
         names.extend(fc.roles.keys().filter(|k| !names.contains(k)).cloned().collect::<Vec<_>>());
         let mut profiles = Vec::new();
         for name in names {
@@ -263,6 +271,7 @@ impl Config {
         let cfg = Config {
             cwd: cwd.to_path_buf(),
             max_workers: ov.max_workers.or(fc.max_workers).unwrap_or(4).max(1),
+            spec_dir: cwd.join(ov.spec_dir.clone().or(fc.spec_dir).unwrap_or_else(|| "specs".into())),
             approval: ov.approval.or(fc.approval).unwrap_or_default(),
             sandbox: fc.sandbox.unwrap_or(true),
             bash_env_passthrough: fc.bash_env_passthrough.unwrap_or_default(),
@@ -327,6 +336,7 @@ impl Config {
 
 fn merge_file(dst: &mut FileConfig, src: FileConfig, base: &Path) {
     merge_opt(&mut dst.max_workers, src.max_workers);
+    merge_opt(&mut dst.spec_dir, src.spec_dir);
     merge_opt(&mut dst.approval, src.approval);
     merge_opt(&mut dst.sandbox, src.sandbox);
     merge_opt(&mut dst.bash_env_passthrough, src.bash_env_passthrough);
@@ -366,6 +376,9 @@ fn build_profile(name: &str, rc: RoleCfg, defaults: &RoleCfg) -> Result<Profile>
             "Read-only investigation: finds code, answers questions about the codebase",
             READONLY_TOOLS,
         ),
+        "spec" => {
+            (AgentRole::Spec, prompt::SPEC_PROMPT, "Requirements engineer: interviews the user and maintains the project spec", SPEC_TOOLS)
+        }
         _ => (AgentRole::Worker, prompt::WORKER_PROMPT, "General worker", WORKER_TOOLS),
     };
 
@@ -373,7 +386,7 @@ fn build_profile(name: &str, rc: RoleCfg, defaults: &RoleCfg) -> Result<Profile>
         None => default_tools.iter().map(|s| s.to_string()).collect(),
         Some(list) => {
             for t in list {
-                let known = MASTER_TOOLS.contains(&t.as_str()) || WORKER_TOOLS.contains(&t.as_str());
+                let known = MASTER_TOOLS.contains(&t.as_str()) || WORKER_TOOLS.contains(&t.as_str()) || SPEC_TOOLS.contains(&t.as_str());
                 if !known {
                     bail!("profile '{name}': unknown tool '{t}'");
                 }
@@ -384,7 +397,10 @@ fn build_profile(name: &str, rc: RoleCfg, defaults: &RoleCfg) -> Result<Profile>
     // Structural role enforcement: the master can never get mutating tools, workers never coordinate.
     let tools: Vec<String> = match role {
         AgentRole::Master => tools.into_iter().filter(|t| MASTER_TOOLS.contains(&t.as_str())).collect(),
-        AgentRole::Worker => tools.into_iter().filter(|t| !COORDINATION_TOOLS.contains(&t.as_str())).collect(),
+        AgentRole::Worker => {
+            tools.into_iter().filter(|t| !COORDINATION_TOOLS.contains(&t.as_str()) && !SPEC_ONLY_TOOLS.contains(&t.as_str())).collect()
+        }
+        AgentRole::Spec => tools.into_iter().filter(|t| SPEC_TOOLS.contains(&t.as_str())).collect(),
     };
 
     let custom_prompt = match (&rc.system_prompt, &rc.system_prompt_file) {

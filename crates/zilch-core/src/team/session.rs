@@ -40,6 +40,9 @@ pub struct SessionState {
     /// First user request, for listings.
     pub title: String,
     pub master: AgentState,
+    /// The /spec lane's conversation (absent in sessions from before the spec lane existed).
+    #[serde(default)]
+    pub spec: Option<AgentState>,
     pub workers: Vec<WorkerState>,
     pub todos: TodoList,
     pub counters: HashMap<String, usize>,
@@ -141,6 +144,9 @@ impl SessionState {
             t.status = TodoStatus::Pending;
         }
         trim_dangling(&mut self.master.history);
+        if let Some(s) = &mut self.spec {
+            trim_dangling(&mut s.history);
+        }
         for w in &mut self.workers {
             trim_dangling(&mut w.agent.history);
         }
@@ -286,6 +292,7 @@ mod tests {
                 session: "s".into(),
                 usage: Usage::default(),
             },
+            spec: None,
             workers: vec![],
             todos: TodoList::default(),
             counters: HashMap::new(),

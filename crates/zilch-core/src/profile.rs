@@ -7,6 +7,8 @@ use serde::Deserialize;
 pub enum AgentRole {
     Master,
     Worker,
+    /// Requirements engineer of the /spec lane: reads the code, writes only the spec file.
+    Spec,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]

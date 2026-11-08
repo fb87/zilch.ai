@@ -40,6 +40,9 @@ struct Cli {
     /// Stop when the whole team has used this many tokens (prompt + completion).
     #[arg(long, value_name = "TOKENS")]
     max_tokens: Option<u64>,
+    /// Directory for the spec lane's documents (spec.md, design.md, plan.md, versions/); default specs/.
+    #[arg(long, value_name = "DIR")]
+    spec_dir: Option<String>,
     /// Stop before the team's spend would exceed this many USD (needs known prices).
     #[arg(long, value_name = "USD")]
     max_cost: Option<f64>,
@@ -161,6 +164,7 @@ async fn real_main() -> Result<i32> {
         approval: if cli.yolo { Some(ApprovalMode::Auto) } else { cli.approval },
         max_session_tokens: cli.max_tokens,
         max_session_cost: cli.max_cost,
+        spec_dir: cli.spec_dir.clone(),
     };
     let cfg = Config::load(&cwd, &ov)?;
     let mut cfg = cfg;

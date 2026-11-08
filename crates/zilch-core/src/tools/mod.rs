@@ -8,6 +8,7 @@ pub mod sandbox;
 #[cfg(target_os = "linux")]
 pub mod sandbox_linux;
 pub mod search;
+pub mod spec_tools;
 pub mod todo_tools;
 
 use crate::agent::approval::ApprovalGate;

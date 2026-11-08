@@ -7,6 +7,7 @@ pub const MASTER_PROMPT: &str = include_str!("../prompts/master.md");
 pub const CODER_PROMPT: &str = include_str!("../prompts/coder.md");
 pub const EXPLORER_PROMPT: &str = include_str!("../prompts/explorer.md");
 pub const WORKER_PROMPT: &str = include_str!("../prompts/worker.md");
+pub const SPEC_PROMPT: &str = include_str!("../prompts/spec.md");
 
 /// Non-removable rules that keep the system working regardless of custom prompts.
 const MASTER_CONTRACT: &str = "\
@@ -18,6 +19,15 @@ const MASTER_CONTRACT: &str = "\
   todo_id of an approved item).
 - `delegate` with a todo_id runs a follow-up for that (approved) item.
 - Never claim work is done unless a worker report confirms it.";
+
+const SPEC_CONTRACT: &str = "\
+## Rules (always apply)
+- You can only write the documents in the spec directory (write_doc / edit_doc / release_spec). You cannot change code or run
+  commands; the implementation team does that, possibly in parallel with you.
+- Record only what the user confirmed; everything else is an assumption or an open question.
+- Release a spec version only with the user's agreement, and keep design.md and plan.md based on the
+  latest released version. Keep requirement ids stable so the implementation
+  team can see what moved.";
 
 const WORKER_CONTRACT: &str = "\
 ## Rules (always apply)
@@ -52,6 +62,7 @@ pub fn build(profile: &Profile, env: &PromptEnv) -> String {
         match profile.role {
             AgentRole::Master => MASTER_CONTRACT,
             AgentRole::Worker => WORKER_CONTRACT,
+            AgentRole::Spec => SPEC_CONTRACT,
         }
         .to_string(),
     );

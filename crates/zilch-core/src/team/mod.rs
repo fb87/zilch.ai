@@ -12,6 +12,7 @@ use crate::config::{Config, READONLY_TOOLS};
 use crate::llm::{Message, ModelBinding, Providers};
 use crate::profile::Profile;
 use crate::prompt::{self, PromptEnv};
+use crate::tools::spec_tools::{Doc, EditDoc, ReleaseSpec, SpecStore, WriteDoc};
 use crate::tools::{self, CancelCell, Scope, TokenBudget, ToolCtx, ToolPolicy, ToolRegistry};
 use anyhow::{anyhow, bail, Result};
 use file_locks::FileLocks;
@@ -37,6 +38,8 @@ pub struct TeamShared {
     pub meter: Arc<crate::llm::catalog::CostMeter>,
     persist: Mutex<Persist>,
     worker_tools: ToolRegistry,
+    /// The spec lane's documents (spec.md, design.md, plan.md, versions/).
+    pub spec_store: Arc<SpecStore>,
 }
 
 impl TeamShared {
@@ -97,6 +100,8 @@ impl TeamShared {
             updated_ms: session::now_ms(),
             title: p.title.clone(),
             master,
+            // Latest known spec-lane state (refreshed at the start and end of every spec turn).
+            spec: p.spec_checkpoint.clone().filter(|s| !s.history.is_empty()),
             workers,
             todos: self.todos.lock().unwrap().clone(),
             counters: self.pool.counters(),
@@ -221,18 +226,56 @@ pub fn report_ok(report: &str) -> bool {
     }) && !report.starts_with("[stopped after reaching max_steps")
 }
 
-struct MasterHooks(Arc<TeamShared>);
+struct MasterHooks {
+    shared: Arc<TeamShared>,
+    /// Last seen modification time of plan.md, to tell the master when the spec lane updated it.
+    plan_seen: Mutex<Option<std::time::SystemTime>>,
+}
+
+impl MasterHooks {
+    /// What the code lane should know about the spec lane's output: it implements from plan.md
+    /// and design.md (never spec.md), so report their versions, staleness and fresh updates.
+    fn plan_context(&self) -> Option<String> {
+        let store = &self.shared.spec_store;
+        let st = store.status();
+        if !st.spec_exists && st.plan_based_on.is_none() {
+            return None;
+        }
+        let mut s = format!(
+            "Specification documents (maintained by the user and the spec lane, in parallel with you): {}\n\
+             Implement from {} and {} — they are your requirements; do not plan from spec.md directly.",
+            st.describe(&store.dir),
+            store.path(Doc::Plan).display(),
+            store.path(Doc::Design).display()
+        );
+        if st.plan_is_stale() || st.design_is_stale() {
+            s.push_str(
+                "\nWARNING: plan/design are based on an older spec version; tell the user before implementing parts that may have changed.",
+            );
+        }
+        let mtime = std::fs::metadata(store.path(Doc::Plan)).and_then(|m| m.modified()).ok();
+        let mut seen = self.plan_seen.lock().unwrap();
+        if seen.is_some() && mtime != *seen {
+            s.push_str("\nNOTE: plan.md was updated since you last looked; re-read it and adjust the TODO list if needed.");
+        }
+        *seen = mtime;
+        Some(s)
+    }
+}
 
 impl TurnHooks for MasterHooks {
     fn context(&self) -> Option<String> {
-        let l = self.0.todos.lock().unwrap();
-        if l.items.is_empty() {
-            return None;
+        let plan = self.plan_context();
+        let l = self.shared.todos.lock().unwrap();
+        let todos =
+            (!l.items.is_empty()).then(|| format!("Current TODO list (state: {:?}):\n{}", plan_state::plan_state(&l), l.render_compact()));
+        match (plan, todos) {
+            (None, None) => None,
+            (a, b) => Some([a, b].into_iter().flatten().collect::<Vec<_>>().join("\n\n")),
         }
-        Some(format!("Current TODO list (state: {:?}):\n{}", plan_state::plan_state(&l), l.render_compact()))
     }
     fn on_finish(&self) -> Option<String> {
-        let l = self.0.todos.lock().unwrap();
+        let l = self.shared.todos.lock().unwrap();
         let open: Vec<String> = l.items.iter().filter(|t| !t.status.is_terminal()).map(|t| format!("{} ({:?})", t.id, t.status)).collect();
         if open.is_empty() {
             return None;
@@ -261,6 +304,19 @@ pub struct Team {
     pub shared: Arc<TeamShared>,
     master: AsyncMutex<Agent>,
     master_system: String,
+    /// The /spec lane: its own conversation, model, prompt and cancellation.
+    spec: AsyncMutex<Agent>,
+    spec_system: String,
+    spec_cancel: CancelCell,
+}
+
+/// Spec lane context: the documents' current versions every turn.
+struct SpecHooks(Arc<SpecStore>);
+
+impl TurnHooks for SpecHooks {
+    fn context(&self) -> Option<String> {
+        Some(format!("Spec documents: {}", self.0.status().describe(&self.0.dir)))
+    }
 }
 
 /// Where and as what this team's session is saved (shared so the scheduler can checkpoint).
@@ -271,6 +327,8 @@ struct Persist {
     title: String,
     /// Master state to write in mid-turn checkpoints (history up to the current request).
     master_checkpoint: Option<session::AgentState>,
+    /// Spec lane state from before its current turn (used when saving while it is busy).
+    spec_checkpoint: Option<session::AgentState>,
     /// Last known state of each worker, used when it is busy during a checkpoint.
     worker_cache: std::collections::HashMap<String, session::WorkerState>,
 }
@@ -313,12 +371,14 @@ impl Team {
                 created_ms: session::now_ms(),
                 title: String::new(),
                 master_checkpoint: None,
+                spec_checkpoint: None,
                 worker_cache: Default::default(),
             }),
             policy,
             budget: cfg.max_session_tokens.map(|l| Arc::new(TokenBudget::new(l))),
             meter: Arc::new(crate::llm::catalog::CostMeter::new(cfg.max_session_cost)),
             worker_tools: tools::worker_tools(),
+            spec_store: Arc::new(SpecStore::new(cfg.spec_dir.clone())),
             cfg,
         });
 
@@ -349,11 +409,50 @@ impl Team {
             max_steps: profile.max_steps,
             context_tokens: profile.context_tokens,
             ctx,
-            hooks: Some(Arc::new(MasterHooks(shared.clone()))),
+            hooks: Some(Arc::new(MasterHooks { shared: shared.clone(), plan_seen: Mutex::new(None) })),
             usage: Default::default(),
             session: crate::agent::run::new_session_id("master"),
         };
-        Ok(Self { shared, master: AsyncMutex::new(master), master_system: system })
+
+        // Spec lane: a separate conversation (requirements engineering) that runs in parallel with
+        // the code lane. It reads the code and writes only the spec directory's documents.
+        let sprof = shared.cfg.profile("spec").cloned().ok_or_else(|| anyhow!("missing spec profile"))?;
+        let mut sreg = tools::worker_tools().filter(|t| !t.mutating() && READONLY_TOOLS.contains(&t.name()));
+        sreg.register(Arc::new(WriteDoc(shared.spec_store.clone())));
+        sreg.register(Arc::new(EditDoc(shared.spec_store.clone())));
+        sreg.register(Arc::new(ReleaseSpec(shared.spec_store.clone())));
+        let sreg = sreg.subset(&sprof.tools);
+        let snames = sreg.names();
+        let spec_system = prompt::build(&sprof, &PromptEnv { cwd: &shared.cfg.cwd, agent_id: "spec", tools: &snames, workers: &[] });
+        let spec_cancel = CancelCell::default();
+        let sctx = Arc::new(
+            ToolCtx::new(
+                "spec",
+                shared.cfg.cwd.clone(),
+                shared.gate.clone(),
+                shared.events.clone(),
+                spec_cancel.clone(),
+                shared.file_locks.clone(),
+            )
+            .with_policy(shared.policy.clone(), shared.budget.clone())
+            .with_meter(shared.meter.clone()),
+        );
+        let spec = Agent {
+            id: "spec".into(),
+            profile: "spec".into(),
+            llm: shared.providers.get(&sprof.binding.provider)?,
+            binding: sprof.binding.clone(),
+            system: spec_system.clone(),
+            tools: sreg,
+            history: vec![],
+            max_steps: sprof.max_steps,
+            context_tokens: sprof.context_tokens,
+            ctx: sctx,
+            hooks: Some(Arc::new(SpecHooks(shared.spec_store.clone()))),
+            usage: Default::default(),
+            session: crate::agent::run::new_session_id("spec"),
+        };
+        Ok(Self { shared, master: AsyncMutex::new(master), master_system: system, spec: AsyncMutex::new(spec), spec_system, spec_cancel })
     }
 
     /// Save the session to `store` after every turn.
@@ -420,20 +519,39 @@ impl Team {
 
     /// Capture the full team state (call between turns, when no worker is running).
     pub async fn snapshot(&self) -> session::SessionState {
-        let master = {
-            let m = self.master.lock().await;
-            session::AgentState { history: m.history.clone(), session: m.session.clone(), usage: m.usage }
+        // Never wait on a busy lane: the other lane may be mid-turn for minutes. Busy agents are
+        // recorded from the state captured at the start of their current turn.
+        let agent_state = |a: &Agent| session::AgentState { history: a.history.clone(), session: a.session.clone(), usage: a.usage };
+        let (master_cp, spec_cp) = {
+            let p = self.shared.persist.lock().unwrap();
+            (p.master_checkpoint.clone(), p.spec_checkpoint.clone())
         };
+        let empty = || session::AgentState { history: vec![], session: String::new(), usage: Default::default() };
+        let master = match self.master.try_lock() {
+            Ok(m) => agent_state(&m),
+            Err(_) => master_cp.unwrap_or_else(empty),
+        };
+        let spec = match self.spec.try_lock() {
+            Ok(s) => Some(agent_state(&s)),
+            Err(_) => spec_cp,
+        }
+        .filter(|s| !s.history.is_empty());
         let mut workers = Vec::new();
         for inst in self.shared.pool.list() {
-            let a = inst.agent.lock().await;
-            workers.push(session::WorkerState {
-                id: inst.id.clone(),
-                profile: inst.profile.clone(),
-                binding: inst.binding.clone(),
-                readonly: inst.readonly,
-                agent: session::AgentState { history: a.history.clone(), session: a.session.clone(), usage: a.usage },
-            });
+            let state = match inst.agent.try_lock() {
+                Ok(a) => Some(session::WorkerState {
+                    id: inst.id.clone(),
+                    profile: inst.profile.clone(),
+                    binding: inst.binding.clone(),
+                    readonly: inst.readonly,
+                    agent: agent_state(&a),
+                }),
+                Err(_) => self.shared.persist.lock().unwrap().worker_cache.get(&inst.id).cloned(),
+            };
+            if let Some(s) = state {
+                self.shared.persist.lock().unwrap().worker_cache.insert(s.id.clone(), s.clone());
+                workers.push(s);
+            }
         }
         let p = self.shared.persist.lock().unwrap();
         session::SessionState {
@@ -444,6 +562,7 @@ impl Team {
             updated_ms: session::now_ms(),
             title: p.title.clone(),
             master,
+            spec,
             workers,
             todos: self.shared.todos.lock().unwrap().clone(),
             counters: self.shared.pool.counters(),
@@ -454,7 +573,7 @@ impl Team {
     pub async fn save(&self) -> Result<Option<std::path::PathBuf>> {
         let Some(store) = self.shared.persist.lock().unwrap().store.clone() else { return Ok(None) };
         let state = self.snapshot().await;
-        if state.master.history.is_empty() {
+        if state.master.history.is_empty() && state.spec.is_none() {
             return Ok(None); // nothing worth saving yet
         }
         store.save(&state).map(Some)
@@ -477,6 +596,12 @@ impl Team {
             m.history = state.master.history;
             m.session = state.master.session;
             m.usage = state.master.usage;
+        }
+        if let Some(s) = state.spec {
+            let mut a = self.spec.lock().await;
+            a.history = s.history;
+            a.session = s.session;
+            a.usage = s.usage;
         }
         self.shared.pool.clear();
         self.shared.pool.set_counters(state.counters);
@@ -508,14 +633,57 @@ impl Team {
         Ok(warnings)
     }
 
+    /// Cancel the code lane (master, scheduler and every worker). The spec lane is unaffected.
     pub fn cancel(&self) {
         self.shared.cancel.cancel();
     }
 
-    /// Forget everything: master history, workers, TODOs. Starts a new session (the old one stays
-    /// on disk and can still be resumed).
+    /// Cancel the spec lane only.
+    pub fn cancel_spec(&self) {
+        self.spec_cancel.cancel();
+    }
+
+    /// One turn of the /spec lane (requirements engineering). Runs independently of — and
+    /// possibly concurrently with — the code lane; saves the session afterwards.
+    pub async fn run_spec(&self, input: &str) -> Result<String> {
+        self.spec_cancel.reset();
+        {
+            let mut p = self.shared.persist.lock().unwrap();
+            if p.title.is_empty() {
+                p.title = input.chars().take(120).collect();
+            }
+        }
+        let res = {
+            let mut s = self.spec.lock().await;
+            // Recorded for saves that happen while this turn is still running.
+            self.shared.persist.lock().unwrap().spec_checkpoint =
+                Some(session::AgentState { history: s.history.clone(), session: s.session.clone(), usage: s.usage });
+            let res = s.run(input).await;
+            if res.is_err() {
+                session::trim_dangling(&mut s.history);
+            }
+            // Refresh the cache with the finished turn, so a later code-lane checkpoint (which
+            // cannot lock this lane) never writes back an older spec conversation.
+            self.shared.persist.lock().unwrap().spec_checkpoint =
+                Some(session::AgentState { history: s.history.clone(), session: s.session.clone(), usage: s.usage });
+            res
+        };
+        if let Err(e) = self.save().await {
+            self.shared.events.emit("spec", EventKind::Notice(format!("warning: could not save session: {e:#}")));
+        }
+        res
+    }
+
+    /// Versions of the spec documents (spec, design, plan) right now.
+    pub fn spec_status(&self) -> crate::tools::spec_tools::SpecStatus {
+        self.shared.spec_store.status()
+    }
+
+    /// Forget everything: both lanes' conversations, workers, TODOs. Starts a new session (the old
+    /// one stays on disk and can still be resumed). Spec documents on disk are kept.
     pub async fn clear(&self) {
         self.master.lock().await.reset();
+        self.spec.lock().await.reset();
         self.shared.pool.clear();
         *self.shared.todos.lock().unwrap() = TodoList::default();
         {
@@ -563,6 +731,9 @@ impl Team {
     pub async fn prompt_of(&self, name: &str) -> Option<String> {
         if name == "master" {
             return Some(self.master_system.clone());
+        }
+        if name == "spec" {
+            return Some(self.spec_system.clone());
         }
         if let Some(i) = self.shared.pool.find(name) {
             return Some(i.agent.lock().await.system.clone());
