@@ -243,3 +243,10 @@ see its answer`); switching shows what it said. Approvals and plan reviews from 
 above the prompt and your next line answers them. `/status` shows both lanes and the document
 versions; `zilch -p "…" --lane spec` talks to the spec lane non-interactively. Both conversations
 are saved in the session and resume with `-c`.
+
+## Editor integration (Neovim)
+
+`editor/nvim` is a small Neovim plugin: select code, `:ZilchSend why is this rounding here?`, and
+the running zilch receives the file, line range, selected code and your comment in the active lane
+(or `:ZilchCode` / `:ZilchSpec` to pick one). It talks to the REPL over a local Unix socket using
+newline-delimited JSON — see [`editor/nvim/README.md`](editor/nvim/README.md).

@@ -18,8 +18,31 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+/// Unix socket paths are limited to ~108 bytes (sockaddr_un). Keep the socket in the workspace
+/// when it fits, otherwise in a short private directory, named after the workspace path.
 pub fn socket_path(workspace: &Path) -> PathBuf {
-    workspace.join(".zilch").join("zilch.sock")
+    const MAX: usize = 100;
+    let in_ws = workspace.join(".zilch").join("zilch.sock");
+    if in_ws.as_os_str().len() <= MAX {
+        return in_ws;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    workspace.hash(&mut h);
+    let name = format!("{:016x}.sock", h.finish());
+    let uid = unsafe { libc::getuid() };
+    let bases = [std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from), Some(PathBuf::from(format!("/tmp/zilch-{uid}")))];
+    bases
+        .into_iter()
+        .flatten()
+        .map(|b| b.join("zilch").join(&name))
+        .find(|p| p.as_os_str().len() <= MAX)
+        .unwrap_or_else(|| PathBuf::from(format!("/tmp/zilch-{uid}-{name}")))
+}
+
+/// `<workspace>/.zilch/ipc`: one line with the socket path, read by editor plugins.
+pub fn pointer_path(workspace: &Path) -> PathBuf {
+    workspace.join(".zilch").join("ipc")
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,20 +84,33 @@ pub fn compose(text: &str, file: Option<&str>, start: Option<u64>, end: Option<u
     out
 }
 
-/// Removes the socket file when the REPL exits.
-pub struct IpcGuard(PathBuf);
+/// Removes the socket and the pointer file when the REPL exits.
+pub struct IpcGuard {
+    socket: PathBuf,
+    pointer: PathBuf,
+}
 
 impl Drop for IpcGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::remove_file(&self.pointer);
     }
 }
 
 /// Start listening. Returns `Ok(None)` if another live zilch already owns this workspace's socket.
 pub async fn serve(dispatcher: Arc<Dispatcher>, workspace: &Path) -> std::io::Result<Option<IpcGuard>> {
     let path = socket_path(workspace);
-    if let Some(dir) = path.parent() {
+    let pointer = pointer_path(workspace);
+    for dir in [path.parent(), pointer.parent()].into_iter().flatten() {
         std::fs::create_dir_all(dir)?;
+    }
+    #[cfg(unix)]
+    if !path.starts_with(workspace) {
+        // Private directory for sockets outside the workspace.
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
     }
     if path.exists() {
         if UnixStream::connect(&path).await.is_ok() {
@@ -88,6 +124,9 @@ pub async fn serve(dispatcher: Arc<Dispatcher>, workspace: &Path) -> std::io::Re
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
+    // Editors discover the socket through this file (the socket itself may live elsewhere).
+    std::fs::write(&pointer, format!("{}\n", path.display()))?;
+    let guard = IpcGuard { socket: path, pointer };
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let d = dispatcher.clone();
@@ -96,7 +135,7 @@ pub async fn serve(dispatcher: Arc<Dispatcher>, workspace: &Path) -> std::io::Re
             });
         }
     });
-    Ok(Some(IpcGuard(path)))
+    Ok(Some(guard))
 }
 
 async fn handle_conn(d: Arc<Dispatcher>, stream: UnixStream) -> std::io::Result<()> {

@@ -2,3 +2,7 @@
 .direnv/
 __pycache__/
 *.pyc
+
+# zilch runtime files
+.zilch/ipc
+.zilch/zilch.sock

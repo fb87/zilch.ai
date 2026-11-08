@@ -1,0 +1,4 @@
+
+# zilch runtime files (IPC pointer / socket)
+.zilch/ipc
+.zilch/zilch.sock
