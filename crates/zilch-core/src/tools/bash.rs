@@ -100,33 +100,48 @@ impl Tool for Bash {
         // Read output concurrently so a chatty command never blocks on a full pipe.
         let mut stdout = child.stdout.take().expect("stdout");
         let (events, agent) = (ctx.events.clone(), ctx.agent_id.clone());
+        // The reader appends into a shared buffer, so we never depend on the pipe closing: a
+        // background child can keep it open even after its group was signalled.
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let sink = collected.clone();
         let reader = tokio::spawn(async move {
-            let mut buf = Vec::new();
             let mut chunk = [0u8; 8192];
             let mut last_emit = std::time::Instant::now();
             loop {
-                match stdout.read(&mut chunk).await {
+                let n = match stdout.read(&mut chunk).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                }
-                // Live progress for the UI: latest non-empty output line, at most ~4×/s.
-                if last_emit.elapsed() >= Duration::from_millis(250) {
-                    last_emit = std::time::Instant::now();
-                    let tail = &buf[buf.len().saturating_sub(4096)..];
-                    let text = String::from_utf8_lossy(tail);
-                    if let Some(line) = text.lines().rev().map(str::trim).find(|l| !l.is_empty()) {
-                        let line: String = line.chars().take(120).collect();
-                        events.emit(&agent, crate::agent::EventKind::ToolProgress { call_id: String::new(), line });
+                    Ok(n) => n,
+                };
+                let progress = {
+                    let mut buf = sink.lock().unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                    // Live progress for the UI: latest non-empty output line, at most ~4×/s.
+                    if last_emit.elapsed() >= Duration::from_millis(250) {
+                        last_emit = std::time::Instant::now();
+                        let tail = &buf[buf.len().saturating_sub(4096)..];
+                        String::from_utf8_lossy(tail)
+                            .lines()
+                            .rev()
+                            .map(str::trim)
+                            .find(|l| !l.is_empty())
+                            .map(|l| l.chars().take(120).collect::<String>())
+                    } else {
+                        None
                     }
+                };
+                if let Some(line) = progress {
+                    events.emit(&agent, crate::agent::EventKind::ToolProgress { call_id: String::new(), line });
                 }
             }
-            buf
         });
         let status = tokio::time::timeout(timeout, child.wait()).await;
-        // Shell finished (or timed out): kill the whole group so background children that still
-        // hold the pipe open can't keep us waiting or outlive the call.
+        // Shell finished (or timed out): kill the whole group so background children can't
+        // outlive the call, then give the reader a short grace period to drain what is left.
         drop(guard);
-        let buf = tokio::time::timeout(Duration::from_secs(5), reader).await.ok().and_then(Result::ok).unwrap_or_default();
+        if tokio::time::timeout(Duration::from_millis(500), reader).await.is_err() {
+            // Something still holds the pipe open; the output we have is what matters.
+        }
+        let buf = std::mem::take(&mut *collected.lock().unwrap());
         let out = truncate_output(&String::from_utf8_lossy(&buf), 30_000);
         Ok(match status {
             Ok(Ok(s)) => format!("{out}\n[exit code: {}]", s.code().map_or("signal".into(), |c| c.to_string())),
