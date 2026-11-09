@@ -213,6 +213,7 @@ async fn real_main() -> Result<i32> {
     if !one_shot {
         let mut s = screen.lock().await;
         s.live_panel = false; // cursor movement would corrupt the line being typed
+        s.set_markdown_indent(cfg.markdown_indent);
         s.lanes = true;
         // Live status above the input line (needs color/escapes; otherwise heartbeat lines).
         if color {
@@ -314,7 +315,7 @@ async fn real_main() -> Result<i32> {
         renderer.abort();
         return Ok(match res {
             Ok(answer) => {
-                println!("{}", render::wrap_for_tty(1, &answer));
+                println!("{}", render::wrap_for_tty(1, &answer, team.shared.cfg.markdown_indent));
                 if !cli.no_session {
                     eprintln!("session {} — continue with: zilch -c -p \"...\"", team.session_id());
                 }

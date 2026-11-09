@@ -47,6 +47,8 @@ pub struct Screen {
     background_answer: HashMap<String, String>,
     /// Markdown renderer for the lane root's streamed answer (VT100/VT220 attributes only).
     md: crate::markdown::Markdown,
+    /// Indent of rendered answers (config `markdown_indent`).
+    md_indent: usize,
     /// Streamed master text not yet ending in a newline (printed, wrapped, line by line).
     master_buf: String,
     /// REPL status bar above the input line (None: plain output, heartbeat lines instead).
@@ -96,6 +98,7 @@ impl Screen {
             active: "master".into(),
             background_answer: HashMap::new(),
             md: crate::markdown::Markdown::new(color),
+            md_indent: 0,
             master_buf: String::new(),
             status_bar: None,
         }))
@@ -125,6 +128,12 @@ impl Screen {
             let _ = writeln!(self.out);
             self.at_line_start = true;
         }
+    }
+
+    /// Indent rendered markdown answers by `n` columns (0 = off).
+    pub fn set_markdown_indent(&mut self, n: usize) {
+        self.md_indent = n;
+        self.md = crate::markdown::Markdown::new(self.color).with_indent(n);
     }
 
     /// Columns to wrap at: the terminal's current width (asked each time, so resizing applies to
@@ -339,7 +348,7 @@ impl Screen {
             let msg = format!("{}── {} lane answered while you were away ──{}", self.c(DIM), Self::lane_name(root), self.c(RESET));
             self.line(&msg);
             // Rendered as markdown and printed as is (code lines must not be re-wrapped).
-            let body = crate::markdown::Markdown::new(self.color).text(answer.trim_end(), self.wrap_width());
+            let body = crate::markdown::Markdown::new(self.color).with_indent(self.md_indent).text(answer.trim_end(), self.wrap_width());
             self.clear_panel();
             let _ = writeln!(self.out, "{body}");
             self.draw_panel();
@@ -676,9 +685,9 @@ fn tty_width(fd: i32) -> Option<usize> {
 
 /// `text` (markdown) rendered and wrapped for the terminal behind `fd`; unchanged when `fd` is a
 /// pipe or file. With NO_COLOR it is wrapped but not styled.
-pub fn wrap_for_tty(fd: i32, text: &str) -> String {
+pub fn wrap_for_tty(fd: i32, text: &str, indent: usize) -> String {
     match tty_width(fd) {
-        Some(w) => crate::markdown::Markdown::new(std::env::var_os("NO_COLOR").is_none()).text(text, w),
+        Some(w) => crate::markdown::Markdown::new(std::env::var_os("NO_COLOR").is_none()).with_indent(indent).text(text, w),
         None => text.to_string(),
     }
 }

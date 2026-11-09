@@ -63,6 +63,7 @@ reasonable place for `api_key = "…"` (a custom `$XDG_CONFIG_HOME` location is 
 ```toml
 max_workers = 4
 approval = "plan"
+markdown_indent = 2                # indent of rendered answers in the terminal (0 = off)
 
 [providers.openai]                 # exists by default
 base_url = "https://api.openai.com/v1"

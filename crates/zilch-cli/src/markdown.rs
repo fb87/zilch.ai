@@ -41,17 +41,69 @@ pub struct Markdown {
     fence: Option<String>,
     /// Pipe-table rows waiting for the table to end.
     table: Vec<String>,
+    /// Columns the whole answer is shifted right by, so it stands apart from zilch's own lines.
+    indent: usize,
 }
 
 impl Markdown {
     /// `styled`: the output is a terminal that takes escape sequences.
     pub fn new(styled: bool) -> Self {
-        Self { styled, plain: Wrapper::default(), fence: None, table: Vec::new() }
+        Self { styled, plain: Wrapper::default(), fence: None, table: Vec::new(), indent: 0 }
+    }
+
+    /// Shift every rendered line right by `n` columns (code blocks included; 0 = off).
+    pub fn with_indent(mut self, n: usize) -> Self {
+        self.indent = n;
+        self
+    }
+
+    /// Width left for the content once the indent is taken (0 = don't wrap stays 0).
+    fn inner(&self, width: usize) -> usize {
+        if width == 0 {
+            0
+        } else {
+            width.saturating_sub(self.indent).max(1)
+        }
+    }
+
+    /// Prefix every non-empty display line with the indent.
+    fn pad(&self, s: String) -> String {
+        if self.indent == 0 {
+            return s;
+        }
+        let pad = " ".repeat(self.indent);
+        s.split('\n').map(|l| if l.is_empty() { String::new() } else { format!("{pad}{l}") }).collect::<Vec<_>>().join("\n")
     }
 
     /// Render one source line (no `\n`) into display lines joined by `\n`. Returns None while a
     /// table is being collected (nothing to print yet).
     pub fn line(&mut self, src: &str, width: usize) -> Option<String> {
+        let w = self.inner(width);
+        self.render_line(src, w).map(|s| self.pad(s))
+    }
+
+    /// A table still being collected, rendered now (e.g. other output must be printed first).
+    pub fn take_table(&mut self, width: usize) -> Option<String> {
+        let w = self.inner(width);
+        (self.styled && !self.table.is_empty()).then(|| self.flush_table(w)).map(|s| self.pad(s))
+    }
+
+    /// Whatever is still buffered (a table ending the answer); resets the state.
+    pub fn finish(&mut self, width: usize) -> Option<String> {
+        self.fence = None;
+        self.plain = Wrapper::default();
+        let w = self.inner(width);
+        (!self.table.is_empty()).then(|| self.flush_table(w)).map(|s| self.pad(s))
+    }
+
+    /// Render a whole text (e.g. a buffered answer).
+    pub fn text(&mut self, text: &str, width: usize) -> String {
+        let mut out: Vec<String> = text.split('\n').filter_map(|l| self.line(l, width)).collect();
+        out.extend(self.finish(width));
+        out.join("\n")
+    }
+
+    fn render_line(&mut self, src: &str, width: usize) -> Option<String> {
         if !self.styled {
             return Some(self.plain.line(src, width));
         }
@@ -75,25 +127,6 @@ impl Markdown {
         }
         out.push(self.block(src, trimmed, width));
         Some(out.join("\n"))
-    }
-
-    /// A table still being collected, rendered now (e.g. other output must be printed first).
-    pub fn take_table(&mut self, width: usize) -> Option<String> {
-        (self.styled && !self.table.is_empty()).then(|| self.flush_table(width))
-    }
-
-    /// Whatever is still buffered (a table ending the answer); resets the state.
-    pub fn finish(&mut self, width: usize) -> Option<String> {
-        self.fence = None;
-        self.plain = Wrapper::default();
-        (!self.table.is_empty()).then(|| self.flush_table(width))
-    }
-
-    /// Render a whole text (e.g. a buffered answer).
-    pub fn text(&mut self, text: &str, width: usize) -> String {
-        let mut out: Vec<String> = text.split('\n').filter_map(|l| self.line(l, width)).collect();
-        out.extend(self.finish(width));
-        out.join("\n")
     }
 
     fn block(&mut self, src: &str, trimmed: &str, width: usize) -> String {
@@ -512,5 +545,33 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines.len() > 1);
         assert!(lines[1..].iter().all(|l| l.starts_with("  ") && !l.starts_with("   ")), "{lines:?}");
+    }
+
+    #[test]
+    fn indent_shifts_every_block_and_still_fits() {
+        let src = format!("## Head\n\n{}\n- item\n> quote\n| a | b |\n|---|---|\n| 1 | 2 |\n```py\nx = 1\n```\n---", "word ".repeat(30));
+        let out = Markdown::new(true).with_indent(2).text(&src, 40);
+        assert_vt220_only(&out);
+        let out = screen(&out);
+        for l in out.lines() {
+            if l.is_empty() {
+                continue; // blank lines carry no trailing spaces
+            }
+            assert!(l.starts_with("  ") && !l.starts_with("   ") || l.starts_with("    "), "indented: {l:?}");
+            assert!(UnicodeWidthStr::width(l) <= 39, "fits the terminal: {l:?}");
+        }
+        assert!(out.contains("\n\n"), "blank line kept, without padding");
+        assert!(out.contains("  x = 1"), "code is indented with the rest");
+        assert!(out.contains("  ┌───┬───┐"));
+        // A table that would fit unindented but not indented falls back to raw rows.
+        let mut md = Markdown::new(true).with_indent(4);
+        let t = md.text("| aaaaaaaaaaaaaaaa | b |\n|---|---|", 28);
+        assert!(screen(&t).starts_with("    | aaaa"), "{t:?}");
+    }
+
+    #[test]
+    fn zero_indent_is_unchanged() {
+        let src = "# T\n- a\n```\ncode\n```";
+        assert_eq!(Markdown::new(true).with_indent(0).text(src, 80), Markdown::new(true).text(src, 80));
     }
 }
