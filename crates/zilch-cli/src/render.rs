@@ -45,6 +45,10 @@ pub struct Screen {
     pub active: String,
     /// Answers produced by a background lane, shown when the user switches to it.
     background_answer: HashMap<String, String>,
+    /// Raw markdown of each lane root's current reply while it streams, and of its last
+    /// complete reply (kept for /redraw).
+    answer_buf: HashMap<String, String>,
+    last_answer: HashMap<String, String>,
     /// Markdown renderer for the lane root's streamed answer (VT100/VT220 attributes only).
     md: crate::markdown::Markdown,
     /// Indent of rendered answers (config `markdown_indent`).
@@ -97,6 +101,8 @@ impl Screen {
             lanes: false,
             active: "master".into(),
             background_answer: HashMap::new(),
+            answer_buf: HashMap::new(),
+            last_answer: HashMap::new(),
             md: crate::markdown::Markdown::new(color),
             md_indent: 0,
             master_buf: String::new(),
@@ -352,7 +358,37 @@ impl Screen {
             self.clear_panel();
             let _ = writeln!(self.out, "{body}");
             self.draw_panel();
+            self.last_answer.insert(root.to_string(), answer);
         }
+    }
+
+    /// /redraw: clear the screen and render the active lane's last answer again at the current
+    /// terminal width (after a resize, or when other output garbled the view). Uses only VT100
+    /// controls: cursor home + erase display; what was on screen stays in the scrollback.
+    pub fn redraw(&mut self) {
+        let root = self.active.clone();
+        self.clear_panel();
+        if self.color {
+            let _ = write!(self.out, "\x1b[H\x1b[2J");
+        }
+        self.at_line_start = true;
+        match self.last_answer.get(&root).filter(|a| !a.trim().is_empty()).cloned() {
+            Some(answer) => {
+                let w = self.wrap_width();
+                let cols = if w == 0 { String::new() } else { format!(" at {w} columns") };
+                let msg = format!("{}── last {} answer, redrawn{cols} ──{}", self.c(DIM), Self::lane_name(&root), self.c(RESET));
+                self.line(&msg);
+                let body = crate::markdown::Markdown::new(self.color).with_indent(self.md_indent).text(answer.trim_end(), w);
+                let _ = writeln!(self.out, "{body}");
+            }
+            None => {
+                let msg = format!("{}(no answer in the {} lane yet){}", self.c(DIM), Self::lane_name(&root), self.c(RESET));
+                self.line(&msg);
+            }
+        }
+        self.draw_panel();
+        self.update_status();
+        let _ = self.out.flush();
     }
 
     pub fn handle(&mut self, ev: AgentEvent) {
@@ -423,6 +459,7 @@ impl Screen {
                 if !self.stream_master {
                     return;
                 }
+                self.answer_buf.entry(ev.agent.clone()).or_default().push_str(&t);
                 self.clear_panel();
                 let w = self.wrap_width();
                 if w == 0 {
@@ -457,6 +494,10 @@ impl Screen {
             }
             EventKind::TextDone => {
                 if master && self.stream_master {
+                    // Keep the reply for /redraw (a turn's final text replaces earlier ones).
+                    if let Some(a) = self.answer_buf.remove(&ev.agent).filter(|a| !a.trim().is_empty()) {
+                        self.last_answer.insert(ev.agent.clone(), a);
+                    }
                     self.clear_panel();
                     self.flush_master();
                     self.ensure_newline();
@@ -921,6 +962,25 @@ mod tests {
         s.handle(ev("coder#1", EventKind::DelegateEnd { worker: "coder#1".into(), ok: true }));
         s.handle(ev("spec", EventKind::Idle));
         assert_eq!(bar.text(), "▸ code: idle  │  spec: idle");
+    }
+
+    #[tokio::test]
+    async fn redraw_clears_and_renders_the_last_answer_again() {
+        let buf = Buf::default();
+        let screen = Screen::new(Box::new(buf.clone()), -1, true, false, true);
+        let mut s = screen.lock().await;
+        s.redraw();
+        assert!(buf.text().contains("no answer in the code lane yet"), "{}", buf.text());
+        s.handle(ev("master", EventKind::TextDelta("Let me look first.\n".into())));
+        s.handle(ev("master", EventKind::TextDone));
+        s.handle(ev("master", EventKind::TextDelta("The **final** answer\n".into())));
+        s.handle(ev("master", EventKind::TextDone));
+        buf.0.lock().unwrap().clear();
+        s.redraw();
+        let out = buf.text();
+        assert!(out.starts_with("\u{241b}[H\u{241b}[2J"), "VT100 home + erase display: {out}");
+        assert!(out.contains("last code answer") && out.contains("final"), "{out}");
+        assert!(!out.contains("Let me look"), "only the last reply: {out}");
     }
 
     #[tokio::test]

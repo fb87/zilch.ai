@@ -46,7 +46,7 @@ How a change request flows:
 - `ask`: ask before every mutating action.
 - `auto`: never ask (same as `--yolo`).
 
-**REPL commands:** `/todos`, `/team`, `/models`, `/prompt <agent>`, `/usage`, `/reset <instance>`, `/about`, `/clear`, `/exit`.
+**REPL commands:** `/todos`, `/team`, `/models`, `/prompt <agent>`, `/usage`, `/reset <instance>`, `/about`, `/redraw`, `/clear`, `/exit`.
 Ctrl-C cancels the current turn, including the master and every running worker.
 
 ## Configure

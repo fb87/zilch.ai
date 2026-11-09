@@ -622,9 +622,14 @@ async fn command(team: &Team, screen: &SharedScreen, input: &str) -> bool {
 /sessions         list saved sessions for this directory
 /clear            start a fresh session (the current one stays resumable)
 /about            version, repository, author, license, platform and config in use
+/redraw           clear the screen and re-render the last answer at the current width
 /exit             quit"
             .to_string(),
         "/about" => about(&team.shared.cfg),
+        "/redraw" => {
+            screen.lock().await.redraw();
+            return true;
+        }
         "/todos" => {
             let todos = team.todos();
             if todos.is_empty() {
