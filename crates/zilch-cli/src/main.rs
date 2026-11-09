@@ -4,6 +4,7 @@ mod ipc;
 mod lanes;
 mod log;
 mod render;
+mod wrap;
 
 use anyhow::{bail, Result};
 use clap::Parser;
@@ -291,7 +292,7 @@ async fn real_main() -> Result<i32> {
         renderer.abort();
         return Ok(match res {
             Ok(answer) => {
-                println!("{answer}");
+                println!("{}", render::wrap_for_tty(1, &answer));
                 if !cli.no_session {
                     eprintln!("session {} — continue with: zilch -c -p \"...\"", team.session_id());
                 }

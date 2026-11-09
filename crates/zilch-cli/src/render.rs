@@ -45,6 +45,10 @@ pub struct Screen {
     pub active: String,
     /// Answers produced by a background lane, shown when the user switches to it.
     background_answer: HashMap<String, String>,
+    /// Hanging-indent word wrap for everything printed (remembers code fences).
+    wrapper: crate::wrap::Wrapper,
+    /// Streamed master text not yet ending in a newline (printed, wrapped, line by line).
+    master_buf: String,
 }
 
 pub type SharedScreen = Arc<Mutex<Screen>>;
@@ -89,6 +93,8 @@ impl Screen {
             lanes: false,
             active: "master".into(),
             background_answer: HashMap::new(),
+            wrapper: Default::default(),
+            master_buf: String::new(),
         }))
     }
 
@@ -118,10 +124,29 @@ impl Screen {
         }
     }
 
+    /// Columns to wrap at: the terminal's current width (asked each time, so resizing applies to
+    /// the next line), or 0 = don't wrap when the output is not a terminal.
+    fn wrap_width(&self) -> usize {
+        tty_width(self.fd).unwrap_or(0)
+    }
+
+    /// Print what is left of the streamed master text as a (wrapped) line of its own.
+    fn flush_master(&mut self) {
+        if self.master_buf.is_empty() {
+            return;
+        }
+        let rest = std::mem::take(&mut self.master_buf);
+        let w = self.wrap_width();
+        let _ = writeln!(self.out, "{}", self.wrapper.line(&rest, w));
+        self.at_line_start = true;
+    }
+
     pub fn line(&mut self, s: &str) {
         self.clear_panel();
+        self.flush_master();
         self.ensure_newline();
-        let _ = writeln!(self.out, "{s}");
+        let w = self.wrap_width();
+        let _ = writeln!(self.out, "{}", crate::wrap::Wrapper::default().text(s, w));
         self.draw_panel();
     }
 
@@ -314,8 +339,19 @@ impl Screen {
                     return;
                 }
                 self.clear_panel();
-                let _ = write!(self.out, "{t}");
-                self.at_line_start = t.ends_with('\n');
+                let w = self.wrap_width();
+                if w == 0 {
+                    // Not a terminal: pass the stream through untouched.
+                    let _ = write!(self.out, "{t}");
+                    self.at_line_start = t.ends_with('\n');
+                } else {
+                    // Wrap whole lines (the REPL printer shows complete lines only anyway).
+                    self.master_buf.push_str(&t);
+                    while let Some(pos) = self.master_buf.find('\n') {
+                        let line: String = self.master_buf.drain(..=pos).collect();
+                        let _ = writeln!(self.out, "{}", self.wrapper.line(line.trim_end_matches(['\n', '\r']), w));
+                    }
+                }
                 let _ = self.out.flush();
             }
             EventKind::TextDelta(t) => {
@@ -335,7 +371,9 @@ impl Screen {
             EventKind::TextDone => {
                 if master && self.stream_master {
                     self.clear_panel();
+                    self.flush_master();
                     self.ensure_newline();
+                    self.wrapper = Default::default(); // an unclosed fence ends with the answer
                     self.draw_panel();
                 } else if let Some(rest) = self.worker_text.remove(&ev.agent) {
                     if self.verbose && !rest.trim().is_empty() {
@@ -529,9 +567,9 @@ fn summary_line(report: &str) -> Option<String> {
         .or_else(|| report.lines().next().map(|s| s.chars().take(100).collect()))
 }
 
-/// Width of the terminal behind file descriptor `fd` (asked from the kernel on every redraw, so
-/// resizing works), then $COLUMNS, then 80. `COLUMNS` alone is unreliable: shells rarely export it.
-fn terminal_width(fd: i32) -> usize {
+/// Width of the terminal behind file descriptor `fd`, asked from the kernel on every call so a
+/// resized window takes effect on the next line. `None` when `fd` is not a terminal.
+fn tty_width(fd: i32) -> Option<usize> {
     #[cfg(unix)]
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
@@ -542,11 +580,24 @@ fn terminal_width(fd: i32) -> usize {
         #[cfg(not(target_os = "linux"))]
         let request = libc::TIOCGWINSZ;
         if libc::ioctl(fd, request, &mut ws) == 0 && ws.ws_col > 0 {
-            return ws.ws_col as usize;
+            return Some(ws.ws_col as usize);
         }
     }
     let _ = fd;
-    std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok()).unwrap_or(80)
+    None
+}
+
+/// `text` wrapped for the terminal behind `fd`; unchanged when `fd` is a pipe or file.
+pub fn wrap_for_tty(fd: i32, text: &str) -> String {
+    match tty_width(fd) {
+        Some(w) => crate::wrap::Wrapper::default().text(text, w),
+        None => text.to_string(),
+    }
+}
+
+/// Terminal width, then $COLUMNS, then 80. `COLUMNS` alone is unreliable: shells rarely export it.
+fn terminal_width(fd: i32) -> usize {
+    tty_width(fd).or_else(|| std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok())).unwrap_or(80)
 }
 
 /// Clip a line so it occupies at most `width - 1` terminal columns (ANSI escapes take none, wide
