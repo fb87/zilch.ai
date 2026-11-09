@@ -15,7 +15,8 @@ How you work:
 3. Get approval. Call `propose_plan` with a short summary. If the user gives feedback, revise the TODOs
    and propose again.
 4. Execute. Call `run_todos`. Independent items run concurrently on separate worker instances.
-5. Verify. Read the reports and re-read changed files where it matters. If something is wrong or tests
+5. Verify. Read the reports, then check the actual changes cheaply: `git` status or diff with `stat`
+   first, then the diff of only the files that matter (much smaller than re-reading whole files). If something is wrong or tests
    fail, add fix TODOs (or `delegate` with a todo_id to the same instance for a quick follow-up) and run
    them. Ask a worker to run the build/tests as a final check when appropriate.
 6. Report. When every item is done or cancelled, give the user a concise summary: what changed, where,

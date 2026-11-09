@@ -8,12 +8,19 @@ A minimal, extensible coding agent written in Rust from scratch, for any **OpenA
 - **Every agent has its own system prompt and model.** The prompt is a built-in default you can extend or replace, and each agent can use a different model and even a different provider.
 
 ```
- you ⇄ MASTER (read_file, glob, grep · todo_write, propose_plan, run_todos, delegate)
+ you ⇄ MASTER (read_file, glob, grep, git · todo_write, propose_plan, run_todos, delegate)
           │  TODO DAG → scheduler (max_workers, file-scope conflicts)
-          ├── coder#1   read/write/edit/glob/grep/bash
+          ├── coder#1   read/write/edit/glob/grep/git/bash
           ├── coder#2   …in parallel
           └── explorer#1 read-only investigation
 ```
+
+**Tools.** `glob` and `grep` run in-process on ripgrep's own crates (`.gitignore`-aware, no external
+binaries). `git` is read-only (status, diff, log, show) so the master can check what workers changed
+with a diff instead of re-reading files; repository config cannot make it run programs (external
+diff drivers, textconv, fsmonitor and hooks are off). `edit_file` takes an `edits` list to make
+several changes to a file in one call, all or none. Agents with `bash` are told which fast CLI
+tools are installed (`rg`, `fd`, `jq`, `ast-grep`) and to prefer them over `grep -r` and `find`.
 
 ## Build
 
@@ -130,7 +137,7 @@ agent and sends each model a tiny request).
 ```
 crates/zilch-core   library: no terminal I/O; frontends consume AgentEvents
   llm/              Chat Completions types, hand-written SSE parser, delta accumulator, provider registry
-  tools/            Tool trait, worker tools (read/write/edit/glob/grep/bash), master tools (todo/plan/run/delegate)
+  tools/            Tool trait, worker tools (read/write/edit/glob/grep/git/bash), master tools (todo/plan/run/delegate)
   agent/            agent loop (concurrent tool calls), approval gate, events
   team/             Team, WorkerPool, TODO list, DAG scheduler, file locks, plan review
   config.rs profile.rs prompt.rs

@@ -4,6 +4,7 @@ pub mod bash;
 pub mod delegate;
 pub mod edit;
 pub mod fs;
+pub mod git;
 pub mod sandbox;
 #[cfg(target_os = "linux")]
 pub mod sandbox_linux;
@@ -314,6 +315,7 @@ pub fn worker_tools() -> ToolRegistry {
     r.register(Arc::new(edit::EditFile));
     r.register(Arc::new(search::GlobTool));
     r.register(Arc::new(search::GrepTool));
+    r.register(Arc::new(git::GitTool));
     r.register(Arc::new(bash::Bash));
     r
 }

@@ -14,11 +14,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub const MASTER_TOOLS: &[&str] = &["read_file", "glob", "grep", "todo_write", "propose_plan", "run_todos", "delegate"];
-pub const WORKER_TOOLS: &[&str] = &["read_file", "write_file", "edit_file", "glob", "grep", "bash"];
-pub const READONLY_TOOLS: &[&str] = &["read_file", "glob", "grep"];
+pub const MASTER_TOOLS: &[&str] = &["read_file", "glob", "grep", "git", "todo_write", "propose_plan", "run_todos", "delegate"];
+pub const WORKER_TOOLS: &[&str] = &["read_file", "write_file", "edit_file", "glob", "grep", "git", "bash"];
+pub const READONLY_TOOLS: &[&str] = &["read_file", "glob", "grep", "git"];
 /// The /spec lane: read the code, write only the documents in the spec directory.
-pub const SPEC_TOOLS: &[&str] = &["read_file", "glob", "grep", "write_doc", "edit_doc", "release_spec"];
+pub const SPEC_TOOLS: &[&str] = &["read_file", "glob", "grep", "git", "write_doc", "edit_doc", "release_spec"];
 pub const SPEC_ONLY_TOOLS: &[&str] = &["write_doc", "edit_doc", "release_spec"];
 
 #[derive(Debug, Clone, Default, Deserialize)]

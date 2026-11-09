@@ -74,6 +74,11 @@ pub fn build(profile: &Profile, env: &PromptEnv) -> String {
     if profile.role == AgentRole::Master {
         envs.push_str("\n- Your team (worker profiles for `worker`):\n{{workers}}");
     }
+    if env.tools.iter().any(|t| t == "bash") {
+        if let Some(line) = cli_tools_line(&installed_cli_tools()) {
+            envs.push_str(&format!("\n- {line}"));
+        }
+    }
     parts.push(envs);
 
     if let Some((path, text)) = find_agents_md(env.cwd) {
@@ -92,6 +97,50 @@ pub fn build(profile: &Profile, env: &PromptEnv) -> String {
             ("workers", &workers),
         ],
     )
+}
+
+/// Fast command-line tools worth preferring in `bash` when installed: (binary, alternatives, hint).
+const CLI_TOOLS: &[(&str, &[&str], &str)] = &[
+    ("rg", &[], "instead of grep -r"),
+    ("fd", &["fdfind"], "instead of find"),
+    ("jq", &[], "for JSON"),
+    ("ast-grep", &["sg"], "structural code search/rewrite"),
+];
+
+/// Which of `CLI_TOOLS` are on PATH, as (name as installed, hint). Looked up once per process.
+fn installed_cli_tools() -> Vec<(String, &'static str)> {
+    static FOUND: std::sync::OnceLock<Vec<(String, &'static str)>> = std::sync::OnceLock::new();
+    FOUND.get_or_init(|| find_cli_tools(&std::env::var_os("PATH").unwrap_or_default())).clone()
+}
+
+fn find_cli_tools(path: &std::ffi::OsStr) -> Vec<(String, &'static str)> {
+    let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
+    let exists = |name: &str| dirs.iter().any(|d| is_executable(&d.join(name)));
+    CLI_TOOLS
+        .iter()
+        .filter_map(|(name, alts, hint)| std::iter::once(name).chain(alts.iter()).find(|n| exists(n)).map(|n| (n.to_string(), *hint)))
+        .collect()
+}
+
+fn is_executable(p: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        p.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        p.is_file()
+    }
+}
+
+/// One environment line naming the installed fast CLI tools (None when there are none).
+fn cli_tools_line(found: &[(String, &str)]) -> Option<String> {
+    if found.is_empty() {
+        return None;
+    }
+    let list = found.iter().map(|(n, h)| format!("{n} ({h})")).collect::<Vec<_>>().join(", ");
+    Some(format!("Fast CLI tools installed, prefer them in bash: {list}. To search code, the grep/glob tools are faster still."))
 }
 
 /// `{{var}}` substitution. Unknown variables are left untouched.
@@ -171,6 +220,32 @@ mod tests {
         let p = build(&profile(AgentRole::Master, None, PromptMode::Append), &env(&tools, &w));
         assert!(p.contains("NO tools that modify files") && p.contains("coder: writes code"));
         assert!(!p.contains("{{"));
+    }
+
+    #[test]
+    fn installed_fast_cli_tools_are_found_on_path() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let touch = |dir: &Path, name: &str, mode: u32| {
+            let p = dir.join(name);
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        };
+        touch(a.path(), "rg", 0o755);
+        touch(b.path(), "fdfind", 0o755); // Debian's name for fd
+        touch(b.path(), "jq", 0o644); // not executable
+        let path = std::env::join_paths([a.path(), b.path()]).unwrap();
+        let found = find_cli_tools(&path);
+        let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
+        #[cfg(unix)]
+        assert_eq!(names, ["rg", "fdfind"]);
+        let line = cli_tools_line(&found).unwrap();
+        assert!(line.contains("rg (instead of grep -r)") && line.contains("fdfind (instead of find)"), "{line}");
+        assert!(cli_tools_line(&[]).is_none());
     }
 
     #[test]
