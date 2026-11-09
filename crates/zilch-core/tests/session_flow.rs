@@ -21,6 +21,11 @@ struct Fake {
 impl LlmClient for Fake {
     async fn stream(&self, req: &ChatRequest) -> Result<EventStream> {
         self.log.lock().unwrap().push(req.clone());
+        if !is_master(req) {
+            // Workers take a moment, so TODOs started together really overlap (a fast worker
+            // could otherwise finish and be reused before its sibling is assigned an instance).
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
         Ok(Box::pin(futures::stream::iter((self.script)(req).into_iter().map(Ok))))
     }
 }
