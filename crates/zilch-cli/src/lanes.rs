@@ -30,6 +30,10 @@ impl Lane {
             Lane::Spec => "spec",
         }
     }
+    /// Single-column symbol shown for the lane on a terminal (status bar, prompt).
+    pub fn icon(self) -> &'static str {
+        crate::render::lane_icon(self.root())
+    }
     pub fn other(self) -> Lane {
         match self {
             Lane::Code => Lane::Spec,
@@ -101,7 +105,14 @@ impl Dispatcher {
             let msg = match res {
                 Ok(_) if s.active == lane.root() => {
                     let cost = s.total_cost().map(|c| format!(" · session ${c:.4}")).unwrap_or_default();
-                    format!("{}↳ {} · +{} in / +{} out tokens{cost}{}", s.c(DIM), lane.name(), i - before_in, o - before_out, s.c(RESET))
+                    format!(
+                        "{}↳ {} · +{} in / +{} out tokens{cost}{}",
+                        s.c(DIM),
+                        if s.color { lane.icon() } else { lane.name() },
+                        i - before_in,
+                        o - before_out,
+                        s.c(RESET)
+                    )
                 }
                 Ok(_) => return, // background lane: the renderer already announced it
                 Err(e) => {

@@ -12,7 +12,7 @@
 //! the terminal still yields working code. Tables are buffered until they end, then aligned.
 //! Without color/escapes (pipes, NO_COLOR) the markdown is left as is: it reads fine raw.
 
-use crate::wrap::{visible, wrap_line, Wrapper};
+use crate::wrap::{visible, wrap_cell, wrap_line, Wrapper};
 use unicode_width::UnicodeWidthStr;
 
 const BOLD: &str = "\x1b[1m";
@@ -163,7 +163,14 @@ impl Markdown {
                 depth += 1;
                 rest = r.strip_prefix(' ').unwrap_or(r);
             }
-            return wrap_line(&format!("{indent}{}{}", "| ".repeat(depth), inline(rest)), width);
+            // The bar is drawn on every row, so a wrapped quote stays marked.
+            let bars = format!("{indent}{}", format!("{} ", gfx(&V.to_string())).repeat(depth));
+            let used = indent.len() + 2 * depth;
+            let text = inline(rest);
+            if width == 0 || width.saturating_sub(1) < used + 20 {
+                return format!("{bars}{text}");
+            }
+            return wrap_cell(&text, width - 1 - used).iter().map(|r| format!("{bars}{r}")).collect::<Vec<_>>().join("\n");
         }
         // Lists: a centered dot (nested: a dash); task boxes stay ASCII.
         let level = indent.chars().map(|c| if c == '\t' { 4 } else { 1 }).sum::<usize>() / 2;
@@ -186,7 +193,7 @@ impl Markdown {
 
     fn flush_table(&mut self, width: usize) -> String {
         let rows = std::mem::take(&mut self.table);
-        render_table(&rows, width).unwrap_or_else(|| rows.iter().map(|r| inline(r)).collect::<Vec<_>>().join("\n"))
+        render_table(&rows, width).unwrap_or_else(|| rows.iter().map(|r| wrap_line(&inline(r), width)).collect::<Vec<_>>().join("\n"))
     }
 }
 
@@ -222,8 +229,9 @@ enum Align {
     Right,
 }
 
-/// Aligned table with line-drawing borders, or None if it is not a table (no separator row) or
-/// is wider than the terminal (then the raw rows are shown).
+/// Aligned table with line-drawing borders, or None if it is not a table (no separator row).
+/// A table wider than the terminal gets narrower columns whose cells wrap inside the borders;
+/// when even that cannot fit, each row is listed as `header: value` lines instead.
 fn render_table(rows: &[String], width: usize) -> Option<String> {
     if rows.len() < 2 {
         return None;
@@ -249,9 +257,17 @@ fn render_table(rows: &[String], width: usize) -> Option<String> {
             widths[i] = widths[i].max(visible_width(c));
         }
     }
-    let total: usize = widths.iter().sum::<usize>() + 3 * cols + 1;
-    if width > 0 && total > width.saturating_sub(1) {
-        return None;
+    if width > 0 {
+        // Columns for cell text once the borders (`│ ` … ` │ ` … ` │`) and the right margin are taken.
+        let avail = width.saturating_sub(1).saturating_sub(3 * cols + 1);
+        if avail < 4 * cols {
+            return Some(table_as_records(&body, width));
+        }
+        // Narrow the widest column one step at a time until the table fits.
+        while widths.iter().sum::<usize>() > avail {
+            let (i, _) = widths.iter().enumerate().max_by_key(|(_, w)| **w).unwrap();
+            widths[i] -= 1;
+        }
     }
     // Corner/tee pieces of the line-drawing set: l k m j (corners), t u (side tees),
     // w v (top/bottom tees), n (cross).
@@ -262,25 +278,47 @@ fn render_table(rows: &[String], width: usize) -> Option<String> {
     let bar = gfx(&V.to_string());
     let mut out = vec![border('l', 'w', 'k')];
     for (ri, r) in body.iter().enumerate() {
-        let mut s = bar.clone();
-        for (i, w) in widths.iter().enumerate() {
-            let cell = r.get(i).map(String::as_str).unwrap_or("");
-            let pad = w - visible_width(cell);
-            let (lp, rp) = match aligns.get(i).copied().unwrap_or(Align::Left) {
-                Align::Left => (0, pad),
-                Align::Right => (pad, 0),
-                Align::Center => (pad / 2, pad - pad / 2),
-            };
-            let cell = if ri == 0 { format!("{BOLD}{cell}{BOLD_OFF}") } else { cell.to_string() };
-            s.push_str(&format!(" {}{cell}{} {bar}", " ".repeat(lp), " ".repeat(rp)));
+        let cells: Vec<Vec<String>> =
+            widths.iter().enumerate().map(|(i, w)| wrap_cell(r.get(i).map(String::as_str).unwrap_or(""), *w)).collect();
+        let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+        for k in 0..height {
+            let mut s = bar.clone();
+            for (i, w) in widths.iter().enumerate() {
+                let cell = cells[i].get(k).map(String::as_str).unwrap_or("");
+                let pad = w.saturating_sub(visible_width(cell));
+                let (lp, rp) = match aligns.get(i).copied().unwrap_or(Align::Left) {
+                    Align::Left => (0, pad),
+                    Align::Right => (pad, 0),
+                    Align::Center => (pad / 2, pad - pad / 2),
+                };
+                let cell = if ri == 0 && !cell.is_empty() { format!("{BOLD}{cell}{BOLD_OFF}") } else { cell.to_string() };
+                s.push_str(&format!(" {}{cell}{} {bar}", " ".repeat(lp), " ".repeat(rp)));
+            }
+            out.push(s);
         }
-        out.push(s);
         if ri == 0 {
             out.push(border('t', 'n', 'u'));
         }
     }
     out.push(border('m', 'v', 'j'));
     Some(out.join("\n"))
+}
+
+/// A table too wide for any column layout: one block per row, `header: value` per cell.
+fn table_as_records(body: &[Vec<String>], width: usize) -> String {
+    let header = &body[0];
+    let mut out = Vec::new();
+    for (ri, r) in body.iter().enumerate().skip(1) {
+        if ri > 1 {
+            out.push(String::new());
+        }
+        for (i, cell) in r.iter().enumerate() {
+            let name = header.get(i).map(String::as_str).unwrap_or("");
+            let mark = if i == 0 { gfx(&BULLET.to_string()) } else { " ".into() };
+            out.push(wrap_line(&format!("{mark} {BOLD}{name}{BOLD_OFF}: {cell}"), width));
+        }
+    }
+    out.join("\n")
 }
 
 /// Inline markup → VT100 attributes. Code spans are literal (reverse video); `**`/`__` are bold,
@@ -488,7 +526,7 @@ mod tests {
         assert_eq!(lines[4], "· [ ] todo");
         assert_eq!(lines[5], "· [x] done");
         assert_eq!(lines[6], "1. first");
-        assert_eq!(lines[7], "| quoted");
+        assert_eq!(lines[7], "│ quoted");
         assert!(lines[8].chars().all(|c| c == '─'));
         assert_eq!(lines[9], "end");
     }
@@ -527,8 +565,43 @@ mod tests {
         assert!(md.line("|---|---|", 80).is_none());
         assert!(md.line("| 1 | 2 |", 80).is_none());
         assert!(screen(&md.finish(80).unwrap()).contains("│ 1 │ 2 │"));
-        let wide = format!("| {} | b |\n|---|---|\n| 1 | 2 |", "x".repeat(100));
-        assert!(screen(&render(&wide)).starts_with("| xxx"), "too wide → raw rows");
+    }
+
+    fn assert_fits(out: &str, width: usize) {
+        for l in out.split('\n') {
+            assert!(visible_width(l) < width, "wider than {width}: {:?}", screen(l));
+        }
+    }
+
+    #[test]
+    fn wide_tables_wrap_their_cells_inside_the_borders() {
+        let src = "| Segment | Flags | Direction | Key Fields |\n|---|---|---|---|\n\
+                   | 1 | SYN | Client → Server | seq = x, options (MSS, etc.) |\n\
+                   | 3 | ACK | Client → Server | ack = y + 1 (may carry data with TFO) |";
+        let out = Markdown::new(true).with_indent(2).text(src, 60);
+        assert_vt220_only(&out);
+        assert_fits(&out, 60);
+        let s = screen(&out);
+        assert!(s.lines().all(|l| ["  ┌", "  │", "  ├", "  └"].iter().any(|p| l.starts_with(p))), "{s}");
+        let text: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        for word in ["Segment", "Direction", "options", "(MSS,", "TFO)"] {
+            assert!(text.contains(word), "{word} kept: {s}");
+        }
+        // Far too many columns for the width: one block per row instead.
+        let many = format!("{}\n{}|\n{}", "| a | b | c | d | e | f | g | h |", "|---".repeat(8), "| 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |");
+        let out = Markdown::new(true).text(&many, 30);
+        assert_fits(&out, 30);
+        let s = screen(&out);
+        assert!(s.contains("· a: 1") && s.contains("  h: 8"), "{s}");
+    }
+
+    #[test]
+    fn wrapped_quotes_keep_their_bar() {
+        let out = Markdown::new(true).with_indent(2).text(&format!("> {}", "a long quoted sentence ".repeat(6)), 40);
+        assert_fits(&out, 40);
+        let s = screen(&out);
+        assert!(s.lines().count() > 2);
+        assert!(s.lines().all(|l| l.starts_with("  │ ")), "{s}");
     }
 
     #[test]
@@ -563,10 +636,10 @@ mod tests {
         assert!(out.contains("\n\n"), "blank line kept, without padding");
         assert!(out.contains("  x = 1"), "code is indented with the rest");
         assert!(out.contains("  ┌───┬───┐"));
-        // A table that would fit unindented but not indented falls back to raw rows.
-        let mut md = Markdown::new(true).with_indent(4);
-        let t = md.text("| aaaaaaaaaaaaaaaa | b |\n|---|---|", 28);
-        assert!(screen(&t).starts_with("    | aaaa"), "{t:?}");
+        // A table that would fit unindented but not indented gets narrower columns instead.
+        let t = Markdown::new(true).with_indent(4).text("| aaaaaaaaaaaaaaaa | b |\n|---|---|", 28);
+        assert_fits(&t, 28);
+        assert!(screen(&t).starts_with("    ┌"), "{t:?}");
     }
 
     #[test]

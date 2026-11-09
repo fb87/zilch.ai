@@ -137,6 +137,20 @@ pub fn wrap_line(line: &str, width: usize) -> String {
     if indent > max / 2 {
         indent = 0;
     }
+    wrap_cols(line, max, indent)
+}
+
+/// `text` cut into rows of at most `cols` columns (table cells, quoted text: the caller draws
+/// the borders). Each row carries its own attributes.
+pub fn wrap_cell(text: &str, cols: usize) -> Vec<String> {
+    if width_of(text) <= cols {
+        return vec![text.to_string()];
+    }
+    wrap_cols(text, cols.max(1), 0).split('\n').map(|r| r.trim_end_matches(' ').to_string()).collect()
+}
+
+/// Word-wrap `line` into rows of at most `max` columns, continuation rows indented by `indent`.
+fn wrap_cols(line: &str, max: usize, indent: usize) -> String {
     let pad = " ".repeat(indent);
 
     // Split into words, each with its trailing spaces; escapes stay attached to their word.

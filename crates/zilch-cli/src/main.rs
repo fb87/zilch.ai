@@ -463,7 +463,10 @@ async fn repl(
         // The prompt itself only names the lane; live activity is drawn in the status row above
         // it (the leading "\n" reserves that row, see status.rs).
         let row = if bar.is_some() { "\n" } else { "" };
-        let prompt = inbox.prompt().map(str::to_string).unwrap_or_else(|| format!("{row}[{}] › ", lanes.active().name()));
+        let prompt = inbox.prompt().map(str::to_string).unwrap_or_else(|| match &bar {
+            Some(_) => format!("{row}{} › ", lanes.active().icon()),
+            None => format!("[{}] › ", lanes.active().name()),
+        });
         if let Some(b) = &bar {
             b.reading.store(true, std::sync::atomic::Ordering::SeqCst);
         }

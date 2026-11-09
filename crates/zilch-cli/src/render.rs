@@ -22,7 +22,7 @@ pub const CYAN: &str = "\x1b[36m";
 pub struct Screen {
     out: Box<dyn Write + Send>,
     fd: i32,
-    color: bool,
+    pub(crate) color: bool,
     pub verbose: bool,
     /// Whether to stream the master's text (off in -p mode, where the final answer is printed at the end).
     pub stream_master: bool,
@@ -283,6 +283,14 @@ impl Screen {
         }
     }
 
+    pub(crate) fn lane_label(&self, root: &str) -> &'static str {
+        if self.color {
+            lane_icon(root)
+        } else {
+            Self::lane_name(root)
+        }
+    }
+
     fn lane_name(root: &str) -> &'static str {
         if root == "spec" {
             "spec"
@@ -393,7 +401,7 @@ impl Screen {
         let mut busy = false;
         let mut cells = Vec::new();
         for root in ["master", "spec"] {
-            let name = Self::lane_name(root);
+            let name = self.lane_label(root);
             let active = self.active == root;
             let mark = if active { "▸ " } else { "" };
             match self.lane_status(root) {
@@ -401,10 +409,9 @@ impl Screen {
                     busy = true;
                     let color = if root == "spec" { YELLOW } else { CYAN };
                     cells.push(format!(
-                        "{} {}{mark}{name}{}: {}{s}{}",
+                        "{} {mark}{name}{}{}{s}{}",
                         self.spinner(color),
-                        self.c(BOLD),
-                        self.c(RESET),
+                        if self.color { " " } else { ": " },
                         self.c(DIM),
                         self.c(RESET)
                     ));
@@ -663,6 +670,16 @@ fn summary_line(report: &str) -> Option<String> {
         .or_else(|| report.lines().next().map(|s| s.chars().take(100).collect()))
 }
 
+/// The lane's symbol on a terminal: a keyboard for the code lane, a pencil for the spec lane
+/// (both one column wide, text presentation).
+pub fn lane_icon(root: &str) -> &'static str {
+    if root == "spec" {
+        "\u{270E}" // ✎
+    } else {
+        "\u{2328}" // ⌨
+    }
+}
+
 /// Width of the terminal behind file descriptor `fd`, asked from the kernel on every call so a
 /// resized window takes effect on the next line. `None` when `fd` is not a terminal.
 fn tty_width(fd: i32) -> Option<usize> {
@@ -916,5 +933,20 @@ mod tests {
         s.handle(ev("coder#1", EventKind::DelegateEnd { worker: "coder#1".into(), ok: true }));
         s.handle(ev("spec", EventKind::Idle));
         assert_eq!(bar.text(), "▸ code idle  │  spec idle");
+    }
+
+    #[tokio::test]
+    async fn lanes_show_as_icons_on_a_terminal() {
+        let screen = Screen::new(Box::new(Buf::default()), -1, true, false, true);
+        let mut s = screen.lock().await;
+        s.lanes = true;
+        let bar = Arc::new(crate::status::StatusBar::default());
+        s.status_bar = Some(bar.clone());
+        s.update_status();
+        let plain = crate::wrap::visible(&bar.text());
+        assert_eq!(plain, "▸ ⌨ idle  │  ✎ idle");
+        s.handle(ev("spec", EventKind::Thinking));
+        let plain = crate::wrap::visible(&bar.text());
+        assert!(plain.contains("✎ thinking") && !plain.contains("spec"), "{plain}");
     }
 }
