@@ -177,3 +177,43 @@ async fn anthropic_protocol_over_http() {
     assert_eq!(msg.tool_calls[0].function.arguments, r#"{"pattern":"*"}"#);
     assert_eq!((usage.prompt_tokens, usage.completion_tokens), (11, 5));
 }
+
+/// A model the provider does not list is reported at startup, naming the agent and what exists.
+#[tokio::test]
+async fn unlisted_models_are_reported_per_agent() {
+    let s = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": [{"id": "our-model"}, {"id": "our-coder"}]})))
+        .mount(&s)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let proj = dir.path().join(".zilch");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("config.toml"),
+        format!(
+            r#"
+[providers.xyz]
+base_url = "{}/v1"
+api_key_env = "XYZ_KEY"
+[defaults]
+provider = "xyz"
+model = "beam-free"
+[roles.master]
+model = "our-model"
+[roles.coder]
+model = "our-coder"
+"#,
+            s.uri()
+        ),
+    )
+    .unwrap();
+    let env: BTreeMap<String, String> = [("XYZ_KEY".to_string(), "k".to_string())].into();
+    let cfg = Config::load_from(dir.path(), &[proj], &env, &Overrides::default()).unwrap();
+    let (_, warnings) = cfg.discover_checked().await;
+    // master, coder: listed. spec: inherits the master's model. explorer: stale [defaults] model.
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("agent 'explorer' uses model 'beam-free'"), "{}", warnings[0]);
+    assert!(warnings[0].contains("our-coder, our-model"), "{}", warnings[0]);
+}

@@ -7,6 +7,7 @@
 
 # Free models are rate-limited (roughly 20 req/min, plus a daily cap), so keep parallelism modest.
 max_workers = 2
+# spec_dir = "specs"             # where /spec keeps spec.md, design.md, plan.md (default: specs)
 
 [providers.openrouter]
 base_url = "https://openrouter.ai/api/v1"
@@ -19,6 +20,11 @@ model = "nvidia/nemotron-3.5-lightning:free"
 
 # Strongest free model plans and coordinates.
 [roles.master]
+model = "nvidia/nemotron-3-ultra-550b-a55b:free"
+
+# Spec lane (/spec): interviews you and writes the spec, so the strongest model too. Without a
+# model of its own it uses the master's.
+[roles.spec]
 model = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
 # Code-specialised model does the edits.

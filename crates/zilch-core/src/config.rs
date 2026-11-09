@@ -80,6 +80,22 @@ pub struct RoleCfg {
 }
 
 impl RoleCfg {
+    /// Fill unset model-binding fields (provider, model, sampling, context, pricing) from `from`.
+    /// Tools, prompts and limits are not inherited.
+    fn inherit_binding(&mut self, from: &RoleCfg) {
+        let f = from.clone();
+        self.provider = self.provider.take().or(f.provider);
+        self.model = self.model.take().or(f.model);
+        self.temperature = self.temperature.or(f.temperature);
+        self.top_p = self.top_p.or(f.top_p);
+        self.max_tokens = self.max_tokens.or(f.max_tokens);
+        self.reasoning_effort = self.reasoning_effort.take().or(f.reasoning_effort);
+        self.extra = self.extra.take().or(f.extra);
+        self.context_tokens = self.context_tokens.or(f.context_tokens);
+        self.price_in = self.price_in.or(f.price_in);
+        self.price_out = self.price_out.or(f.price_out);
+    }
+
     fn merge(&mut self, o: RoleCfg) {
         merge_opt(&mut self.name, o.name);
         merge_opt(&mut self.description, o.description);
@@ -257,6 +273,12 @@ impl Config {
         }
         for (name, m) in &ov.worker_models {
             fc.roles.entry(name.clone()).or_default().model = Some(m.clone());
+        }
+
+        // The spec lane is the master of its own lane: unless configured separately it uses the
+        // master's model binding (and so follows --model), not the global defaults.
+        if let Some(master) = fc.roles.get("master").cloned() {
+            fc.roles.entry("spec".into()).or_default().inherit_binding(&master);
         }
 
         // Build profiles: built-ins first, then user-defined workers.
@@ -529,12 +551,70 @@ prompt_mode = "replace"
         let err = Config::load_from(dir.path(), &[proj], &env(&[("OPENAI_API_KEY", "k")]), &Overrides::default()).unwrap_err();
         assert!(err.to_string().contains("unknown provider"));
     }
+
+    #[test]
+    fn spec_lane_follows_the_master_model_unless_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join(".zilch");
+        std::fs::create_dir_all(&proj).unwrap();
+        let toml = |s: &str| std::fs::write(proj.join("config.toml"), s).unwrap();
+        let e = env(&[("OPENAI_API_KEY", "k"), ("XYZ_KEY", "k")]);
+        let load = |ov: &Overrides| Config::load_from(dir.path(), std::slice::from_ref(&proj), &e, ov).unwrap();
+        let spec = |c: &Config| {
+            let b = &c.profile("spec").unwrap().binding;
+            (b.provider.clone(), b.model.clone(), b.temperature)
+        };
+
+        // Only the master is configured: the spec lane uses the same provider and model.
+        toml(
+            r#"
+[providers.xyz]
+base_url = "http://localhost:9/v1"
+api_key_env = "XYZ_KEY"
+[roles.master]
+provider = "xyz"
+model = "our-model"
+temperature = 0.3
+[roles.spec]
+max_steps = 9
+"#,
+        );
+        let c = load(&Overrides::default());
+        assert_eq!(spec(&c), ("xyz".into(), "our-model".into(), Some(0.3)));
+        assert_eq!(c.profile("spec").unwrap().max_steps, 9, "non-binding settings stay its own");
+        // --model moves both lane masters.
+        let c = load(&Overrides { master_model: Some("other".into()), ..Default::default() });
+        assert_eq!(spec(&c).1, "other");
+
+        // An explicit spec model wins (and keeps the master's provider unless it names one).
+        toml(
+            r#"
+[providers.xyz]
+base_url = "http://localhost:9/v1"
+api_key_env = "XYZ_KEY"
+[roles.master]
+provider = "xyz"
+model = "our-model"
+[roles.spec]
+model = "spec-model"
+"#,
+        );
+        let c = load(&Overrides { master_model: Some("other".into()), ..Default::default() });
+        assert_eq!(spec(&c), ("xyz".into(), "spec-model".into(), None));
+    }
 }
 
 impl Config {
     /// Discover context sizes and prices from every used provider's `/models` (best effort, in
     /// parallel, ~5s max), keyed "provider/model", with explicitly configured prices on top.
     pub async fn discover(&self) -> std::collections::HashMap<String, crate::llm::catalog::ModelInfo> {
+        self.discover_checked().await.0
+    }
+
+    /// Like [`Config::discover`], plus one warning per agent whose model is missing from its
+    /// provider's model list (only for providers that returned a non-empty list). A typo or a
+    /// stale model name then shows up at startup instead of as a 400 in the middle of a task.
+    pub async fn discover_checked(&self) -> (std::collections::HashMap<String, crate::llm::catalog::ModelInfo>, Vec<String>) {
         use crate::llm::catalog::{fetch_models, ModelInfo};
         let used: std::collections::BTreeSet<&str> = self.profiles.iter().map(|p| p.binding.provider.as_str()).collect();
         let fetches = used.into_iter().filter_map(|name| {
@@ -550,16 +630,32 @@ impl Config {
             Some(async move { (name, fetch_models(&base, key.as_deref(), &headers).await) })
         });
         let mut cat = std::collections::HashMap::new();
+        let mut listed: std::collections::BTreeMap<String, Vec<String>> = Default::default();
         for (provider, models) in futures::future::join_all(fetches).await {
             for (id, info) in models {
+                listed.entry(provider.clone()).or_default().push(id.clone());
                 cat.insert(format!("{provider}/{id}"), info);
+            }
+        }
+        let mut warnings = Vec::new();
+        for p in &self.profiles {
+            let b = &p.binding;
+            if let Some(ids) = listed.get(&b.provider).filter(|ids| !ids.contains(&b.model)) {
+                let mut some: Vec<&str> = ids.iter().map(String::as_str).collect();
+                some.sort_unstable();
+                let more = if some.len() > 8 { format!(", … {} more", some.len() - 8) } else { String::new() };
+                some.truncate(8);
+                warnings.push(format!(
+                    "agent '{}' uses model '{}', which provider '{}' does not list (it offers: {}{more}); set [roles.{}] model in your config",
+                    p.name, b.model, b.provider, some.join(", "), p.name
+                ));
             }
         }
         for p in &self.profiles {
             let entry: &mut ModelInfo = cat.entry(p.binding.key()).or_default();
             *entry = entry.merged(p.pricing);
         }
-        cat
+        (cat, warnings)
     }
 
     /// Use discovered context windows for profiles that didn't set `context_tokens` explicitly.

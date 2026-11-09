@@ -77,6 +77,9 @@ model = "gpt-4.1"
 model = "o4-mini"
 reasoning_effort = "high"
 
+[roles.spec]                       # spec lane (/spec); without a model it uses the master's
+model = "o3"
+
 [roles.coder]
 provider = "openrouter"
 model = "qwen/qwen3-coder"
@@ -106,7 +109,13 @@ system_prompt = "You are a meticulous code reviewer…"
 
 `{{cwd}}`, `{{date}}`, `{{agent_id}}`, `{{tools}}`, `{{workers}}` and `{{os}}` are filled in. A worker instance keeps its prompt and model for its whole lifetime. A TODO can set `model` (and `provider`) to send a hard item to a stronger model.
 
-Startup stops with an error if a profile uses an unknown provider or its API key is missing.
+Agents: `master` (code lane), `spec` (spec lane), `coder` and `explorer` (workers), plus your own. Each
+agent's binding comes from `[roles.<name>]`, then `[defaults]`; the `spec` agent first falls back to
+`[roles.master]`, so one master setting (or `--model`) drives both lanes.
+
+Startup stops with an error if a profile uses an unknown provider or its API key is missing, and
+warns when an agent's model is not in its provider's `/models` list (`zilch --doctor` checks every
+agent and sends each model a tiny request).
 
 ## Layout
 

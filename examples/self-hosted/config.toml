@@ -1,0 +1,36 @@
+# Your own OpenAI-compatible server (vLLM, llama.cpp server, LiteLLM, TGI, an internal gateway…).
+#
+# Use:  mkdir -p .zilch && cp examples/self-hosted/config.toml .zilch/config.toml
+#       edit base_url and the model names below, then check everything with:
+#       zilch --doctor          # lists every agent's model and sends each one a tiny request
+#
+# Every agent has its own model: master (code lane), spec (spec lane), coder and explorer
+# (workers). Lookup order: [roles.<name>] → [defaults]; `spec` falls back to [roles.master] first.
+# The simplest setup is one model for everything: set [defaults] and delete the [roles.*] lines.
+
+max_workers = 3
+# spec_dir = "specs"             # where /spec keeps spec.md, design.md, plan.md (default: specs)
+
+[providers.mine]
+base_url = "http://localhost:8000/v1"     # the URL that ends in /v1
+api_key_env = "MY_LLM_API_KEY"            # env var holding the key; delete the line if none is needed
+max_concurrent = 4                        # parallel requests your server handles well
+# protocol = "chat"                       # chat (default) | responses | anthropic
+# discover = false                        # skip GET /models if your server lacks it
+# idle_timeout_secs = 300                 # raise for slow local models
+# headers = { "X-Team" = "platform" }     # extra headers on every request
+
+[defaults]
+provider = "mine"
+model = "your-model"                      # must match an id from GET <base_url>/models
+
+# Optional per-agent models (uncomment to differ from [defaults]):
+# [roles.master]
+# model = "your-strong-model"
+# [roles.spec]                            # defaults to the master's model
+# model = "your-strong-model"
+# [roles.coder]
+# model = "your-coder-model"
+# temperature = 0.2
+# [roles.explorer]
+# model = "your-fast-model"

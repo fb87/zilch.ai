@@ -181,7 +181,14 @@ async fn real_main() -> Result<i32> {
     let cfg = Config::load(&cwd, &ov)?;
     let mut cfg = cfg;
     // Prices and context windows from the providers' model lists (best effort, ~5s max).
-    let catalog = cfg.discover().await;
+    let (catalog, model_warnings) = cfg.discover_checked().await;
+    for w in &model_warnings {
+        eprintln!(
+            "{}warning:{} {w}",
+            if std::io::stderr().is_terminal() { "\x1b[33m" } else { "" },
+            if std::io::stderr().is_terminal() { "\x1b[0m" } else { "" }
+        );
+    }
     cfg.apply_catalog(&catalog);
     let providers = cfg.build_providers()?;
     if cli.sessions {
