@@ -128,6 +128,14 @@ impl ChatRequest {
             "stream_options": { "include_usage": true },
         });
         let obj = body.as_object_mut().expect("object");
+        // Every message carries `content`. OpenAI allows leaving it out of an assistant message
+        // that only calls tools, but strict compatible servers reject that ("missing field
+        // `content`"), and many also reject `null`; an empty string is accepted everywhere.
+        if let Some(Value::Array(msgs)) = obj.get_mut("messages") {
+            for m in msgs.iter_mut().filter_map(Value::as_object_mut) {
+                m.entry("content").or_insert_with(|| Value::String(String::new()));
+            }
+        }
         if !self.tools.is_empty() {
             obj.insert("tools".into(), serde_json::to_value(&self.tools).expect("tools"));
         }
@@ -173,4 +181,32 @@ pub enum LlmEvent {
     ToolCallDelta { index: usize, id: Option<String>, name: Option<String>, args: String },
     Usage(Usage),
     Finish(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_chat_message_carries_string_content() {
+        let mut call = Message::assistant("");
+        call.content = None; // what the accumulator produces for a tool-call-only reply
+        call.tool_calls = vec![ToolCall {
+            id: "c1".into(),
+            kind: "function".into(),
+            function: FunctionCall { name: "glob".into(), arguments: "{}".into() },
+        }];
+        let req = ChatRequest {
+            binding: ModelBinding { provider: "p".into(), model: "m".into(), ..Default::default() },
+            messages: vec![Message::system("s"), Message::user("u"), call, Message::tool("c1", "a.rs")],
+            tools: vec![],
+            session: None,
+        };
+        let body = req.to_body();
+        let msgs = body["messages"].as_array().unwrap();
+        assert!(msgs.iter().all(|m| m["content"].is_string()), "{msgs:#?}");
+        assert_eq!(msgs[2]["content"], "");
+        assert_eq!(msgs[2]["tool_calls"][0]["type"], "function");
+        assert_eq!(msgs[1]["content"], "u", "existing content untouched");
+    }
 }
