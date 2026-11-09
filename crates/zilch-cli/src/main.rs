@@ -580,6 +580,29 @@ async fn banner(team: &Team, screen: &SharedScreen) {
     s.line(&msg);
 }
 
+/// `/about`: what this zilch is (from the package metadata) and which config it runs with.
+fn about(cfg: &Config) -> String {
+    let repo = env!("CARGO_PKG_REPOSITORY");
+    let mut lines = vec![
+        format!("zilch {}", env!("CARGO_PKG_VERSION")),
+        format!("  {}", env!("CARGO_PKG_DESCRIPTION")),
+        String::new(),
+        format!("  repository  {repo}"),
+        format!("  docs        {repo}#readme"),
+        format!("  author      {}", env!("CARGO_PKG_AUTHORS").replace(':', ", ")),
+        format!("  license     {}", env!("CARGO_PKG_LICENSE")),
+        format!("  platform    {}/{}", std::env::consts::OS, std::env::consts::ARCH),
+        format!("  workspace   {}", cfg.cwd.display()),
+    ];
+    if cfg.sources.is_empty() {
+        lines.push("  config      built-in defaults + environment (no config file found)".into());
+    }
+    for (i, s) in cfg.sources.iter().enumerate() {
+        lines.push(format!("{}{}", if i == 0 { "  config      " } else { "              " }, s.display()));
+    }
+    lines.join("\n")
+}
+
 /// Returns false to exit.
 async fn command(team: &Team, screen: &SharedScreen, input: &str) -> bool {
     let (cmd, arg) = input.split_once(' ').map(|(c, a)| (c, a.trim())).unwrap_or((input, ""));
@@ -598,8 +621,10 @@ async fn command(team: &Team, screen: &SharedScreen, input: &str) -> bool {
 /recap            what this session has done so far (requests, last answer, TODOs, workers)
 /sessions         list saved sessions for this directory
 /clear            start a fresh session (the current one stays resumable)
+/about            version, repository, author, license, platform and config in use
 /exit             quit"
             .to_string(),
+        "/about" => about(&team.shared.cfg),
         "/todos" => {
             let todos = team.todos();
             if todos.is_empty() {

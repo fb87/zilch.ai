@@ -6,6 +6,9 @@ members = ["crates/zilch-core", "crates/zilch-cli"]
 version = "0.1.3"
 edition = "2021"
 license = "MIT"
+authors = ["Si Dao"]
+repository = "https://github.com/fb87/zilch.ai"
+description = "A minimal, extensible coding agent for any OpenAI-compatible API: a read-only, TODO-driven master coordinating parallel workers."
 
 [workspace.dependencies]
 anyhow = "1"
