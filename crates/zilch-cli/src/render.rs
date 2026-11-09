@@ -45,8 +45,8 @@ pub struct Screen {
     pub active: String,
     /// Answers produced by a background lane, shown when the user switches to it.
     background_answer: HashMap<String, String>,
-    /// Hanging-indent word wrap for everything printed (remembers code fences).
-    wrapper: crate::wrap::Wrapper,
+    /// Markdown renderer for the lane root's streamed answer (VT100/VT220 attributes only).
+    md: crate::markdown::Markdown,
     /// Streamed master text not yet ending in a newline (printed, wrapped, line by line).
     master_buf: String,
     /// REPL status bar above the input line (None: plain output, heartbeat lines instead).
@@ -95,7 +95,7 @@ impl Screen {
             lanes: false,
             active: "master".into(),
             background_answer: HashMap::new(),
-            wrapper: Default::default(),
+            md: crate::markdown::Markdown::new(color),
             master_buf: String::new(),
             status_bar: None,
         }))
@@ -140,13 +140,25 @@ impl Screen {
         }
         let rest = std::mem::take(&mut self.master_buf);
         let w = self.wrap_width();
-        let _ = writeln!(self.out, "{}", self.wrapper.line(&rest, w));
+        if let Some(s) = self.md.line(&rest, w) {
+            let _ = writeln!(self.out, "{s}");
+        }
         self.at_line_start = true;
+    }
+
+    /// Print a table the markdown renderer is still collecting (before other output, so the
+    /// answer keeps its order).
+    fn flush_md_table(&mut self) {
+        let w = self.wrap_width();
+        if let Some(t) = self.md.take_table(w) {
+            let _ = writeln!(self.out, "{t}");
+        }
     }
 
     pub fn line(&mut self, s: &str) {
         self.clear_panel();
         self.flush_master();
+        self.flush_md_table();
         self.ensure_newline();
         let w = self.wrap_width();
         let _ = writeln!(self.out, "{}", crate::wrap::Wrapper::default().text(s, w));
@@ -324,14 +336,13 @@ impl Screen {
     pub fn switch_lane(&mut self, root: &str) {
         self.active = root.to_string();
         if let Some(answer) = self.background_answer.remove(root).filter(|a| !a.trim().is_empty()) {
-            let msg = format!(
-                "{}── {} lane answered while you were away ──{}\n{}",
-                self.c(DIM),
-                Self::lane_name(root),
-                self.c(RESET),
-                answer.trim_end()
-            );
+            let msg = format!("{}── {} lane answered while you were away ──{}", self.c(DIM), Self::lane_name(root), self.c(RESET));
             self.line(&msg);
+            // Rendered as markdown and printed as is (code lines must not be re-wrapped).
+            let body = crate::markdown::Markdown::new(self.color).text(answer.trim_end(), self.wrap_width());
+            self.clear_panel();
+            let _ = writeln!(self.out, "{body}");
+            self.draw_panel();
         }
     }
 
@@ -419,7 +430,9 @@ impl Screen {
                     self.master_buf.push_str(&t);
                     while let Some(pos) = self.master_buf.find('\n') {
                         let line: String = self.master_buf.drain(..=pos).collect();
-                        let _ = writeln!(self.out, "{}", self.wrapper.line(line.trim_end_matches(['\n', '\r']), w));
+                        if let Some(s) = self.md.line(line.trim_end_matches(['\n', '\r']), w) {
+                            let _ = writeln!(self.out, "{s}");
+                        }
                     }
                 }
                 let _ = self.out.flush();
@@ -443,7 +456,11 @@ impl Screen {
                     self.clear_panel();
                     self.flush_master();
                     self.ensure_newline();
-                    self.wrapper = Default::default(); // an unclosed fence ends with the answer
+                    // A table at the very end; an unclosed fence ends with the answer.
+                    let w = self.wrap_width();
+                    if let Some(t) = self.md.finish(w) {
+                        let _ = writeln!(self.out, "{t}");
+                    }
                     self.draw_panel();
                 } else if let Some(rest) = self.worker_text.remove(&ev.agent) {
                     if self.verbose && !rest.trim().is_empty() {
@@ -657,10 +674,11 @@ fn tty_width(fd: i32) -> Option<usize> {
     None
 }
 
-/// `text` wrapped for the terminal behind `fd`; unchanged when `fd` is a pipe or file.
+/// `text` (markdown) rendered and wrapped for the terminal behind `fd`; unchanged when `fd` is a
+/// pipe or file. With NO_COLOR it is wrapped but not styled.
 pub fn wrap_for_tty(fd: i32, text: &str) -> String {
     match tty_width(fd) {
-        Some(w) => crate::wrap::Wrapper::default().text(text, w),
+        Some(w) => crate::markdown::Markdown::new(std::env::var_os("NO_COLOR").is_none()).text(text, w),
         None => text.to_string(),
     }
 }

@@ -38,20 +38,56 @@ impl Wrapper {
     }
 }
 
-/// The text without ANSI escape sequences.
-fn visible(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut esc = false;
-    for ch in s.chars() {
-        if esc {
-            esc = !ch.is_ascii_alphabetic();
-        } else if ch == '\x1b' {
-            esc = true;
-        } else {
-            out.push(ch);
+/// A piece of terminal output: an escape sequence (takes no columns) or one character.
+pub enum Piece<'a> {
+    Esc(&'a str),
+    Char(char),
+}
+
+/// Split terminal output into escape sequences and characters. Understands CSI sequences
+/// (`ESC [ … final`, e.g. SGR), charset designations (`ESC ( 0` / `ESC ( B`, the VT100 line
+/// drawing set, whose final byte is not a letter) and other two-byte escapes.
+pub fn pieces(s: &str) -> Vec<Piece<'_>> {
+    let mut out = Vec::new();
+    let mut it = s.char_indices().peekable();
+    while let Some((i, ch)) = it.next() {
+        if ch != '\x1b' {
+            out.push(Piece::Char(ch));
+            continue;
         }
+        let end = match it.peek().map(|&(_, c)| c) {
+            Some('[') => {
+                it.next();
+                let mut e = s.len();
+                for (j, c) in it.by_ref() {
+                    if ('\x40'..='\x7e').contains(&c) {
+                        e = j + c.len_utf8();
+                        break;
+                    }
+                }
+                e
+            }
+            Some('(') | Some(')') => {
+                it.next();
+                it.next().map_or(s.len(), |(j, c)| j + c.len_utf8())
+            }
+            Some(_) => it.next().map_or(s.len(), |(j, c)| j + c.len_utf8()),
+            None => s.len(),
+        };
+        out.push(Piece::Esc(&s[i..end]));
     }
     out
+}
+
+/// The text without escape sequences.
+pub fn visible(s: &str) -> String {
+    pieces(s)
+        .into_iter()
+        .filter_map(|p| match p {
+            Piece::Char(c) => Some(c),
+            Piece::Esc(_) => None,
+        })
+        .collect()
 }
 
 fn width_of(s: &str) -> usize {
@@ -106,29 +142,22 @@ pub fn wrap_line(line: &str, width: usize) -> String {
     // Split into words, each with its trailing spaces; escapes stay attached to their word.
     let mut words: Vec<(String, usize, String)> = Vec::new(); // (word, cols, spaces)
     let (mut word, mut cols, mut spaces) = (String::new(), 0usize, String::new());
-    let mut esc = false;
-    for ch in line.chars() {
-        if esc {
-            word.push(ch);
-            esc = !ch.is_ascii_alphabetic();
-            continue;
-        }
-        if ch == '\x1b' {
-            if !spaces.is_empty() {
-                words.push((std::mem::take(&mut word), cols, std::mem::take(&mut spaces)));
-                cols = 0;
+    for p in pieces(line) {
+        match p {
+            Piece::Char(' ') => spaces.push(' '),
+            other => {
+                if !spaces.is_empty() {
+                    words.push((std::mem::take(&mut word), cols, std::mem::take(&mut spaces)));
+                    cols = 0;
+                }
+                match other {
+                    Piece::Esc(e) => word.push_str(e),
+                    Piece::Char(ch) => {
+                        word.push(ch);
+                        cols += ch.width().unwrap_or(0);
+                    }
+                }
             }
-            esc = true;
-            word.push(ch);
-        } else if ch == ' ' {
-            spaces.push(ch);
-        } else {
-            if !spaces.is_empty() {
-                words.push((std::mem::take(&mut word), cols, std::mem::take(&mut spaces)));
-                cols = 0;
-            }
-            word.push(ch);
-            cols += ch.width().unwrap_or(0);
         }
     }
     words.push((word, cols, spaces));
@@ -152,19 +181,15 @@ pub fn wrap_line(line: &str, width: usize) -> String {
         }
         pending_spaces.clear();
         // A word longer than a whole row is cut by character.
-        let mut esc = false;
-        let mut seq = String::new();
-        for ch in word.chars() {
-            if esc || ch == '\x1b' {
-                out.push(ch);
-                seq.push(ch);
-                esc = ch == '\x1b' || !ch.is_ascii_alphabetic();
-                if !esc {
-                    track_style(&mut style, &seq);
-                    seq.clear();
+        for p in pieces(&word) {
+            let ch = match p {
+                Piece::Esc(e) => {
+                    out.push_str(e);
+                    track_style(&mut style, e);
+                    continue;
                 }
-                continue;
-            }
+                Piece::Char(ch) => ch,
+            };
             let w = ch.width().unwrap_or(0);
             if col + w > max && col > indent {
                 break_row(&mut out, &style, &pad);

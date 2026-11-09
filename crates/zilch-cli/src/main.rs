@@ -3,6 +3,7 @@ mod inbox;
 mod ipc;
 mod lanes;
 mod log;
+mod markdown;
 mod render;
 mod status;
 mod wrap;
