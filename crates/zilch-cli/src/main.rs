@@ -344,6 +344,14 @@ async fn doctor(
     catalog: &std::collections::HashMap<String, zilch_core::llm::catalog::ModelInfo>,
 ) -> Result<i32> {
     println!("workspace   {}", cfg.cwd.display());
+    if cfg.sources.is_empty() {
+        let central =
+            zilch_core::config::user_config_dirs().into_iter().map(|d| d.join("config.toml").display().to_string()).collect::<Vec<_>>();
+        println!("config      none found (built-in defaults + env); looked in .zilch/config.toml, {}", central.join(", "));
+    }
+    for (i, s) in cfg.sources.iter().enumerate() {
+        println!("{}{}", if i == 0 { "config      " } else { "            " }, s.display());
+    }
     println!(
         "approval    {:?} · file sandbox {} · max workers {} · token cap {} · cost cap {}",
         cfg.approval,

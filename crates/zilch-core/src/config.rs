@@ -172,6 +172,8 @@ pub struct Overrides {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cwd: PathBuf,
+    /// Config files that were found and loaded, lowest precedence first (shown by --doctor).
+    pub sources: Vec<PathBuf>,
     pub max_workers: usize,
     /// Directory of the spec lane's documents (spec.md, design.md, plan.md, versions/); default <workspace>/specs.
     pub spec_dir: PathBuf,
@@ -201,6 +203,25 @@ pub struct Config {
     pub profiles: Vec<Profile>,
 }
 
+/// Central (per-user) config directories, lowest precedence first: the platform config dir
+/// (`~/.config` on Linux, honoring `$XDG_CONFIG_HOME`; `~/Library/Application Support` on macOS),
+/// then `$XDG_CONFIG_HOME` or `~/.config` on other platforms too, since that is where most
+/// people look. Each may hold `config.toml`, `agents/*.toml` and prompt files.
+pub fn user_config_dirs() -> Vec<PathBuf> {
+    let mut dirs_found: Vec<PathBuf> = Vec::new();
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")));
+    for d in [dirs::config_dir(), xdg].into_iter().flatten() {
+        let d = d.join("zilch");
+        if !dirs_found.contains(&d) {
+            dirs_found.push(d);
+        }
+    }
+    dirs_found
+}
+
 impl Config {
     pub fn master(&self) -> &Profile {
         self.profiles.iter().find(|p| p.is_master()).expect("master profile")
@@ -214,10 +235,7 @@ impl Config {
 
     /// Load all layers from disk + environment.
     pub fn load(cwd: &Path, ov: &Overrides) -> Result<Self> {
-        let mut layers = Vec::new();
-        if let Some(d) = dirs::config_dir() {
-            layers.push(d.join("zilch"));
-        }
+        let mut layers = user_config_dirs();
         layers.push(cwd.join(".zilch"));
         Self::load_from(cwd, &layers, &std::env::vars().collect(), ov)
     }
@@ -226,12 +244,14 @@ impl Config {
     pub fn load_from(cwd: &Path, layer_dirs: &[PathBuf], env: &BTreeMap<String, String>, ov: &Overrides) -> Result<Self> {
         let mut fc = FileConfig::default();
         let mut agent_files: BTreeMap<String, RoleCfg> = BTreeMap::new();
+        let mut sources = Vec::new();
         for dir in layer_dirs {
             let file = dir.join("config.toml");
             if file.exists() {
                 let text = std::fs::read_to_string(&file)?;
                 let layer: FileConfig = toml::from_str(&text).with_context(|| format!("parsing {}", file.display()))?;
                 merge_file(&mut fc, layer, dir);
+                sources.push(file.clone());
             }
             let agents = dir.join("agents");
             if let Ok(rd) = std::fs::read_dir(&agents) {
@@ -244,6 +264,7 @@ impl Config {
                     rc.absolutize(dir);
                     let name = rc.name.clone().or_else(|| p.file_stem().map(|s| s.to_string_lossy().into_owned())).unwrap();
                     agent_files.entry(name).or_default().merge(rc);
+                    sources.push(p.clone());
                 }
             }
         }
@@ -292,6 +313,7 @@ impl Config {
 
         let cfg = Config {
             cwd: cwd.to_path_buf(),
+            sources,
             max_workers: ov.max_workers.or(fc.max_workers).unwrap_or(4).max(1),
             spec_dir: cwd.join(ov.spec_dir.clone().or(fc.spec_dir).unwrap_or_else(|| "specs".into())),
             approval: ov.approval.or(fc.approval).unwrap_or_default(),
@@ -582,6 +604,7 @@ max_steps = 9
         let c = load(&Overrides::default());
         assert_eq!(spec(&c), ("xyz".into(), "our-model".into(), Some(0.3)));
         assert_eq!(c.profile("spec").unwrap().max_steps, 9, "non-binding settings stay its own");
+        assert_eq!(c.sources, vec![proj.join("config.toml")], "loaded files are recorded");
         // --model moves both lane masters.
         let c = load(&Overrides { master_model: Some("other".into()), ..Default::default() });
         assert_eq!(spec(&c).1, "other");

@@ -51,7 +51,14 @@ Ctrl-C cancels the current turn, including the master and every running worker.
 
 ## Configure
 
-Config layers, later wins: built-in defaults < `~/.config/zilch/config.toml` < `./.zilch/config.toml` < env vars (`OPENAI_BASE_URL`, `OPENAI_API_KEY`, `ZILCH_MODEL`, `ZILCH_PROVIDER`) < CLI flags.
+Config layers, later wins: built-in defaults < central `~/.config/zilch/config.toml` < `./.zilch/config.toml` < env vars (`OPENAI_BASE_URL`, `OPENAI_API_KEY`, `ZILCH_MODEL`, `ZILCH_PROVIDER`) < CLI flags.
+
+Put providers and models in the central file once and every workspace uses them; a workspace's
+`.zilch/config.toml` only needs what differs, and is merged key by key on top. The central directory
+is `$XDG_CONFIG_HOME/zilch` or `~/.config/zilch` (on macOS, `~/Library/Application Support/zilch` is read
+too) and may also hold `agents/*.toml` and prompt files. `zilch --doctor` prints which files were loaded.
+Sandboxed commands cannot read `~/.config/zilch` or the macOS directory, so with `chmod 600` it is a
+reasonable place for `api_key = "…"` (a custom `$XDG_CONFIG_HOME` location is not hidden; add it to `bash_hide`).
 
 ```toml
 max_workers = 4

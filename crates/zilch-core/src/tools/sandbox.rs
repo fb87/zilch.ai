@@ -238,6 +238,7 @@ pub fn seatbelt_profile(workspace: &Path, spec: &SandboxSpec) -> String {
     let mut hidden: Vec<PathBuf> = home.iter().flat_map(|h| DEFAULT_HIDDEN.iter().map(move |x| h.join(x))).collect();
     if let Some(h) = &home {
         hidden.push(h.join("Library/Keychains"));
+        hidden.push(h.join("Library/Application Support/zilch")); // central config (API keys)
     }
     hidden.extend(spec.hide.iter().map(|x| expand(x)));
     for h in hidden.iter().filter(|h| !workspace.starts_with(h)) {
