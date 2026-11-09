@@ -17,6 +17,7 @@ pub const GREEN: &str = "\x1b[32m";
 pub const RED: &str = "\x1b[31m";
 pub const YELLOW: &str = "\x1b[33m";
 pub const CYAN: &str = "\x1b[36m";
+pub const REVERSE: &str = "\x1b[7m";
 
 /// Terminal state shared by the renderer and the interactive prompts (approver, plan review).
 pub struct Screen {
@@ -57,6 +58,11 @@ pub struct Screen {
     master_buf: String,
     /// REPL status bar above the input line (None: plain output, heartbeat lines instead).
     pub status_bar: Option<Arc<crate::status::StatusBar>>,
+    /// A question waiting for the user's answer (approval, plan review): pinned in the status
+    /// row until answered, so output from other agents cannot scroll it out of sight.
+    question: Option<String>,
+    /// Set while handling an event of the background lane: put before each printed line.
+    bg_prefix: String,
 }
 
 pub type SharedScreen = Arc<Mutex<Screen>>;
@@ -107,6 +113,8 @@ impl Screen {
             md_indent: 0,
             master_buf: String::new(),
             status_bar: None,
+            question: None,
+            bg_prefix: String::new(),
         }))
     }
 
@@ -176,7 +184,12 @@ impl Screen {
         self.flush_md_table();
         self.ensure_newline();
         let w = self.wrap_width();
-        let _ = writeln!(self.out, "{}", crate::wrap::Wrapper::default().text(s, w));
+        let s = if self.bg_prefix.is_empty() {
+            s.to_string()
+        } else {
+            s.lines().map(|l| format!("{}{l}", self.bg_prefix)).collect::<Vec<_>>().join("\n")
+        };
+        let _ = writeln!(self.out, "{}", crate::wrap::Wrapper::default().text(&s, w));
         self.draw_panel();
     }
 
@@ -350,6 +363,15 @@ impl Screen {
     /// Make `root` ("master" or "spec") the foreground lane and show anything it said meanwhile.
     pub fn switch_lane(&mut self, root: &str) {
         self.active = root.to_string();
+        // A rule marks where the other lane's output ends.
+        let label = self.lane_label(root);
+        let width = match self.wrap_width() {
+            0 => 40,
+            w => w.min(100),
+        };
+        let tail = "─".repeat(width.saturating_sub(6 + unicode_width::UnicodeWidthStr::width(label.as_str())).max(4));
+        let rule = format!("{}──── {label} {tail}{}", self.c(DIM), self.c(RESET));
+        self.line(&rule);
         if let Some(answer) = self.background_answer.remove(root).filter(|a| !a.trim().is_empty()) {
             let msg = format!("{}── {} lane answered while you were away ──{}", self.c(DIM), Self::lane_name(root), self.c(RESET));
             self.line(&msg);
@@ -392,7 +414,20 @@ impl Screen {
     }
 
     pub fn handle(&mut self, ev: AgentEvent) {
+        // Lines the background lane still prints (TODO results, notices, "finished") carry its
+        // lane mark so they are not mistaken for the foreground lane's output.
+        self.bg_prefix = if self.lanes && Self::lane_of(&ev.agent) != self.active {
+            let root = Self::lane_of(&ev.agent);
+            if self.color {
+                format!("{} ", lane_icon(root))
+            } else {
+                format!("[{}] ", Self::lane_name(root))
+            }
+        } else {
+            String::new()
+        };
         self.handle_event(ev);
+        self.bg_prefix.clear();
         self.update_status();
     }
 
@@ -426,12 +461,16 @@ impl Screen {
     /// Refresh the REPL status bar text (cheap; called on every event and tick).
     pub fn update_status(&mut self) {
         let Some(bar) = self.status_bar.clone() else { return };
+        if let Some(q) = &self.question {
+            let text = format!("{}{}? {q} {}", self.c(BOLD), self.c(REVERSE), self.c(RESET));
+            bar.set(clip(&text, terminal_width(self.fd)), false);
+            return;
+        }
         let mut busy = false;
         let mut cells = Vec::new();
         for root in ["master", "spec"] {
             // On a terminal the lane's icon goes before its name.
-            let name =
-                if self.color { format!("{} {}", lane_icon(root), Self::lane_name(root)) } else { Self::lane_name(root).to_string() };
+            let name = self.lane_label(root);
             let active = self.active == root;
             let mark = if active { "▸ " } else { "" };
             match self.lane_status(root) {
@@ -446,6 +485,22 @@ impl Screen {
         let sep = format!("{}  │  {}", self.c(DIM), self.c(RESET));
         let text = clip(&cells.join(&sep), terminal_width(self.fd));
         bar.set(text, busy);
+    }
+
+    /// Pin (or with None, unpin) a one-line question in the status row.
+    pub fn set_question(&mut self, q: Option<String>) {
+        self.question = q;
+        self.update_status();
+    }
+
+    /// The lane an agent belongs to, as shown to the user: "⧉ code" on a terminal, "code" otherwise.
+    pub fn lane_label(&self, agent: &str) -> String {
+        let root = Self::lane_of(agent);
+        if self.color {
+            format!("{} {}", lane_icon(root), Self::lane_name(root))
+        } else {
+            Self::lane_name(root).to_string()
+        }
     }
 
     fn handle_event(&mut self, ev: AgentEvent) {
@@ -765,6 +820,14 @@ fn clip(s: &str, width: usize) -> String {
             out.push(ch);
             continue;
         }
+        // A line break (a multi-line bash command in a tool summary) would make the line two
+        // rows and leave a stale copy behind on every redraw; other controls are dropped.
+        let ch = match ch {
+            '\n' | '\r' | '\t' if out.ends_with(' ') => continue,
+            '\n' | '\r' | '\t' => ' ',
+            c if c.is_control() => continue,
+            c => c,
+        };
         let w = ch.width().unwrap_or(0);
         if cols + w > max - 1 {
             out.push('…');
@@ -892,6 +955,13 @@ mod tests {
     }
 
     #[test]
+    fn multi_line_tool_summaries_stay_on_one_status_row() {
+        let s = clip("⠸ code: coder#1 bash(set -u\nD=/home/x\r\n\tls)  │  spec: idle", 80);
+        assert_eq!(s, "⠸ code: coder#1 bash(set -u D=/home/x ls)  │  spec: idle");
+        assert!(!clip("a\x07b\x1b[2mc", 80).contains('\x07'), "controls other than escapes are dropped");
+    }
+
+    #[test]
     fn clipped_panel_lines_never_wrap() {
         use unicode_width::UnicodeWidthStr;
         let strip = |s: &str| {
@@ -964,6 +1034,21 @@ mod tests {
         assert_eq!(bar.text(), "▸ code: idle  │  spec: idle");
     }
 
+    #[tokio::test]
+    async fn switching_lanes_draws_a_rule_and_background_lines_carry_their_lane() {
+        let buf = Buf::default();
+        let screen = Screen::new(Box::new(buf.clone()), -1, false, false, true);
+        let mut s = screen.lock().await;
+        s.lanes = true;
+        s.switch_lane("spec");
+        assert!(buf.text().contains("──── spec ────"), "{}", buf.text());
+        // The code lane works in the background: its notice is marked, the spec lane's is not.
+        s.handle(ev("master", EventKind::Notice("retrying in 2s".into())));
+        s.handle(ev("spec", EventKind::Notice("spec saved".into())));
+        let out = buf.text();
+        assert!(out.contains("[code] retrying in 2s"), "{out}");
+        assert!(out.contains("\nspec saved"), "{out}");
+    }
     #[tokio::test]
     async fn redraw_clears_and_renders_the_last_answer_again() {
         let buf = Buf::default();

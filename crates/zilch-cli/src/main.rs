@@ -463,10 +463,14 @@ async fn repl(
         // The prompt itself only names the lane; live activity is drawn in the status row above
         // it (the leading "\n" reserves that row, see status.rs).
         let row = if bar.is_some() { "\n" } else { "" };
-        let prompt = inbox.prompt().map(str::to_string).unwrap_or_else(|| match &bar {
-            Some(_) => format!("{row}{} › ", lanes.active().icon()),
-            None => format!("[{}] › ", lanes.active().name()),
-        });
+        // A question shown in the prompt is answered by this line; one that arrives while the
+        // user is already typing is not (that line was meant for the lane).
+        let asked = inbox.prompt();
+        let prompt = match (asked, &bar) {
+            (Some(q), _) => format!("{row}{q}"),
+            (None, Some(_)) => format!("{row}{} › ", lanes.active().icon()),
+            (None, None) => format!("[{}] › ", lanes.active().name()),
+        };
         if let Some(b) = &bar {
             b.reading.store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -490,10 +494,15 @@ async fn repl(
             Err(rustyline::error::ReadlineError::Eof) => break,
             Err(e) => return Err(e.into()),
         };
-        // A pending question (approval / plan review) takes the next line as its answer.
-        if inbox.pending() {
-            inbox.answer(&line).await;
-            continue;
+        // A pending question (approval / plan review) takes the line as its answer when its
+        // prompt was showing. Slash commands still run (e.g. /code to look before answering).
+        if inbox.pending() && !line.trim_start().starts_with('/') {
+            if asked.is_some() {
+                inbox.answer(&line).await;
+                continue;
+            }
+            // Typed before the question appeared: run it normally and show the question again.
+            inbox.reshow().await;
         }
         let input = line.trim();
         if input.is_empty() {

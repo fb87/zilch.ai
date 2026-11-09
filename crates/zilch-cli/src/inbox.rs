@@ -3,6 +3,9 @@
 //! With two lanes running in parallel the keyboard has a single owner: the line editor. So
 //! agents don't read stdin themselves; they queue a question here, it is printed above the
 //! prompt, and the user's next input line answers it. Questions are answered in order.
+//!
+//! The question at the front is also pinned in the status row (one line, with its lane) until it
+//! is answered, so output from the other lane or from workers cannot scroll it out of sight.
 
 use crate::render::{SharedScreen, BOLD, CYAN, DIM, RESET, YELLOW};
 use async_trait::async_trait;
@@ -13,9 +16,17 @@ use zilch_core::agent::{ApprovalRequest, Decision};
 use zilch_core::team::todo::Todo;
 use zilch_core::{Approver, PlanDecision, PlanReviewer};
 
-enum Ask {
-    Approval { text: String, tx: oneshot::Sender<Decision> },
-    Plan { text: String, tx: oneshot::Sender<PlanDecision> },
+enum Reply {
+    Approval(oneshot::Sender<Decision>),
+    Plan(oneshot::Sender<PlanDecision>),
+}
+
+struct Ask {
+    /// The full question, printed above the prompt.
+    text: String,
+    /// One line for the status row.
+    short: String,
+    reply: Reply,
 }
 
 pub struct Inbox {
@@ -34,16 +45,35 @@ impl Inbox {
 
     /// Short prompt hint while a question is waiting for an answer.
     pub fn prompt(&self) -> Option<&'static str> {
-        match self.queue.lock().unwrap().front()? {
-            Ask::Approval { .. } => Some("allow? [y/n/a] › "),
-            Ask::Plan { .. } => Some("plan? [A]pprove / [r]eject / feedback › "),
+        match self.queue.lock().unwrap().front()?.reply {
+            Reply::Approval(_) => Some("allow? [y/n/a] › "),
+            Reply::Plan(_) => Some("plan? [A]pprove / [r]eject / feedback › "),
         }
     }
 
+    fn front(&self) -> Option<(String, String)> {
+        self.queue.lock().unwrap().front().map(|a| (a.text.clone(), a.short.clone()))
+    }
+
+    /// Print the front question and pin it in the status row (or unpin when none is left).
+    async fn show_front(&self) {
+        let front = self.front();
+        let mut s = self.screen.lock().await;
+        match front {
+            Some((text, short)) => {
+                s.line(&text);
+                s.set_question(Some(short));
+            }
+            None => s.set_question(None),
+        }
+    }
+
+    /// Print the waiting question again (a line was typed before its answer prompt appeared).
+    pub async fn reshow(&self) {
+        self.show_front().await;
+    }
+
     async fn push(&self, ask: Ask) {
-        let text = match &ask {
-            Ask::Approval { text, .. } | Ask::Plan { text, .. } => text.clone(),
-        };
         let first = {
             let mut q = self.queue.lock().unwrap();
             q.push_back(ask);
@@ -51,23 +81,16 @@ impl Inbox {
         };
         // Only the question at the front is shown; the next one appears once it is answered.
         if first {
-            self.screen.lock().await.line(&text);
+            self.show_front().await;
         }
     }
 
     /// Answer the oldest question with the user's input line. Returns false if none was pending.
     pub async fn answer(&self, line: &str) -> bool {
-        let (ask, next) = {
-            let mut q = self.queue.lock().unwrap();
-            let Some(ask) = q.pop_front() else { return false };
-            let next = q.front().map(|a| match a {
-                Ask::Approval { text, .. } | Ask::Plan { text, .. } => text.clone(),
-            });
-            (ask, next)
-        };
+        let Some(ask) = self.queue.lock().unwrap().pop_front() else { return false };
         let l = line.trim();
-        match ask {
-            Ask::Approval { tx, .. } => {
+        match ask.reply {
+            Reply::Approval(tx) => {
                 let d = match l.to_lowercase().as_str() {
                     "y" | "yes" => Decision::Allow,
                     "a" | "always" => Decision::AlwaysForTool,
@@ -75,7 +98,7 @@ impl Inbox {
                 };
                 let _ = tx.send(d);
             }
-            Ask::Plan { tx, .. } => {
+            Reply::Plan(tx) => {
                 let d = match l.to_lowercase().as_str() {
                     "" | "a" | "y" | "yes" | "approve" => PlanDecision::Approve,
                     "r" | "n" | "no" | "reject" => PlanDecision::Reject(String::new()),
@@ -84,9 +107,7 @@ impl Inbox {
                 let _ = tx.send(d);
             }
         }
-        if let Some(text) = next {
-            self.screen.lock().await.line(&text);
-        }
+        self.show_front().await;
         true
     }
 }
@@ -97,15 +118,17 @@ pub struct ReplApprover(pub Arc<Inbox>);
 impl Approver for ReplApprover {
     async fn approve(&self, req: &ApprovalRequest) -> Decision {
         let (tx, rx) = oneshot::channel();
-        let text = {
+        let (text, short) = {
             let s = self.0.screen.lock().await;
             let (y, b, d, r) = (s.c(YELLOW), s.c(BOLD), s.c(DIM), s.c(RESET));
-            format!(
-                "{y}?{r} {b}{}{r} wants to run {b}{}{r}: {}\n  {d}answer y (allow) / n (deny) / a (always allow {}){r}",
+            let lane = s.lane_label(&req.agent);
+            let text = format!(
+                "{y}?{r} {b}{lane}{r} · {b}{}{r} wants to run {b}{}{r}: {}\n  {d}answer y (allow) / n (deny) / a (always allow {}){r}",
                 req.agent, req.tool, req.summary, req.tool
-            )
+            );
+            (text, format!("{lane} · {} wants {}: {} — y/n/a", req.agent, req.tool, req.summary))
         };
-        self.0.push(Ask::Approval { text, tx }).await;
+        self.0.push(Ask { text, short, reply: Reply::Approval(tx) }).await;
         rx.await.unwrap_or(Decision::Deny)
     }
 }
@@ -116,11 +139,19 @@ pub struct ReplReviewer(pub Arc<Inbox>);
 impl PlanReviewer for ReplReviewer {
     async fn review(&self, summary: &str, todos: &[Todo], waves: &[Vec<String>]) -> PlanDecision {
         let (tx, rx) = oneshot::channel();
-        let text = {
+        let (text, short) = {
             let s = self.0.screen.lock().await;
-            render_plan(summary, todos, waves, (s.c(CYAN), s.c(BOLD), s.c(DIM), s.c(RESET), s.c(YELLOW)))
+            // Plans come from the code lane's master.
+            let lane = s.lane_label("master");
+            let (b, r) = (s.c(BOLD), s.c(RESET));
+            let plan = render_plan(summary, todos, waves, (s.c(CYAN), s.c(BOLD), s.c(DIM), s.c(RESET), s.c(YELLOW)));
+            let n = todos.len();
+            (
+                format!("{b}{lane}{r} lane asks for a plan review:\n{plan}"),
+                format!("{lane} · plan review, {n} TODO(s) — Enter approve / r reject / feedback"),
+            )
         };
-        self.0.push(Ask::Plan { text, tx }).await;
+        self.0.push(Ask { text, short, reply: Reply::Plan(tx) }).await;
         rx.await.unwrap_or_else(|_| PlanDecision::Reject("no answer".into()))
     }
 }
@@ -177,5 +208,35 @@ mod tests {
         }
         inbox.answer("please split task 2").await;
         assert_eq!(h.await.unwrap(), PlanDecision::Feedback("please split task 2".into()));
+    }
+
+    #[tokio::test]
+    async fn the_waiting_question_is_pinned_in_the_status_row_with_its_lane() {
+        let screen = Screen::new(Box::new(std::io::sink()), -1, false, false, true);
+        let bar = Arc::new(crate::status::StatusBar::default());
+        screen.lock().await.status_bar = Some(bar.clone());
+        let inbox = Inbox::new(screen.clone());
+        let ask = |agent: &str, tool: &str| {
+            let a = ReplApprover(inbox.clone());
+            let req = ApprovalRequest { agent: agent.into(), tool: tool.into(), summary: "cargo test".into() };
+            tokio::spawn(async move { a.approve(&req).await })
+        };
+        let h1 = ask("coder#1", "bash");
+        while !inbox.pending() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(bar.text(), "? code · coder#1 wants bash: cargo test — y/n/a ");
+        let h2 = ask("spec", "write_doc");
+        while inbox.queue.lock().unwrap().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        // Other activity does not replace the pinned question.
+        screen.lock().await.update_status();
+        assert!(bar.text().starts_with("? code · coder#1"), "{}", bar.text());
+        inbox.answer("y").await;
+        assert!(bar.text().starts_with("? spec · spec wants write_doc"), "the next question is pinned: {}", bar.text());
+        inbox.answer("n").await;
+        assert_eq!(bar.text(), "▸ code: idle  │  spec: idle", "unpinned once answered");
+        assert_eq!((h1.await.unwrap(), h2.await.unwrap()), (Decision::Allow, Decision::Deny));
     }
 }
