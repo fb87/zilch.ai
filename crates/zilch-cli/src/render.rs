@@ -283,14 +283,6 @@ impl Screen {
         }
     }
 
-    pub(crate) fn lane_label(&self, root: &str) -> &'static str {
-        if self.color {
-            lane_icon(root)
-        } else {
-            Self::lane_name(root)
-        }
-    }
-
     fn lane_name(root: &str) -> &'static str {
         if root == "spec" {
             "spec"
@@ -401,22 +393,18 @@ impl Screen {
         let mut busy = false;
         let mut cells = Vec::new();
         for root in ["master", "spec"] {
-            let name = self.lane_label(root);
+            // On a terminal the lane's icon goes before its name.
+            let name =
+                if self.color { format!("{} {}", lane_icon(root), Self::lane_name(root)) } else { Self::lane_name(root).to_string() };
             let active = self.active == root;
             let mark = if active { "▸ " } else { "" };
             match self.lane_status(root) {
                 Some(s) => {
                     busy = true;
                     let color = if root == "spec" { YELLOW } else { CYAN };
-                    cells.push(format!(
-                        "{} {mark}{name}{}{}{s}{}",
-                        self.spinner(color),
-                        if self.color { " " } else { ": " },
-                        self.c(DIM),
-                        self.c(RESET)
-                    ));
+                    cells.push(format!("{} {mark}{name}: {}{s}{}", self.spinner(color), self.c(DIM), self.c(RESET)));
                 }
-                None => cells.push(format!("{}{mark}{name} idle{}", self.c(DIM), self.c(RESET))),
+                None => cells.push(format!("{}{mark}{name}: idle{}", self.c(DIM), self.c(RESET))),
             }
         }
         let sep = format!("{}  │  {}", self.c(DIM), self.c(RESET));
@@ -670,13 +658,13 @@ fn summary_line(report: &str) -> Option<String> {
         .or_else(|| report.lines().next().map(|s| s.chars().take(100).collect()))
 }
 
-/// The lane's symbol on a terminal: a keyboard for the code lane, a pencil for the spec lane
-/// (both one column wide, text presentation).
+/// The lane's symbol on a terminal: joined frames for the code lane, a hexagon (structure,
+/// architecture) for the spec lane. Both one column wide, text presentation.
 pub fn lane_icon(root: &str) -> &'static str {
     if root == "spec" {
-        "\u{270E}" // ✎
+        "\u{232C}" // ⌬
     } else {
-        "\u{2328}" // ⌨
+        "\u{29C9}" // ⧉
     }
 }
 
@@ -914,10 +902,10 @@ mod tests {
         let bar = Arc::new(crate::status::StatusBar::default());
         s.status_bar = Some(bar.clone());
         s.update_status();
-        assert_eq!(bar.text(), "▸ code idle  │  spec idle");
+        assert_eq!(bar.text(), "▸ code: idle  │  spec: idle");
 
         s.handle(ev("spec", EventKind::Thinking));
-        assert!(bar.text().contains("code idle") && bar.text().contains("spec: thinking · 0s"), "{}", bar.text());
+        assert!(bar.text().contains("code: idle") && bar.text().contains("spec: thinking · 0s"), "{}", bar.text());
         s.handle(ev("coder#1", EventKind::DelegateStart { worker: "coder#1".into(), task: "build".into() }));
         s.handle(ev("coder#1", EventKind::ToolStart { call_id: "c".into(), name: "bash".into(), summary: "cargo test".into() }));
         s.handle(ev("coder#1", EventKind::ToolProgress { call_id: String::new(), line: "running 12 tests".into() }));
@@ -932,7 +920,7 @@ mod tests {
         s.handle(ev("coder#1", EventKind::Idle));
         s.handle(ev("coder#1", EventKind::DelegateEnd { worker: "coder#1".into(), ok: true }));
         s.handle(ev("spec", EventKind::Idle));
-        assert_eq!(bar.text(), "▸ code idle  │  spec idle");
+        assert_eq!(bar.text(), "▸ code: idle  │  spec: idle");
     }
 
     #[tokio::test]
@@ -944,9 +932,9 @@ mod tests {
         s.status_bar = Some(bar.clone());
         s.update_status();
         let plain = crate::wrap::visible(&bar.text());
-        assert_eq!(plain, "▸ ⌨ idle  │  ✎ idle");
+        assert_eq!(plain, "▸ ⧉ code: idle  │  ⌬ spec: idle");
         s.handle(ev("spec", EventKind::Thinking));
         let plain = crate::wrap::visible(&bar.text());
-        assert!(plain.contains("✎ thinking") && !plain.contains("spec"), "{plain}");
+        assert!(plain.contains("⌬ spec: thinking"), "{plain}");
     }
 }
