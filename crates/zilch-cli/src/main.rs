@@ -4,7 +4,11 @@ mod ipc;
 mod lanes;
 mod log;
 mod render;
+mod status;
 mod wrap;
+
+/// The REPL line editor; its helper draws the live status bar above the input line.
+type LineEditor = rustyline::Editor<status::StatusHelper, rustyline::history::DefaultHistory>;
 
 use anyhow::{bail, Result};
 use clap::Parser;
@@ -191,7 +195,7 @@ async fn real_main() -> Result<i32> {
     let tty = std::io::stdout().is_terminal();
     // In -p mode progress goes to stderr and the final answer to stdout. In the REPL, output is
     // printed above the live input line (both lanes can produce output while the user types).
-    let mut editor = if one_shot { None } else { Some(rustyline::DefaultEditor::new()?) };
+    let mut editor: Option<LineEditor> = if one_shot { None } else { Some(LineEditor::new()?) };
     let out: Box<dyn std::io::Write + Send> = match editor.as_mut() {
         None => Box::new(std::io::stderr()),
         Some(rl) => Box::new(render::PrinterOut::new(Box::new(rl.create_external_printer()?))),
@@ -202,6 +206,16 @@ async fn real_main() -> Result<i32> {
         let mut s = screen.lock().await;
         s.live_panel = false; // cursor movement would corrupt the line being typed
         s.lanes = true;
+        // Live status above the input line (needs color/escapes; otherwise heartbeat lines).
+        if color {
+            if let Some(rl) = editor.as_mut() {
+                let bar = Arc::new(status::StatusBar::default());
+                rl.set_helper(Some(status::StatusHelper(bar.clone())));
+                status::spawn_refresher(bar.clone(), Box::new(rl.create_external_printer()?));
+                s.status_bar = Some(bar);
+                s.update_status();
+            }
+        }
     }
 
     let mut event_log = None;
@@ -390,7 +404,7 @@ async fn repl(
     screen: SharedScreen,
     log_path: Option<std::path::PathBuf>,
     recap: Option<String>,
-    mut rl: rustyline::DefaultEditor,
+    mut rl: LineEditor,
     inbox: Arc<inbox::Inbox>,
 ) -> Result<()> {
     banner(&team, &screen).await;
@@ -427,11 +441,20 @@ async fn repl(
         }
     };
 
+    let bar = screen.lock().await.status_bar.clone();
     loop {
-        // Just the lane: a prompt cannot be updated once shown, so busy markers would go stale
-        // the moment a lane finishes. Finish notices and /status cover activity.
-        let prompt = inbox.prompt().map(str::to_string).unwrap_or_else(|| format!("[{}] › ", lanes.active().name()));
-        let line = match tokio::task::block_in_place(|| rl.readline(&prompt)) {
+        // The prompt itself only names the lane; live activity is drawn in the status row above
+        // it (the leading "\n" reserves that row, see status.rs).
+        let row = if bar.is_some() { "\n" } else { "" };
+        let prompt = inbox.prompt().map(str::to_string).unwrap_or_else(|| format!("{row}[{}] › ", lanes.active().name()));
+        if let Some(b) = &bar {
+            b.reading.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let read = tokio::task::block_in_place(|| rl.readline(&prompt));
+        if let Some(b) = &bar {
+            b.reading.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        let line = match read {
             Ok(l) => l,
             Err(rustyline::error::ReadlineError::Interrupted) => {
                 // Ctrl-C cancels the active lane's running turn (the other lane keeps going).

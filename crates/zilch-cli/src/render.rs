@@ -49,6 +49,8 @@ pub struct Screen {
     wrapper: crate::wrap::Wrapper,
     /// Streamed master text not yet ending in a newline (printed, wrapped, line by line).
     master_buf: String,
+    /// REPL status bar above the input line (None: plain output, heartbeat lines instead).
+    pub status_bar: Option<Arc<crate::status::StatusBar>>,
 }
 
 pub type SharedScreen = Arc<Mutex<Screen>>;
@@ -95,6 +97,7 @@ impl Screen {
             background_answer: HashMap::new(),
             wrapper: Default::default(),
             master_buf: String::new(),
+            status_bar: None,
         }))
     }
 
@@ -224,6 +227,11 @@ impl Screen {
         if self.busy.is_empty() {
             return;
         }
+        if self.status_bar.is_some() {
+            // The REPL status bar shows spinners and timers live; no heartbeat lines needed.
+            self.update_status();
+            return;
+        }
         if self.color && self.live_panel {
             if self.at_line_start {
                 self.clear_panel();
@@ -328,6 +336,68 @@ impl Screen {
     }
 
     pub fn handle(&mut self, ev: AgentEvent) {
+        self.handle_event(ev);
+        self.update_status();
+    }
+
+    /// What one lane is doing, for the status bar; None when it is idle.
+    fn lane_status(&self, root: &str) -> Option<String> {
+        let agents: Vec<&String> = self.busy.keys().filter(|a| Self::lane_of(a) == root).collect();
+        let running: Vec<&Todo> = self.todos.iter().filter(|t| t.status == TodoStatus::InProgress).collect();
+        let team = root == "master" && (!running.is_empty() || !self.delegations.is_empty());
+        if agents.is_empty() && !team {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if team {
+            let working = running.len() + self.delegations.len();
+            parts.push(format!("{working} working"));
+            if !self.todos.is_empty() {
+                let done = self.todos.iter().filter(|t| t.status == TodoStatus::Done).count();
+                parts.push(format!("{done}/{} TODOs", self.todos.len()));
+            }
+        }
+        // The longest-running worker activity, else the lane root's own.
+        let worker = agents.iter().filter(|a| a.as_str() != root).max_by_key(|a| self.busy[a.as_str()].since.elapsed());
+        match worker {
+            Some(w) => parts.push(format!("{w} {}", self.activity_line(w))),
+            None if self.busy.contains_key(root) => parts.push(self.activity_line(root)),
+            None => {}
+        }
+        Some(parts.join(" · "))
+    }
+
+    /// Refresh the REPL status bar text (cheap; called on every event and tick).
+    pub fn update_status(&mut self) {
+        let Some(bar) = self.status_bar.clone() else { return };
+        let mut busy = false;
+        let mut cells = Vec::new();
+        for root in ["master", "spec"] {
+            let name = Self::lane_name(root);
+            let active = self.active == root;
+            let mark = if active { "▸ " } else { "" };
+            match self.lane_status(root) {
+                Some(s) => {
+                    busy = true;
+                    let color = if root == "spec" { YELLOW } else { CYAN };
+                    cells.push(format!(
+                        "{} {}{mark}{name}{}: {}{s}{}",
+                        self.spinner(color),
+                        self.c(BOLD),
+                        self.c(RESET),
+                        self.c(DIM),
+                        self.c(RESET)
+                    ));
+                }
+                None => cells.push(format!("{}{mark}{name} idle{}", self.c(DIM), self.c(RESET))),
+            }
+        }
+        let sep = format!("{}  │  {}", self.c(DIM), self.c(RESET));
+        let text = clip(&cells.join(&sep), terminal_width(self.fd));
+        bar.set(text, busy);
+    }
+
+    fn handle_event(&mut self, ev: AgentEvent) {
         if self.lanes && !self.route_background(&ev) {
             return;
         }
@@ -790,5 +860,34 @@ mod tests {
         s.tick(); // same 30s window: printed once
         assert_eq!(buf.text().matches("still running bash(npm test) (31s)").count(), 1, "{}", buf.text());
         assert!(!buf.text().contains('\u{241b}'), "no ANSI escapes in plain mode");
+    }
+
+    #[tokio::test]
+    async fn repl_status_bar_follows_both_lanes() {
+        let screen = Screen::new(Box::new(Buf::default()), -1, false, false, true);
+        let mut s = screen.lock().await;
+        s.lanes = true;
+        let bar = Arc::new(crate::status::StatusBar::default());
+        s.status_bar = Some(bar.clone());
+        s.update_status();
+        assert_eq!(bar.text(), "▸ code idle  │  spec idle");
+
+        s.handle(ev("spec", EventKind::Thinking));
+        assert!(bar.text().contains("code idle") && bar.text().contains("spec: thinking · 0s"), "{}", bar.text());
+        s.handle(ev("coder#1", EventKind::DelegateStart { worker: "coder#1".into(), task: "build".into() }));
+        s.handle(ev("coder#1", EventKind::ToolStart { call_id: "c".into(), name: "bash".into(), summary: "cargo test".into() }));
+        s.handle(ev("coder#1", EventKind::ToolProgress { call_id: String::new(), line: "running 12 tests".into() }));
+        let t = bar.text();
+        assert!(t.contains("▸ code: 1 working · coder#1 bash(cargo test) · 0s · running 12 tests"), "{t}");
+        assert!(t.contains(" s"), "spec cell still present (clipped at 80 columns): {t}");
+
+        // Ticks keep it current while busy; finishing returns both lanes to idle.
+        s.busy.get_mut("coder#1").unwrap().since = Instant::now() - std::time::Duration::from_secs(42);
+        s.tick();
+        assert!(bar.text().contains("42s"), "{}", bar.text());
+        s.handle(ev("coder#1", EventKind::Idle));
+        s.handle(ev("coder#1", EventKind::DelegateEnd { worker: "coder#1".into(), ok: true }));
+        s.handle(ev("spec", EventKind::Idle));
+        assert_eq!(bar.text(), "▸ code idle  │  spec idle");
     }
 }
