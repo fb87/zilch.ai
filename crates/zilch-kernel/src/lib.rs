@@ -482,6 +482,16 @@ pub struct Kernel {
     exec: Pool,
 }
 
+/// Sends commands to the kernel from any thread.
+#[derive(Clone)]
+pub struct Commander(Sender<KEvent>);
+
+impl Commander {
+    pub fn send(&self, cmd: Cmd) {
+        let _ = self.0.send(KEvent::Cmd(cmd));
+    }
+}
+
 /// The CLI's handle on a running kernel.
 pub struct KernelHandle {
     tx: Sender<KEvent>,
@@ -492,6 +502,10 @@ pub struct KernelHandle {
 impl KernelHandle {
     pub fn send(&self, cmd: Cmd) {
         let _ = self.tx.send(KEvent::Cmd(cmd));
+    }
+    /// A cloneable sender for other threads (an editor link) to place orders with.
+    pub fn commander(&self) -> Commander {
+        Commander(self.tx.clone())
     }
     /// Send the guest's `text` to a process or group; Ok says when it will be read.
     pub fn tell(&self, target: Target, text: &str) -> Result<String, String> {

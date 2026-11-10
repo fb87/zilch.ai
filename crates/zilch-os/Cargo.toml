@@ -22,3 +22,8 @@ rustyline = "15"
 unicode-width = "0.2"
 libc = "0.2"
 dirs = "5"
+serde = { workspace = true }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

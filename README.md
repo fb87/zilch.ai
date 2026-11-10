@@ -188,6 +188,11 @@ design and plan are stamped with the spec version they derive from. `/code` swit
 main agent works from the spec lane's design and plan. Both lanes run in parallel and are saved
 with the session. `@spec text` reaches the spec agent; `/status` shows the documents' state.
 
+**Editor link.** The REPL listens on a local socket (Linux: an abstract socket, nothing on disk;
+elsewhere a socket file in a private directory; only your user can connect) and writes its address
+to `.zilch/ipc`. The Neovim plugin in `editor/nvim` (`:ZilchSend`) sends a selection plus a comment,
+which becomes an order in the requested lane or the active one.
+
 **Sessions.** After every served order the main agent's conversation is saved under
 `<data dir>/zilch/os-sessions/` (one directory per workspace, files mode 0600). `zilch-os -c`
 continues the most recent session of the current directory: the main agent remembers it and order

@@ -3,6 +3,7 @@
 //! It never waits on the agents: the kernel runs on its own threads and reports on the event bus.
 
 mod costs;
+mod ipc;
 #[allow(dead_code)] // ported whole from zilch-cli; streaming parts come later
 mod markdown;
 mod status;
@@ -605,6 +606,55 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             std::thread::sleep(Duration::from_millis(100));
         })?;
     }
+    // Editor link (Neovim: :ZilchSend): a selection plus a comment arrives over a local socket and
+    // becomes an order in the requested lane (or the active one).
+    let ipc_printer = Mutex::new(rl.create_external_printer()?);
+    let commander = kernel.commander();
+    let (v_submit, v_status, spec_dir) = (view.clone(), view.clone(), cfg.spec_dir.clone());
+    let hooks = Arc::new(ipc::Hooks {
+        submit: Box::new(move |lane, msg| {
+            let lane = match lane {
+                None => *v_submit.lane.lock().unwrap(),
+                Some("code") => Group::Architecture,
+                Some("spec") => Group::Spec,
+                Some(l) => return Err(format!("unknown lane '{l}' (code | spec)")),
+            };
+            let name = if lane == Group::Spec { "spec" } else { "code" };
+            let first: String = msg.lines().last().unwrap_or("").chars().take(100).collect();
+            let loc = msg.lines().next().and_then(|l| l.strip_prefix("[From the editor] ")).map(|l| format!(" {l}")).unwrap_or_default();
+            let echo = format!("{}◆ editor → {name} lane{loc}:{} {first}\n", v_submit.c(CYAN), v_submit.c(RESET));
+            let _ = rustyline::ExternalPrinter::print(&mut *ipc_printer.lock().unwrap(), echo);
+            commander.send(Cmd::OrderTo(lane, msg));
+            Ok(name.to_string())
+        }),
+        status: Box::new(move || {
+            let live = v_status.live.lock().unwrap();
+            let state = |g: Group| {
+                let busy = live.values().any(|l| l.group == g && (l.state == "running" || l.state == "blocked(io)"));
+                if busy {
+                    "working"
+                } else {
+                    "idle"
+                }
+            };
+            let active = if *v_status.lane.lock().unwrap() == Group::Spec { "spec" } else { "code" };
+            serde_json::json!({"ok": true, "active": active, "code": state(Group::Architecture), "spec": state(Group::Spec), "docs": spec_status(&spec_dir)})
+        }),
+    });
+    let _ipc = match ipc::serve(hooks, &cwd) {
+        Ok(Some(guard)) => {
+            println!("{}editor link: {} (Neovim: :ZilchSend){}", view.c(DIM), guard.endpoint, view.c(RESET));
+            Some(guard)
+        }
+        Ok(None) => {
+            println!("{}editor link: another zilch already serves this workspace; not listening{}", view.c(DIM), view.c(RESET));
+            None
+        }
+        Err(e) => {
+            println!("editor link unavailable: {e}");
+            None
+        }
+    };
     let v = view.clone();
     std::thread::Builder::new().name("zilch-os-view".into()).spawn(move || {
         for env in events.iter() {
