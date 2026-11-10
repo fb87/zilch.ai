@@ -166,8 +166,12 @@ only its task's `owned_paths`; the Architect can write only `docs/`. When every 
 Architect checks the result and the order is served.
 
 LLM calls and tool calls are both syscalls, so step workers never wait on the network. Every
-syscall result goes to the event log, which is the data a replay needs. A process that stops
-making progress is interrupted, and then killed. `zilch-os` reads the same config files as `zilch`,
+syscall result goes to the event log, which is the data a replay needs. The supervisor compares
+steps after removing what changes from run to run (durations, timestamps, temp paths, addresses).
+A process that loops is nudged first; if it loops again, it is restarted with a summary of what
+it tried (built in code, no extra model call), at most twice in 10 minutes, and then stopped. A
+process that stops making progress is interrupted, then restarted or killed. When every process
+of an order waits for a message nobody can send, the youngest one is woken with an error. `zilch-os` reads the same config files as `zilch`,
 mapping `[roles.master]` to the Architect and `[roles.coder]` to the Developer.
 
 ```sh

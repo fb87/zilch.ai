@@ -199,6 +199,8 @@ pub enum Signal {
     Warn,
     /// In-flight calls cancelled, the process keeps running.
     Interrupt,
+    /// Conversation discarded; the process starts its task again with a summary.
+    Restart,
     /// The process is stopped.
     Kill,
 }

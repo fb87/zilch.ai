@@ -2625,6 +2625,7 @@ name = "zilch-kernel"
 version = "0.1.3"
 dependencies = [
  "globset",
+ "regex",
  "serde_json",
  "zilch-ipc",
 ]

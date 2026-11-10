@@ -11,3 +11,5 @@ description = "zilch OS kernel: process table, scheduler with timer tick, syscal
 zilch-ipc = { path = "../zilch-ipc" }
 serde_json.workspace = true
 globset = "0.4"
+# Supervisor: normalizing outputs before comparing them (loop detection).
+regex = "1"

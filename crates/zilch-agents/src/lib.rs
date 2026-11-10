@@ -43,6 +43,9 @@ enum Phase {
 pub struct LlmAgent {
     binding: ModelBinding,
     system: String,
+    /// The task as first given (a restart starts from it again).
+    task: String,
+    /// The first message of the current attempt: the task, plus a restart summary after a restart.
     input: String,
     tools: Vec<ToolSpec>,
     session: String,
@@ -56,7 +59,18 @@ pub struct LlmAgent {
 
 impl LlmAgent {
     pub fn new(binding: ModelBinding, system: String, input: String, tools: Vec<ToolSpec>, session: String) -> Self {
-        Self { binding, system, input, tools, session, messages: vec![], phase: Phase::Start, calls: vec![], local: vec![] }
+        Self {
+            binding,
+            system,
+            task: input.clone(),
+            input,
+            tools,
+            session,
+            messages: vec![],
+            phase: Phase::Start,
+            calls: vec![],
+            local: vec![],
+        }
     }
 
     fn request(&self) -> Syscall {
@@ -109,6 +123,15 @@ impl LlmAgent {
 }
 
 impl Agent for LlmAgent {
+    fn restart(&mut self, summary: &str) -> bool {
+        self.messages.clear();
+        self.calls.clear();
+        self.local.clear();
+        self.input = format!("{}\n\n{summary}", self.task);
+        self.phase = Phase::Start;
+        true
+    }
+
     fn step(&mut self, view: &AcbView, wake: Vec<SyscallResult>) -> StepResult {
         let result = match self.phase {
             Phase::Start => {

@@ -52,6 +52,34 @@ fn hash_of(parts: &[&str]) -> u64 {
     h.finish()
 }
 
+/// Output with the parts that change on every run of the same thing removed, so a real loop is
+/// not missed because a duration, timestamp, temp path or address differs: colour codes, times and
+/// dates, durations ("finished in 3.21s"), hex addresses, temp paths, process ids, extra whitespace.
+pub fn normalize_output(s: &str) -> String {
+    use std::sync::OnceLock;
+    static RULES: OnceLock<Vec<(regex::Regex, &'static str)>> = OnceLock::new();
+    let rules = RULES.get_or_init(|| {
+        [
+            (r"\x1b\[[0-9;?]*[A-Za-z]", ""),
+            (r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?", "<time>"),
+            (r"\b\d{1,2}:\d{2}:\d{2}(\.\d+)?\b", "<time>"),
+            (r"\b\d+(\.\d+)?\s?(ns|µs|us|ms|s|secs?|seconds?|m|min|minutes?)\b", "<dur>"),
+            (r"\b0x[0-9a-fA-F]{4,}\b", "<addr>"),
+            (r#"(/tmp|/var/folders|/private/var/folders)/[^\s:'"]+"#, "<tmp>"),
+            (r"\b(?i:pid)[ :=#]*\d+", "pid <n>"),
+            (r"[ \t]+", " "),
+        ]
+        .into_iter()
+        .map(|(p, r)| (regex::Regex::new(p).expect("valid pattern"), r))
+        .collect()
+    });
+    let mut out = s.trim().to_string();
+    for (re, with) in rules {
+        out = re.replace_all(&out, *with).into_owned();
+    }
+    out
+}
+
 /// Arguments compared by meaning, not formatting (`{"a":1, "b":2}` = `{"b":2,"a":1}`).
 fn canonical_args(raw: &str) -> String {
     serde_json::from_str::<serde_json::Value>(raw).map(|v| v.to_string()).unwrap_or_else(|_| raw.trim().to_string())
@@ -71,16 +99,17 @@ impl Supervisor {
         if !self.enabled() {
             return Verdict::Ok;
         }
-        let mut step_parts: Vec<String> = vec![text.trim().to_string()];
+        let mut step_parts: Vec<String> = vec![normalize_output(text)];
         let mut repeated: Option<(String, usize)> = None;
         for c in calls {
             let args = canonical_args(c.arguments);
-            let n = self.calls.entry(hash_of(&[c.name, &args, c.result])).or_default();
+            let result = normalize_output(c.result);
+            let n = self.calls.entry(hash_of(&[c.name, &args, &result])).or_default();
             *n += 1;
             if *n >= self.limit && repeated.as_ref().is_none_or(|(_, m)| *n > *m) {
                 repeated = Some((c.name.to_string(), *n));
             }
-            step_parts.extend([c.name.to_string(), args, c.result.to_string()]);
+            step_parts.extend([c.name.to_string(), args, result]);
         }
         let parts: Vec<&str> = step_parts.iter().map(String::as_str).collect();
         let step_n = {
@@ -268,5 +297,29 @@ mod tests {
         for _ in 0..100 {
             assert!(!g.push("────────────────────────────────────────"), "a long rule is not a loop");
         }
+    }
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::*;
+
+    #[test]
+    fn outputs_differing_only_in_noise_count_as_the_same_loop() {
+        let run = |dur: &str, tmp: &str, at: &str, pid: u32| {
+            format!("\x1b[1mtest result:\x1b[0m FAILED. 0 passed; 1 failed; finished in {dur}\n  at {at} pid={pid}\n  wrote {tmp}/out.log  0x7ffe{pid:04x}")
+        };
+        let a = run("3.21s", "/tmp/.tmpAbC123", "2026-11-10T12:00:01Z", 4242);
+        let b = run("0.98s", "/tmp/.tmpXyZ789", "2026-11-10T12:03:59Z", 5151);
+        assert_eq!(normalize_output(&a), normalize_output(&b));
+        assert_ne!(normalize_output("3 tests failed"), normalize_output("4 tests failed"), "real differences stay");
+
+        let mut s = Supervisor::new(3);
+        let outs = [a.clone(), b.clone(), run("12ms", "/tmp/x", "09:00:00", 1)];
+        let mut verdict = Verdict::Ok;
+        for o in &outs {
+            verdict = s.observe("", &[CallRecord { name: "bash", arguments: r#"{"command":"cargo test"}"#, result: o }]);
+        }
+        assert!(matches!(verdict, Verdict::Nudge(_)), "{verdict:?}");
     }
 }

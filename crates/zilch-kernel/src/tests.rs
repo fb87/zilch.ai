@@ -336,3 +336,118 @@ fn higher_priority_runs_first_and_waiting_work_ages_upward() {
     assert_eq!(k.acbs[&low].priority, 1, "aged one level");
     assert_eq!((k.pick_next(), k.pick_next(), k.pick_next()), (Some(high), Some(mid), Some(low)));
 }
+
+/// A developer that loops (or hangs) until it is restarted `cure_after` times, then reports done.
+/// It records every restart summary it gets.
+struct Stubborn {
+    restarts: usize,
+    cure_after: usize,
+    hang: bool,
+    summaries: Arc<Mutex<Vec<String>>>,
+}
+
+impl Agent for Stubborn {
+    fn step(&mut self, _view: &AcbView, _wake: Vec<SyscallResult>) -> StepResult {
+        if self.restarts >= self.cure_after {
+            return match _wake.is_empty() {
+                true => StepResult::Syscalls(vec![tool("work", json!({}))]),
+                false => StepResult::Exit(ExitStatus::ok("fixed it\nSTATUS: done")),
+            };
+        }
+        let name = if self.hang { "hang" } else { "same" };
+        StepResult::Syscalls(vec![tool(name, json!({"q": 1}))])
+    }
+    fn restart(&mut self, summary: &str) -> bool {
+        self.restarts += 1;
+        self.summaries.lock().unwrap().push(summary.to_string());
+        true
+    }
+}
+
+fn stubborn(cure_after: usize, hang: bool, summaries: Arc<Mutex<Vec<String>>>) -> DevScript {
+    Arc::new(move |_| Box::new(Stubborn { restarts: 0, cure_after, hang, summaries: summaries.clone() }))
+}
+
+#[test]
+fn a_loop_that_survives_the_nudge_is_restarted_with_a_summary_of_what_was_tried() {
+    let summaries: Arc<Mutex<Vec<String>>> = Arc::default();
+    let mut run = Run::new(
+        cfg(),
+        Arc::new(FakeDrivers::default()),
+        Book { tasks: vec![task("T1", &[], &["a"])], dev: stubborn(1, false, summaries.clone()) },
+    );
+    run.k.send(Cmd::Order("x".into()));
+    let (ok, summary) = run.served();
+    assert!(ok && summary.contains("fixed it"), "{summary}");
+    assert!(run
+        .seen
+        .iter()
+        .any(|e| matches!(e, KernelEvent::Signal { pid: 2, signal: Signal::Restart, reason } if reason.contains("1 of 2"))));
+    let s = summaries.lock().unwrap();
+    assert_eq!(s.len(), 1);
+    assert!(
+        s[0].contains("same arguments") && s[0].contains("same(") && s[0].contains("→ same result"),
+        "the summary says what was tried: {}",
+        s[0]
+    );
+}
+
+#[test]
+fn restarts_are_limited_then_the_process_is_stopped() {
+    let summaries: Arc<Mutex<Vec<String>>> = Arc::default();
+    let k = KernelConfig { max_restarts: 1, ..cfg() };
+    let mut run = Run::new(
+        k,
+        Arc::new(FakeDrivers::default()),
+        Book { tasks: vec![task("T1", &[], &["a"])], dev: stubborn(usize::MAX, false, summaries.clone()) },
+    );
+    run.k.send(Cmd::Order("x".into()));
+    let (_, summary) = run.served();
+    assert_eq!(summaries.lock().unwrap().len(), 1, "one restart allowed");
+    assert!(summary.contains("stopped by the supervisor") && summary.contains("Failed"), "{summary}");
+}
+
+#[test]
+fn a_hung_process_that_can_restart_gets_a_fresh_start_instead_of_a_kill() {
+    let summaries: Arc<Mutex<Vec<String>>> = Arc::default();
+    let k = KernelConfig { hang_ticks: 10, ..cfg() };
+    let mut run = Run::new(
+        k,
+        Arc::new(FakeDrivers::default()),
+        Book { tasks: vec![task("T1", &[], &["a"])], dev: stubborn(1, true, summaries.clone()) },
+    );
+    run.k.send(Cmd::Order("x".into()));
+    let (ok, summary) = run.served();
+    assert!(ok && summary.contains("fixed it"), "{summary}");
+    assert!(run.seen.iter().any(|e| matches!(e, KernelEvent::Signal { signal: Signal::Interrupt, .. })));
+    assert!(run
+        .seen
+        .iter()
+        .any(|e| matches!(e, KernelEvent::Signal { signal: Signal::Restart, reason, .. } if reason.contains("no progress"))));
+    assert!(!run.seen.iter().any(|e| matches!(e, KernelEvent::Signal { signal: Signal::Kill, .. })));
+}
+
+#[test]
+fn processes_waiting_on_each_other_are_woken_instead_of_waiting_forever() {
+    // Both developers wait for a message; nobody will ever send one.
+    let dev: DevScript = Arc::new(|_| {
+        Box::new(Scripted(0, |n, wake, _| match n {
+            1 => StepResult::Syscalls(vec![Syscall::Recv]),
+            _ => StepResult::Exit(ExitStatus::ok(format!("gave up: {}\nSTATUS: done", wake[0].text()))),
+        }))
+    });
+    let mut run =
+        Run::new(cfg(), Arc::new(FakeDrivers::default()), Book { tasks: vec![task("T1", &[], &["a"]), task("T2", &[], &["b"])], dev });
+    run.k.send(Cmd::Order("x".into()));
+    let (_, summary) = run.served();
+    assert_eq!(summary.matches("gave up: Error: deadlock").count(), 2, "{summary}");
+    let order: Vec<Pid> = run
+        .seen
+        .iter()
+        .filter_map(|e| match e {
+            KernelEvent::Signal { pid, reason, .. } if reason.starts_with("deadlock") => Some(*pid),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order, vec![3, 2], "the youngest waiter is woken first");
+}

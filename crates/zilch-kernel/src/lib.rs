@@ -56,6 +56,11 @@ pub enum StepResult {
 /// the process goes through syscalls.
 pub trait Agent: Send {
     fn step(&mut self, view: &AcbView, wake: Vec<SyscallResult>) -> StepResult;
+    /// Supervisor restart: drop the conversation, keep the task, and start again with `summary`
+    /// (what was tried and why it was stopped). Return false if this program cannot restart.
+    fn restart(&mut self, _summary: &str) -> bool {
+        false
+    }
 }
 
 /// What a tool call would touch, for the capability check.
@@ -131,6 +136,9 @@ pub struct KernelConfig {
     pub auto_approve: bool,
     /// Ticks a process may wait in a lower queue before it moves up one level.
     pub age_ticks: u64,
+    /// Supervisor restarts allowed per process within `restart_window_ticks`; beyond that it is stopped.
+    pub max_restarts: usize,
+    pub restart_window_ticks: u64,
 }
 
 impl Default for KernelConfig {
@@ -147,6 +155,8 @@ impl Default for KernelConfig {
             max_tokens: None,
             auto_approve: false,
             age_ticks: 50,
+            max_restarts: 2,
+            restart_window_ticks: 6000, // 10 minutes at 100 ms
         }
     }
 }
@@ -293,6 +303,10 @@ struct Acb {
     batch_interrupted: bool,
     supervisor: Supervisor,
     last_text: String,
+    /// What the last steps did, newest last (the summary a restart starts from).
+    ring: VecDeque<String>,
+    /// Ticks of past restarts (restart intensity).
+    restarts: Vec<u64>,
 }
 
 struct TaskRun {
@@ -367,6 +381,8 @@ impl Drop for Pool {
 
 const QUEUES: usize = 4;
 const MAILBOX_CAP: usize = 32;
+/// Steps remembered per process for a restart summary.
+const RING: usize = 12;
 
 pub struct Kernel {
     cfg: KernelConfig,
@@ -572,6 +588,8 @@ impl Kernel {
                 batch_interrupted: false,
                 supervisor: Supervisor::new(self.cfg.loop_limit),
                 last_text: String::new(),
+                ring: VecDeque::new(),
+                restarts: vec![],
             },
         );
         self.bus.publish(KernelEvent::Spawned { pid, parent, ticket, group, title });
@@ -850,6 +868,19 @@ impl Kernel {
                 verdict = a.supervisor.observe(&text, &records);
             }
         }
+        // The step log a restart summary is built from.
+        let first = |s: &str| s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").chars().take(120).collect::<String>();
+        for (f, r) in inflight.iter().zip(&results) {
+            let line = match r {
+                SyscallResult::Completion { message, .. } if message.tool_calls.is_empty() => format!("replied: {}", first(message.text())),
+                SyscallResult::Completion { .. } => continue,
+                r => format!("{} → {}", f.summary, first(&r.text())),
+            };
+            a.ring.push_back(line);
+            if a.ring.len() > RING {
+                a.ring.pop_front();
+            }
+        }
         a.wake = results;
         match verdict {
             Verdict::Ok => {}
@@ -858,12 +889,60 @@ impl Kernel {
                 self.bus.publish(KernelEvent::Signal { pid, signal: Signal::Warn, reason: format!("looping: {reason} — nudged") });
             }
             Verdict::Stop(reason) => {
+                if self.restart(pid, &reason) {
+                    return;
+                }
                 let report = format!("{} it {reason}, again after a warning]\nSTATUS: failed", supervisor::STOPPED_BY_SUPERVISOR);
                 self.finish(pid, ExitStatus::failed(report), State::Killed);
                 return;
             }
         }
         self.enqueue(pid);
+    }
+
+    /// Supervisor restart: invalidate what is in flight, give the program a fresh start with a
+    /// summary of what it tried (built from the step log, no model call), and run it again.
+    /// False when the program cannot restart or used up its restarts for the window.
+    fn restart(&mut self, pid: Pid, reason: &str) -> bool {
+        let (tick, window, max) = (self.tick, self.cfg.restart_window_ticks, self.cfg.max_restarts);
+        let Some(a) = self.acbs.get_mut(&pid) else { return false };
+        a.restarts.retain(|t| tick.saturating_sub(*t) < window);
+        if a.restarts.len() >= max || !a.state.alive() {
+            return false;
+        }
+        let Some(agent) = a.agent.as_mut() else { return false };
+        let tried: String = a.ring.iter().map(|l| format!("- {l}\n")).collect();
+        let summary = format!(
+            "[supervisor] Your previous attempt at this task was stopped because you {reason}, again after a warning. \
+             Its conversation was discarded; files it changed stay changed. What it did, most recent last:\n{tried}\n\
+             Start again from the task with a different approach. Do not repeat what failed."
+        );
+        if !agent.restart(&summary) {
+            return false;
+        }
+        a.restarts.push(tick);
+        a.batch += 1; // results still in flight are now stale
+        a.batch_cancel.cancel();
+        a.batch_interrupted = false;
+        a.inflight.clear();
+        a.pending.clear();
+        a.outstanding = 0;
+        a.parked_slot = None;
+        a.wake.clear();
+        a.notes.clear();
+        a.supervisor = Supervisor::new(self.cfg.loop_limit);
+        a.hang_strikes = 0;
+        a.last_progress = tick;
+        a.last_text.clear();
+        a.ring.clear();
+        let n = a.restarts.len();
+        self.bus.publish(KernelEvent::Signal {
+            pid,
+            signal: Signal::Restart,
+            reason: format!("{reason} — restarted with a summary ({n} of {max})"),
+        });
+        self.enqueue(pid);
+        true
     }
 
     // ── plans ──
@@ -1021,6 +1100,36 @@ impl Kernel {
         }
     }
 
+    /// An order is deadlocked when some of its processes wait for a message and none of the others
+    /// can ever send one: every live process waits on its mailbox or on its children, nothing is in
+    /// flight, and no question is open for the guest. The youngest waiting receiver is woken with an
+    /// error, so it can go on without the message (or report) instead of waiting forever.
+    fn break_deadlocks(&mut self) {
+        let tickets: Vec<TicketId> = self.tickets.iter().filter(|(_, t)| !t.served).map(|(id, _)| *id).collect();
+        for ticket in tickets {
+            let live: Vec<&Acb> = self.acbs.values().filter(|a| a.ticket == ticket && a.state.alive()).collect();
+            let stuck = !live.is_empty()
+                && live.iter().all(|a| matches!(a.state, State::Blocked(Block::Recv | Block::Child)))
+                && live.iter().any(|a| a.state == State::Blocked(Block::Recv));
+            if !stuck {
+                continue;
+            }
+            let Some(victim) = live.iter().filter(|a| a.state == State::Blocked(Block::Recv)).max_by_key(|a| a.born).map(|a| a.pid) else {
+                continue;
+            };
+            let waiting: Vec<String> = live.iter().filter(|a| a.state == State::Blocked(Block::Recv)).map(|a| a.pid.to_string()).collect();
+            self.bus.publish(KernelEvent::Signal {
+                pid: victim,
+                signal: Signal::Interrupt,
+                reason: format!("deadlock: processes {} all wait for messages nobody can send", waiting.join(", ")),
+            });
+            self.wake_parked(
+                victim,
+                SyscallResult::Failed("deadlock: every process of this order is waiting for a message and none can send one. Continue without it, or finish and report.".into()),
+            );
+        }
+    }
+
     // ── timer tick ──
 
     fn on_tick(&mut self) {
@@ -1055,8 +1164,11 @@ impl Kernel {
             });
         }
         for pid in kill {
-            self.kill(pid, "hung: no progress after an interrupt");
+            if !self.restart(pid, "made no progress, even after its calls were interrupted") {
+                self.kill(pid, "hung: no progress after an interrupt");
+            }
         }
+        self.break_deadlocks();
         // Aging: a process waiting too long in a lower queue moves up one level.
         if self.cfg.age_ticks > 0 && tick.is_multiple_of(self.cfg.age_ticks) {
             for level in 1..QUEUES {

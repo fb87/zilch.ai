@@ -172,3 +172,16 @@ fn invalid_tool_arguments_are_answered_without_a_syscall() {
     assert!(tail[1].contains("must be a JSON object") && tail[2].contains("invalid plan"));
     assert_eq!(tail[3], "[supervisor] stop repeating", "the nudge comes last, before the next reply");
 }
+
+#[test]
+fn a_restart_drops_the_conversation_and_starts_from_the_task_plus_summary() {
+    let mut a = LlmAgent::new(ModelBinding::default(), "s".into(), "Write a.txt".into(), vec![], "x".into());
+    let view = AcbView { pid: 1, ticket: 1, group: Group::Development, steps: 0, notes: vec![] };
+    a.step(&view, vec![]);
+    assert!(a.restart("[supervisor] you looped. What it did:\n- bash(x) → Error"));
+    let StepResult::Syscalls(calls) = a.step(&view, vec![]) else { panic!() };
+    let Syscall::Complete(req) = &calls[0] else { panic!() };
+    assert_eq!(req.messages.len(), 2, "system + the new first message only");
+    let first = req.messages[1].text();
+    assert!(first.starts_with("Write a.txt") && first.contains("you looped"), "{first}");
+}
