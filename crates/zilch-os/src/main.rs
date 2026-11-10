@@ -4,14 +4,16 @@
 
 #[allow(dead_code)] // ported whole from zilch-cli; streaming parts come later
 mod markdown;
+mod status;
 #[allow(dead_code)]
 mod wrap;
 
 use clap::Parser;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use zilch_agents::Book;
 use zilch_drivers::config::{Config, Overrides};
 use zilch_drivers::{DriverSet, ARCHITECT_TOOLS, DEVELOPER_TOOLS};
@@ -67,6 +69,20 @@ struct View {
     /// Plans waiting for the guest, oldest first: (qid, ticket).
     questions: Mutex<std::collections::VecDeque<(u64, TicketId)>>,
     open: Mutex<HashSet<TicketId>>,
+    /// Live processes for the status row.
+    live: Mutex<BTreeMap<Pid, Live>>,
+    /// A short message shown in the status row for a few seconds.
+    note: Mutex<Option<(String, Instant)>>,
+    started: Instant,
+}
+
+/// What the status row knows about one process.
+struct Live {
+    group: Group,
+    ticket: TicketId,
+    state: String,
+    /// What it is doing and since when.
+    doing: Option<(String, Instant)>,
 }
 
 impl View {
@@ -85,6 +101,79 @@ impl View {
 
     fn latest_open(&self) -> Option<TicketId> {
         self.open.lock().unwrap().iter().max().copied()
+    }
+
+    /// Keep the status row's picture of live processes up to date.
+    fn track(&self, ev: &KernelEvent) {
+        let mut live = self.live.lock().unwrap();
+        match ev {
+            KernelEvent::Spawned { pid, ticket, group, .. } => {
+                live.insert(*pid, Live { group: *group, ticket: *ticket, state: "ready".into(), doing: None });
+            }
+            KernelEvent::State { pid, state } => {
+                if let Some(l) = live.get_mut(pid) {
+                    l.state = state.clone();
+                    if state == "ready" || state == "running" {
+                        l.doing = None;
+                    }
+                }
+            }
+            KernelEvent::SyscallIssued { pid, summary, .. } => {
+                if let Some(l) = live.get_mut(pid) {
+                    let what = if summary.starts_with("llm ") { "thinking".to_string() } else { summary.clone() };
+                    // Several calls in one step: show the first, count the rest.
+                    l.doing = match l.doing.take() {
+                        Some((d, t)) if !d.ends_with(" more") && d != what => Some((format!("{d} +1 more"), t)),
+                        Some((d, t)) => Some((bump(&d), t)),
+                        None => Some((what, Instant::now())),
+                    };
+                }
+            }
+            KernelEvent::Exited { pid, .. } => {
+                live.remove(pid);
+            }
+            KernelEvent::TicketServed { ticket, .. } => live.retain(|_, l| l.ticket != *ticket),
+            _ => {}
+        }
+    }
+
+    /// Show `msg` in the status row for a few seconds (printed instead when there is no status row).
+    fn note(&self, msg: &str) {
+        *self.note.lock().unwrap() = Some((msg.to_string(), Instant::now()));
+    }
+
+    /// The status row: a pinned plan question, or what each busy process is doing.
+    fn status_line(&self) -> (String, bool) {
+        let (b, d, r, y, cy) = (self.c(BOLD), self.c(DIM), self.c(RESET), self.c(YELLOW), self.c(CYAN));
+        let note =
+            self.note.lock().unwrap().as_ref().filter(|(_, at)| at.elapsed() < Duration::from_secs(3)).map(|(m, _)| format!("{y}{m}{r}  "));
+        let note = note.unwrap_or_default();
+        if let Some((_, ticket)) = self.question() {
+            let rev = self.c("\x1b[7m");
+            return (
+                format!("{note}{b}{rev}? plan #{ticket} waits for you — Enter approves · n rejects · anything else is feedback {r}"),
+                false,
+            );
+        }
+        let live = self.live.lock().unwrap();
+        let busy: Vec<(&Pid, &Live)> = live.iter().filter(|(_, l)| l.state == "running" || l.state == "blocked(io)").collect();
+        let waiting = live.len() - busy.len();
+        if busy.is_empty() {
+            let rest = if waiting > 0 { format!("{waiting} waiting") } else { "idle".into() };
+            return (format!("{note}{d}{rest}{r}"), false);
+        }
+        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let frame = FRAMES[(self.started.elapsed().as_millis() / 100) as usize % FRAMES.len()];
+        let cells: Vec<String> = busy
+            .iter()
+            .map(|(pid, l)| {
+                let (what, secs) = l.doing.as_ref().map(|(w, t)| (w.as_str(), t.elapsed().as_secs())).unwrap_or(("thinking", 0));
+                let who = if l.group == Group::Architecture { "architect".to_string() } else { format!("{pid}") };
+                format!("{who} {d}{what} · {secs}s{r}")
+            })
+            .collect();
+        let more = if waiting > 0 { format!("  {d}│ {waiting} waiting{r}") } else { String::new() };
+        (format!("{note}{cy}{frame}{r} {} working: {}{more}", busy.len(), cells.join(&format!("{d}  │  {r}"))), true)
     }
 
     fn render(&self, ev: &KernelEvent) -> Option<String> {
@@ -274,7 +363,16 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         ..defaults
     };
     let color = std::io::stdout().is_terminal();
-    let view = Arc::new(View { color, verbose: cli.verbose, procs: Mutex::default(), questions: Mutex::default(), open: Mutex::default() });
+    let view = Arc::new(View {
+        color,
+        verbose: cli.verbose,
+        procs: Mutex::default(),
+        questions: Mutex::default(),
+        open: Mutex::default(),
+        live: Mutex::default(),
+        note: Mutex::default(),
+        started: Instant::now(),
+    });
     let (d, r) = (view.c(DIM), view.c(RESET));
     let (_, sandbox) = zilch_drivers::tools::sandbox::status(cfg.policy.bash_sandbox, cfg.policy.bash.network);
     let banner = format!(
@@ -316,11 +414,24 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
     }
 
     println!("{banner}\n{d}Type an order, or /help.{r}");
-    let mut rl = rustyline::DefaultEditor::new()?;
+    let mut rl: rustyline::Editor<status::StatusHelper, rustyline::history::DefaultHistory> = rustyline::Editor::new()?;
     let mut printer = rl.create_external_printer()?;
+    // The live status row above the prompt (terminals only), redrawn while something runs.
+    let bar = color.then(|| Arc::new(status::StatusBar::default()));
+    if let Some(bar) = &bar {
+        rl.set_helper(Some(status::StatusHelper(bar.clone())));
+        status::spawn_refresher(bar.clone(), Box::new(rl.create_external_printer()?));
+        let (v, bar) = (view.clone(), bar.clone());
+        std::thread::Builder::new().name("zilch-os-status".into()).spawn(move || loop {
+            let (text, busy) = v.status_line();
+            bar.set(status::clip(&text, terminal_width()), busy);
+            std::thread::sleep(Duration::from_millis(100));
+        })?;
+    }
     let v = view.clone();
     std::thread::Builder::new().name("zilch-os-view".into()).spawn(move || {
         for env in events.iter() {
+            v.track(&env.event);
             if let Some(s) = v.render(&env.event) {
                 if rustyline::ExternalPrinter::print(&mut printer, format!("{s}\n")).is_err() {
                     break;
@@ -331,11 +442,20 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
     loop {
         // A line answers the plan only if the plan prompt was showing when it was typed.
         let asked = view.question();
+        // With a status row the prompt is two rows; the first is filled with the status (status.rs).
+        let row = if bar.is_some() { "\n" } else { "" };
         let prompt = match asked {
-            Some((_, t)) => format!("plan #{t}? › "),
-            None => "zilch-os › ".to_string(),
+            Some((_, t)) => format!("{row}plan #{t}? › "),
+            None => format!("{row}zilch-os › "),
         };
-        let line = match rl.readline(&prompt) {
+        if let Some(b) = &bar {
+            b.reading.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let read = rl.readline(&prompt);
+        if let Some(b) = &bar {
+            b.reading.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        let line = match read {
             Ok(l) => l,
             Err(rustyline::error::ReadlineError::Interrupted) => {
                 match view.latest_open() {
@@ -357,6 +477,13 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             continue;
         }
         if input.is_empty() {
+            // Nothing to order: say so instead of silently doing nothing (the plan prompt, if one
+            // arrived meanwhile, shows from the next line on).
+            let msg = if view.question().is_some() { "empty input ignored — a plan is waiting" } else { "empty input ignored" };
+            match &bar {
+                Some(_) => view.note(msg),
+                None => println!("({msg})"),
+            }
             continue;
         }
         let _ = rl.add_history_entry(input);
@@ -379,4 +506,12 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
     }
     kernel.shutdown();
     Ok(0)
+}
+
+/// "x +1 more" → "x +2 more".
+fn bump(d: &str) -> String {
+    match d.rsplit_once(" +").and_then(|(head, tail)| tail.strip_suffix(" more").and_then(|n| n.parse::<u32>().ok()).map(|n| (head, n))) {
+        Some((head, n)) => format!("{head} +{} more", n + 1),
+        None => d.to_string(),
+    }
 }
