@@ -53,7 +53,7 @@ How a change request flows:
 - `ask`: ask before every mutating action.
 - `auto`: never ask (same as `--yolo`).
 
-**REPL commands:** `/todos`, `/team`, `/models`, `/prompt <agent>`, `/usage`, `/reset <instance>`, `/about`, `/redraw`, `/clear`, `/exit`.
+**REPL commands:** `/todos`, `/team`, `/models`, `/model <agent> <model> [provider]` (switch for this session; `default` switches back), `/ack`, `/prompt <agent>`, `/usage`, `/reset <instance>`, `/about`, `/redraw`, `/clear`, `/exit`.
 Ctrl-C cancels the current turn, including the master and every running worker.
 
 ## Configure
@@ -221,6 +221,13 @@ publish prices and context windows) so `/usage`, the REPL footer and `--doctor` 
 with `price_in` / `price_out` (USD per 1M tokens); `discover = false` on a provider skips the lookup.
 `max_session_cost = 5.0` (or `--max-cost 5`) stops the team before a request would exceed the cap;
 `max_session_tokens` likewise, both checked **before** sending.
+
+**High-cost model warning** — a model whose output price is at least `expensive_model_price`
+(default `10`, USD per 1M tokens; `0` = off) gets a pulsing segment in the status row once it has
+been in use for `expensive_model_minutes` (default 30) or cost `expensive_model_spend` (default
+`2.0`) — e.g. a strong model switched in for one hard task and forgotten. It keeps pulsing until
+`/ack` (silenced until the next 30 min / $2 step) or until no agent uses that model any more
+(`/model <agent> default`).
 
 **Sandbox on macOS** — `bash` runs under `sandbox-exec` with the same policy (writes limited to the
 workspace, temp dirs and tool caches; secrets and the Keychain hidden; optional no-network). No

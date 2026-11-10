@@ -82,6 +82,13 @@ pub async fn fetch_models(base_url: &str, api_key: Option<&str>, headers: &[(Str
     }
 }
 
+/// Use of one model this session (for the high-cost model warning).
+#[derive(Debug, Clone, Copy)]
+pub struct ModelUse {
+    pub first: std::time::Instant,
+    pub spent: f64,
+}
+
 /// Team-wide cost accounting (keyed by "provider/model") with an optional dollar cap.
 #[derive(Debug, Default)]
 pub struct CostMeter {
@@ -89,6 +96,8 @@ pub struct CostMeter {
     /// Spend in micro-dollars (atomic so parallel workers can record concurrently).
     spent_micros: AtomicU64,
     pub limit_usd: Option<f64>,
+    /// When each priced model was first used this session and what it cost so far.
+    uses: std::sync::Mutex<HashMap<String, ModelUse>>,
 }
 
 impl CostMeter {
@@ -102,7 +111,20 @@ impl CostMeter {
     pub fn record(&self, key: &str, u: &Usage) -> Option<f64> {
         let c = self.info(key)?.cost(u)?;
         self.spent_micros.fetch_add((c * 1_000_000.0).round() as u64, Ordering::Relaxed);
+        let mut uses = self.uses.lock().unwrap();
+        uses.entry(key.to_string()).or_insert(ModelUse { first: std::time::Instant::now(), spent: 0.0 }).spent += c;
         Some(c)
+    }
+    /// This session's use of a model, if it was used with a known price.
+    pub fn model_use(&self, key: &str) -> Option<ModelUse> {
+        self.uses.lock().unwrap().get(key).copied()
+    }
+    #[doc(hidden)]
+    /// Tests: pretend a model was first used `ago` before now.
+    pub fn backdate(&self, key: &str, ago: Duration) {
+        if let Some(u) = self.uses.lock().unwrap().get_mut(key) {
+            u.first -= ago;
+        }
     }
     pub fn spent(&self) -> f64 {
         self.spent_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0

@@ -152,6 +152,11 @@ pub struct FileConfig {
     pub max_session_cost: Option<f64>,
     /// Loop protection: identical repeats before an agent is nudged, then stopped (default 3, 0 = off).
     pub loop_limit: Option<usize>,
+    /// High-cost model warning: output price (USD per 1M tokens) from which a model counts as
+    /// high-cost (default 10, 0 = off), and after how many minutes of use or USD spent it is flagged.
+    pub expensive_model_price: Option<f64>,
+    pub expensive_model_minutes: Option<u64>,
+    pub expensive_model_spend: Option<f64>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderCfg>,
     pub defaults: Option<RoleCfg>,
@@ -205,6 +210,12 @@ pub struct Config {
     /// Loop protection (see agent::supervisor): repeats tolerated before an agent is nudged and then
     /// stopped, and failed attempts of an unchanged TODO before it is no longer run. 0 = off.
     pub loop_limit: usize,
+    /// A model whose output price (USD per 1M tokens) is at least this is high-cost (0 = no warning).
+    pub expensive_model_price: f64,
+    /// Flag a high-cost model after this many minutes of use, and again every as many minutes …
+    pub expensive_model_minutes: u64,
+    /// … or after this many USD spent on it, and again every as many USD.
+    pub expensive_model_spend: f64,
     /// Team-wide spend cap in USD per session (needs known prices), None = unlimited.
     pub max_session_cost: Option<f64>,
     pub providers: BTreeMap<String, ProviderCfg>,
@@ -338,6 +349,9 @@ impl Config {
             max_session_tokens: ov.max_session_tokens.or(fc.max_session_tokens),
             max_session_cost: ov.max_session_cost.or(fc.max_session_cost),
             loop_limit: fc.loop_limit.unwrap_or(crate::agent::supervisor::DEFAULT_LOOP_LIMIT),
+            expensive_model_price: fc.expensive_model_price.unwrap_or(10.0).max(0.0),
+            expensive_model_minutes: fc.expensive_model_minutes.unwrap_or(30).max(1),
+            expensive_model_spend: fc.expensive_model_spend.unwrap_or(2.0).max(0.01),
             providers: fc.providers,
             profiles,
         };
@@ -405,6 +419,9 @@ fn merge_file(dst: &mut FileConfig, src: FileConfig, base: &Path) {
     merge_opt(&mut dst.max_session_tokens, src.max_session_tokens);
     merge_opt(&mut dst.max_session_cost, src.max_session_cost);
     merge_opt(&mut dst.loop_limit, src.loop_limit);
+    merge_opt(&mut dst.expensive_model_price, src.expensive_model_price);
+    merge_opt(&mut dst.expensive_model_minutes, src.expensive_model_minutes);
+    merge_opt(&mut dst.expensive_model_spend, src.expensive_model_spend);
     for (k, v) in src.providers {
         dst.providers.entry(k).or_default().merge(v);
     }

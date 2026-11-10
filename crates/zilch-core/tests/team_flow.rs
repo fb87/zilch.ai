@@ -322,3 +322,75 @@ async fn a_task_that_keeps_failing_unchanged_is_not_run_a_third_time() {
     run(todo("t4", "Make cargo build pass: the error is a missing import in src/lib.rs.")).await;
     assert_eq!(worker_runs(), 3);
 }
+
+#[tokio::test]
+async fn model_switches_apply_to_the_next_turn_and_switch_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let (team, fake, _, _rx) = setup(dir.path(), 2, Box::new(|_| vec![text("ok")]));
+    let configured = team.shared.cfg.master().binding.model.clone();
+    let last_model = || fake.requests.lock().unwrap().last().unwrap().binding.model.clone();
+
+    team.run("hi").await.unwrap();
+    assert_eq!(last_model(), configured);
+    let msg = team.set_model("master", Some("big-model"), None).unwrap();
+    assert!(msg.contains("big-model") && msg.contains("next turn"), "{msg}");
+    team.run("hi again").await.unwrap();
+    assert_eq!(last_model(), "big-model", "the master uses the switched model from its next turn");
+    assert!(team.models().iter().any(|(a, m)| a.starts_with("master") && m.contains("switched")));
+    team.set_model("master", None, None).unwrap();
+    team.run("and again").await.unwrap();
+    assert_eq!(last_model(), configured, "back to the configured model");
+
+    // Worker profiles switch for new tasks; instances and unknown names are refused.
+    team.set_model("coder", Some("fast-model"), None).unwrap();
+    let p = team.shared.cfg.profile("coder").unwrap();
+    assert_eq!(team.shared.effective_binding(p).model, "fast-model");
+    assert!(team.set_model("coder#1", Some("x"), None).is_err());
+    assert!(team.set_model("nobody", Some("x"), None).is_err());
+    assert!(team.set_model("coder", Some("x"), Some("no-such-provider")).is_err());
+    // With a provider model list known, a model not in it is refused (it would fail mid-task).
+    let info = zilch_core::llm::catalog::ModelInfo::default();
+    team.set_catalog([("openai/listed".to_string(), info)].into());
+    assert!(team.set_model("coder", Some("typo-model"), None).is_err());
+    assert!(team.set_model("coder", Some("listed"), None).is_ok());
+}
+
+#[tokio::test]
+async fn a_high_cost_model_in_use_too_long_alerts_until_acknowledged_or_switched_back() {
+    use zilch_core::llm::catalog::ModelInfo;
+    use zilch_core::llm::Usage;
+    let dir = tempfile::tempdir().unwrap();
+    let (team, _, _, _rx) = setup(dir.path(), 2, Box::new(|_| vec![text("ok")]));
+    let price = |o: f64| ModelInfo { context: None, input_per_mtok: Some(1.0), output_per_mtok: Some(o) };
+    team.set_catalog([("openai/opus-big".to_string(), price(75.0)), ("openai/cheap".to_string(), price(0.5))].into());
+    let meter = &team.shared.meter;
+    let small = Usage { prompt_tokens: 1000, completion_tokens: 100 };
+
+    // A cheap model never alerts, however long it is used.
+    team.set_model("master", Some("cheap"), None).unwrap();
+    meter.record("openai/cheap", &small);
+    meter.backdate("openai/cheap", Duration::from_secs(5 * 3600));
+    assert!(team.cost_alerts().is_empty());
+
+    // The high-cost one: quiet at first, alerts after 30 minutes.
+    team.set_model("master", Some("opus-big"), None).unwrap();
+    meter.record("openai/opus-big", &small);
+    assert!(team.cost_alerts().is_empty(), "just switched");
+    meter.backdate("openai/opus-big", Duration::from_secs(31 * 60));
+    let a = team.cost_alerts();
+    assert_eq!(a.len(), 1);
+    assert_eq!((a[0].model.as_str(), a[0].agents.clone(), a[0].minutes), ("openai/opus-big", vec!["master".to_string()], 31));
+
+    // /ack silences it until the next step (another 30 minutes, or $2 spent).
+    assert_eq!(team.ack_cost_alerts(), 1);
+    assert!(team.cost_alerts().is_empty());
+    meter.record("openai/opus-big", &Usage { prompt_tokens: 0, completion_tokens: 30_000 }); // $2.25
+    assert_eq!(team.cost_alerts().len(), 1, "spending past $2 alerts again");
+    team.ack_cost_alerts();
+
+    // Switching back ends it: no agent is bound to the high-cost model any more.
+    meter.backdate("openai/opus-big", Duration::from_secs(3600));
+    assert_eq!(team.cost_alerts().len(), 1);
+    team.set_model("master", None, None).unwrap();
+    assert!(team.cost_alerts().is_empty());
+}

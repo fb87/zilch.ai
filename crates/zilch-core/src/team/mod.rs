@@ -43,6 +43,10 @@ pub struct TeamShared {
     /// Team-level loop protection: failed runs per unchanged task (worker + instructions), with
     /// the last failure report. See scheduler::task_key.
     pub task_failures: Mutex<std::collections::HashMap<u64, (usize, String)>>,
+    /// Runtime model switches (/model): profile name ("master", "spec", "coder", …) → binding.
+    pub model_overrides: Mutex<std::collections::HashMap<String, ModelBinding>>,
+    /// High-cost model warnings the user acknowledged: model key → (minutes step, spend step).
+    cost_acked: Mutex<std::collections::HashMap<String, (u64, u64)>>,
 }
 
 impl TeamShared {
@@ -125,9 +129,14 @@ impl TeamShared {
         })
     }
 
+    /// The binding a profile runs with now: its /model switch if any, else its configured one.
+    pub fn effective_binding(&self, profile: &Profile) -> ModelBinding {
+        self.model_overrides.lock().unwrap().get(&profile.name).cloned().unwrap_or_else(|| profile.binding.clone())
+    }
+
     /// Resolve a TODO's model override against the profile's binding.
     pub fn binding_for(&self, profile: &Profile, model: Option<&str>, provider: Option<&str>) -> Result<ModelBinding> {
-        let mut b = profile.binding.clone();
+        let mut b = self.effective_binding(profile);
         if let Some(p) = provider {
             if !self.providers.contains(p) {
                 bail!("unknown provider '{p}'");
@@ -201,7 +210,7 @@ impl TeamShared {
             return Ok((inst, g));
         }
         let profile = self.worker_profile(worker)?;
-        let binding = binding.unwrap_or_else(|| profile.binding.clone());
+        let binding = binding.unwrap_or_else(|| self.effective_binding(profile));
         if let Some(found) = self.pool.take_idle(&profile.name, &binding, readonly) {
             return Ok(found);
         }
@@ -304,6 +313,19 @@ pub struct InstanceInfo {
     pub messages: usize,
 }
 
+/// A high-cost model that has been in use for a while (see `Team::cost_alerts`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CostAlert {
+    /// "provider/model"
+    pub model: String,
+    /// The profiles currently bound to it.
+    pub agents: Vec<String>,
+    pub minutes: u64,
+    pub spent: f64,
+    /// (minutes, spend) thresholds crossed; a new step alerts again after /ack.
+    pub step: (u64, u64),
+}
+
 pub struct Team {
     pub shared: Arc<TeamShared>,
     master: AsyncMutex<Agent>,
@@ -384,6 +406,8 @@ impl Team {
             worker_tools: tools::worker_tools(),
             spec_store: Arc::new(SpecStore::new(cfg.spec_dir.clone())),
             task_failures: Mutex::default(),
+            model_overrides: Mutex::default(),
+            cost_acked: Mutex::default(),
             cfg,
         });
 
@@ -493,6 +517,7 @@ impl Team {
         }
         let res = {
             let mut m = self.master.lock().await;
+            self.apply_model_switch(&mut m, "master")?;
             // What a mid-turn checkpoint records for the master: everything before this request,
             // the request itself, and a note so a resumed master knows the turn was interrupted.
             {
@@ -662,6 +687,7 @@ impl Team {
         }
         let res = {
             let mut s = self.spec.lock().await;
+            self.apply_model_switch(&mut s, "spec")?;
             // Recorded for saves that happen while this turn is still running.
             self.shared.persist.lock().unwrap().spec_checkpoint =
                 Some(session::AgentState { history: s.history.clone(), session: s.session.clone(), usage: s.usage });
@@ -728,10 +754,113 @@ impl Team {
 
     /// (agent/profile, provider/model) for the master, every profile and every live instance.
     pub fn models(&self) -> Vec<(String, String)> {
-        let mut v: Vec<(String, String)> =
-            self.shared.cfg.profiles.iter().map(|p| (format!("{} (profile)", p.name), p.binding.key())).collect();
+        let mut v: Vec<(String, String)> = self
+            .shared
+            .cfg
+            .profiles
+            .iter()
+            .map(|p| {
+                let now = self.shared.effective_binding(p);
+                let note = if now != p.binding { format!("  (switched; configured: {})", p.binding.key()) } else { String::new() };
+                (format!("{} (profile)", p.name), format!("{}{note}", now.key()))
+            })
+            .collect();
         v.extend(self.shared.pool.list().iter().map(|i| (i.id.clone(), i.binding.key())));
         v
+    }
+
+    /// /model: switch the model of the master, the spec lane or a worker profile for the rest of
+    /// the session (`model` None = back to the configured one). The master and spec lane pick it
+    /// up at their next turn; new worker tasks use it, running ones finish on their model.
+    pub fn set_model(&self, name: &str, model: Option<&str>, provider: Option<&str>) -> Result<String> {
+        if name.contains('#') {
+            bail!("'{name}' is an instance; its model is fixed. Switch its profile '{}' instead", name.split('#').next().unwrap_or(name));
+        }
+        let profile = self.shared.cfg.profile(name).ok_or_else(|| {
+            let names: Vec<&str> = self.shared.cfg.profiles.iter().map(|p| p.name.as_str()).collect();
+            anyhow!("unknown agent '{name}'. Available: {}", names.join(", "))
+        })?;
+        let Some(model) = model else {
+            self.shared.model_overrides.lock().unwrap().remove(name);
+            return Ok(format!("{name} → {} (configured model)", profile.binding.key()));
+        };
+        let b = self.shared.binding_for(profile, Some(model), provider)?;
+        // A model the provider does not list would fail with a 400 in the middle of a task.
+        let listed: Vec<String> = {
+            let prefix = format!("{}/", b.provider);
+            self.shared.meter.catalog.read().unwrap().keys().filter(|k| k.starts_with(&prefix)).cloned().collect()
+        };
+        if !listed.is_empty() && !listed.contains(&b.key()) {
+            bail!("'{model}' is not in provider '{}''s model list (/models in the provider docs, or `zilch --doctor`)", b.provider);
+        }
+        let price = match self.shared.meter.info(&b.key()) {
+            Some(crate::llm::catalog::ModelInfo { input_per_mtok: Some(i), output_per_mtok: Some(o), .. }) => {
+                format!(" (${i}/${o} per 1M tokens in/out)")
+            }
+            _ => String::new(),
+        };
+        let key = b.key();
+        if b == profile.binding {
+            self.shared.model_overrides.lock().unwrap().remove(name);
+        } else {
+            self.shared.model_overrides.lock().unwrap().insert(name.to_string(), b);
+        }
+        let when = match name {
+            "master" | "spec" => "from its next turn",
+            _ => "for new tasks (running ones finish on their model)",
+        };
+        Ok(format!("{name} → {key}{price}, {when}"))
+    }
+
+    /// Give a lane agent the model /model chose for it (called at the start of its turn).
+    fn apply_model_switch(&self, agent: &mut Agent, profile: &str) -> Result<()> {
+        let Some(p) = self.shared.cfg.profile(profile) else { return Ok(()) };
+        let b = self.shared.effective_binding(p);
+        if agent.binding != b {
+            agent.llm = self.shared.providers.get(&b.provider)?;
+            // Compaction follows the new model's context window (the configured one when back).
+            agent.context_tokens = match self.shared.meter.info(&b.key()).and_then(|i| i.context) {
+                Some(ctx) if b != p.binding => ctx as usize,
+                _ => p.context_tokens,
+            };
+            agent.binding = b;
+        }
+        Ok(())
+    }
+
+    /// High-cost models in use that crossed a time or spend step the user has not acknowledged.
+    pub fn cost_alerts(&self) -> Vec<CostAlert> {
+        let cfg = &self.shared.cfg;
+        if cfg.expensive_model_price <= 0.0 {
+            return vec![];
+        }
+        let mut by_model: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for p in &cfg.profiles {
+            by_model.entry(self.shared.effective_binding(p).key()).or_default().push(p.name.clone());
+        }
+        let acked = self.shared.cost_acked.lock().unwrap();
+        let mut out = Vec::new();
+        for (model, agents) in by_model {
+            let expensive = self.shared.meter.info(&model).and_then(|i| i.output_per_mtok).is_some_and(|o| o >= cfg.expensive_model_price);
+            let Some(u) = self.shared.meter.model_use(&model).filter(|_| expensive) else { continue };
+            let minutes = u.first.elapsed().as_secs() / 60;
+            let step = (minutes / cfg.expensive_model_minutes, (u.spent / cfg.expensive_model_spend) as u64);
+            let seen = acked.get(&model).copied().unwrap_or((0, 0));
+            if step.0 > seen.0 || step.1 > seen.1 {
+                out.push(CostAlert { model, agents, minutes, spent: u.spent, step });
+            }
+        }
+        out
+    }
+
+    /// /ack: silence the current high-cost warnings until each crosses its next step.
+    pub fn ack_cost_alerts(&self) -> usize {
+        let alerts = self.cost_alerts();
+        let mut acked = self.shared.cost_acked.lock().unwrap();
+        for a in &alerts {
+            acked.insert(a.model.clone(), a.step);
+        }
+        alerts.len()
     }
 
     /// The fully composed system prompt of the master, a live instance, or a profile (as it would be spawned).

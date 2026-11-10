@@ -14,7 +14,7 @@ type LineEditor = rustyline::Editor<status::StatusHelper, rustyline::history::De
 use anyhow::{bail, Result};
 use clap::Parser;
 use lanes::{Dispatcher, Lane};
-use render::{Screen, SharedScreen, BOLD, CYAN, DIM, GREEN, RED, RESET};
+use render::{Screen, SharedScreen, BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
 use std::io::{IsTerminal, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -458,6 +458,7 @@ async fn repl(
         }
     };
 
+    let _cost_watch = AbortOnDrop(spawn_cost_watch(team.clone(), screen.clone()));
     let bar = screen.lock().await.status_bar.clone();
     loop {
         // The prompt itself only names the lane; live activity is drawn in the status row above
@@ -612,6 +613,60 @@ fn about(cfg: &Config) -> String {
     lines.join("\n")
 }
 
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// High-cost model warning: while a high-cost model has been in use past its time or spend step,
+/// the status row carries a segment that pulses like a heartbeat (highlighted 1 s, plain 1 s)
+/// until /ack, or until no agent is bound to that model any more (/model … default). Each new
+/// step is also printed once, so it stays in the scrollback.
+fn spawn_cost_watch(team: Arc<Team>, screen: SharedScreen) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut announced: std::collections::HashMap<String, (u64, u64)> = Default::default();
+        let mut beat = false;
+        loop {
+            tick.tick().await;
+            let alerts = team.cost_alerts();
+            let mut s = screen.lock().await;
+            if alerts.is_empty() {
+                s.set_cost_alert(None);
+                continue;
+            }
+            beat = !beat;
+            for a in &alerts {
+                if announced.get(&a.model) != Some(&a.step) {
+                    announced.insert(a.model.clone(), a.step);
+                    let agent = a.agents.first().map(String::as_str).unwrap_or("<agent>");
+                    let msg = format!(
+                        "{}$ high-cost model in use: {} ({}) for {} min, ${:.2} so far. Switch back with /model {agent} default, or /ack to silence it until the next step.{}",
+                        s.c(YELLOW),
+                        a.model,
+                        a.agents.join(", "),
+                        a.minutes,
+                        a.spent,
+                        s.c(RESET)
+                    );
+                    s.line(&msg);
+                }
+            }
+            let text = alerts
+                .iter()
+                .map(|a| {
+                    let model = a.model.rsplit('/').next().unwrap_or(&a.model);
+                    format!("{model} · {} · {} min · ${:.2}", a.agents.join(","), a.minutes, a.spent)
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            s.set_cost_alert(Some((format!("$ {text} — /ack"), beat)));
+        }
+    })
+}
+
 /// Returns false to exit.
 async fn command(team: &Team, screen: &SharedScreen, input: &str) -> bool {
     let (cmd, arg) = input.split_once(' ').map(|(c, a)| (c, a.trim())).unwrap_or((input, ""));
@@ -621,6 +676,10 @@ async fn command(team: &Team, screen: &SharedScreen, input: &str) -> bool {
 /todos            show the TODO list with status and reports
 /team             show worker instances
 /models           show the model of every agent
+/model <agent> <model> [provider]
+                  switch an agent's model for this session (master, spec, coder, …);
+                  /model <agent> default switches back to the configured one
+/ack              silence the high-cost model warning until its next step (default every 30 min / $2)
 /prompt <agent>   print the composed system prompt (master, coder, coder#2, …)
 /usage            token usage per agent and model
 /reset <instance> drop a worker instance (its history and context)
@@ -698,6 +757,25 @@ async fn command(team: &Team, screen: &SharedScreen, input: &str) -> bool {
             }
         }
         "/models" => team.models().iter().map(|(a, m)| format!("{a:<22} {m}")).collect::<Vec<_>>().join("\n"),
+        "/model" => {
+            let parts: Vec<&str> = arg.split_whitespace().collect();
+            match parts.as_slice() {
+                [] => team.models().iter().map(|(a, m)| format!("{a:<22} {m}")).collect::<Vec<_>>().join("\n"),
+                [agent, "default"] => team.set_model(agent, None, None).unwrap_or_else(|e| format!("{e:#}")),
+                [agent, model] => team.set_model(agent, Some(model), None).unwrap_or_else(|e| format!("{e:#}")),
+                [agent, model, provider] => team.set_model(agent, Some(model), Some(provider)).unwrap_or_else(|e| format!("{e:#}")),
+                _ => "usage: /model <agent> <model> [provider]   ·   /model <agent> default".into(),
+            }
+        }
+        "/ack" => {
+            let n = team.ack_cost_alerts();
+            screen.lock().await.set_cost_alert(None);
+            if n == 0 {
+                "No high-cost model warning to acknowledge.".into()
+            } else {
+                "High-cost model warning silenced until its next step.".into()
+            }
+        }
         "/prompt" => {
             let name = if arg.is_empty() { "master" } else { arg };
             team.prompt_of(name).await.unwrap_or_else(|| format!("No agent or profile named '{name}'."))

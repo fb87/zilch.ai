@@ -61,6 +61,9 @@ pub struct Screen {
     /// A question waiting for the user's answer (approval, plan review): pinned in the status
     /// row until answered, so output from other agents cannot scroll it out of sight.
     question: Option<String>,
+    /// High-cost model warning for the status row: (text, highlighted now). The caller toggles
+    /// the highlight every second for a heartbeat.
+    cost_alert: Option<(String, bool)>,
     /// Set while handling an event of the background lane: put before each printed line.
     bg_prefix: String,
 }
@@ -115,6 +118,7 @@ impl Screen {
             status_bar: None,
             question: None,
             bg_prefix: String::new(),
+            cost_alert: None,
         }))
     }
 
@@ -483,8 +487,21 @@ impl Screen {
             }
         }
         let sep = format!("{}  │  {}", self.c(DIM), self.c(RESET));
+        if let Some((alert, on)) = &self.cost_alert {
+            // First, so clipping on a narrow terminal cuts the lanes, not the warning.
+            let style = if *on { format!("{}{}", self.c(BOLD), self.c(REVERSE)) } else { self.c(YELLOW).to_string() };
+            cells.insert(0, format!("{style} {alert} {}", self.c(RESET)));
+        }
         let text = clip(&cells.join(&sep), terminal_width(self.fd));
         bar.set(text, busy);
+    }
+
+    /// Show (or with None, clear) the high-cost model warning in the status row.
+    pub fn set_cost_alert(&mut self, alert: Option<(String, bool)>) {
+        if self.cost_alert != alert {
+            self.cost_alert = alert;
+            self.update_status();
+        }
     }
 
     /// Pin (or with None, unpin) a one-line question in the status row.
@@ -1048,6 +1065,23 @@ mod tests {
         let out = buf.text();
         assert!(out.contains("[code] retrying in 2s"), "{out}");
         assert!(out.contains("\nspec saved"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn the_cost_warning_pulses_in_the_status_row() {
+        let screen = Screen::new(Box::new(Buf::default()), -1, true, false, true);
+        let mut s = screen.lock().await;
+        s.lanes = true;
+        let bar = Arc::new(crate::status::StatusBar::default());
+        s.status_bar = Some(bar.clone());
+        s.set_cost_alert(Some(("$ opus · master · 31 min · $2.40 — /ack".into(), true)));
+        let on = bar.text();
+        assert!(on.starts_with(&format!("{BOLD}{REVERSE} $ opus")), "highlighted beat comes first: {on:?}");
+        assert!(on.contains("code: idle"), "the lanes are still shown: {on:?}");
+        s.set_cost_alert(Some(("$ opus · master · 31 min · $2.40 — /ack".into(), false)));
+        assert!(bar.text().starts_with(&format!("{YELLOW} $ opus")) && !bar.text().contains(REVERSE), "{:?}", bar.text());
+        s.set_cost_alert(None);
+        assert!(!bar.text().contains("opus"), "cleared after /ack or switching back");
     }
     #[tokio::test]
     async fn redraw_clears_and_renders_the_last_answer_again() {
