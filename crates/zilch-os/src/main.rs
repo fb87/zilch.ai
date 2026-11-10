@@ -48,6 +48,12 @@ struct Cli {
     log: Option<PathBuf>,
     #[arg(long)]
     no_log: bool,
+    /// Continue the most recent session in this directory (the main agent remembers it).
+    #[arg(short = 'c', long = "continue")]
+    r#continue: bool,
+    /// Do not save this session.
+    #[arg(long)]
+    no_session: bool,
     /// Show every model call and syscall result.
     #[arg(short, long)]
     verbose: bool,
@@ -349,11 +355,43 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
     let ov =
         Overrides { model: cli.model.clone(), architect_model: cli.architect_model.clone(), developer_model: cli.developer_model.clone() };
     let cfg = Config::load(&cwd, &ov)?;
-    let drivers = DriverSet::new(&cwd, cfg.policy.clone(), cfg.backends());
+    let mut drivers = DriverSet::new(&cwd, cfg.policy.clone(), cfg.backends());
+    // Sessions: the main agent's conversation is saved after every served order; -c continues the
+    // most recent one of this directory.
+    let sessions =
+        (!cli.no_session).then(zilch_drivers::session::default_root).flatten().map(|r| zilch_drivers::session::dir_for(&r, &cwd));
+    let mut resumed: Option<(PathBuf, Vec<zilch_ipc::Message>)> = None;
+    let mut session_note = String::new();
+    if let Some(dir) = &sessions {
+        let earlier = cli.r#continue.then(|| zilch_drivers::session::latest(dir)).flatten();
+        let loaded = earlier.as_ref().and_then(|p| zilch_drivers::session::load(p)).and_then(|v| zilch_agents::snapshot_messages(&v));
+        let path = match (earlier, loaded) {
+            (Some(p), Some(msgs)) => {
+                resumed = Some((p.clone(), msgs));
+                p
+            }
+            _ => {
+                if cli.r#continue {
+                    session_note = "no earlier session in this directory; starting a new one".into();
+                }
+                zilch_drivers::session::new_path(dir)
+            }
+        };
+        drivers = drivers.with_session_file(path);
+    }
     let mut book =
         Book::new(cfg.architect.clone(), cfg.developer.clone(), drivers.specs(ARCHITECT_TOOLS), drivers.specs(DEVELOPER_TOOLS), &cwd);
     if let Some(t) = cfg.main_context_tokens {
         book.main_context_tokens = t;
+    }
+    let mut first_ticket = 1;
+    if let Some((path, msgs)) = &resumed {
+        let orders: Vec<&str> = msgs.iter().map(|m| m.text()).filter(|t| t.starts_with("Order #")).collect();
+        first_ticket = orders.iter().filter_map(|t| t[7..].split(':').next()?.parse::<u64>().ok()).max().unwrap_or(0) + 1;
+        let last: String = orders.last().map(|t| t.split_once(": ").map(|x| x.1).unwrap_or(t)).unwrap_or("").chars().take(70).collect();
+        let id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        session_note = format!("↺ continuing session {id}: {} order(s), last: {last}", orders.len());
+        *book.resume.lock().unwrap() = Some(msgs.clone());
     }
     let bus = Arc::new(EventBus::new());
     let log = open_log(&cli);
@@ -369,6 +407,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         max_steps: cfg.max_steps,
         max_tokens: cfg.max_task_tokens,
         group_tokens: cfg.group_tokens.clone(),
+        first_ticket,
         auto_approve: cli.yes,
         ..defaults
     };
@@ -395,6 +434,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         kcfg.workers,
         log.as_ref().map(|(p, _)| format!("\n{d}event log: {}{r}", p.display())).unwrap_or_default()
     );
+    let banner = if session_note.is_empty() { banner } else { format!("{banner}\n{}{session_note}{r}", view.c(CYAN)) };
     let kernel = zilch_kernel::start(kcfg, Arc::new(drivers), Arc::new(book), bus);
 
     if let Some(order) = &cli.prompt {

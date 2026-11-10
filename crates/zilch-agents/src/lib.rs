@@ -124,6 +124,12 @@ impl LlmAgent {
         StepResult::Syscalls(vec![self.request()])
     }
 
+    /// Start from an earlier session's conversation (`-c`): the input becomes the next turn.
+    pub fn with_history(mut self, messages: Vec<Message>) -> Self {
+        self.messages = messages;
+        self
+    }
+
     /// Context budget in tokens (compaction starts at 75% of it).
     pub fn with_budget(mut self, tokens: usize) -> Self {
         self.budget = tokens.max(4_000);
@@ -163,6 +169,10 @@ impl LlmAgent {
 }
 
 impl Agent for LlmAgent {
+    fn snapshot(&self) -> Option<Value> {
+        Some(json!({ "messages": self.messages }))
+    }
+
     fn restart(&mut self, summary: &str) -> bool {
         self.messages.clear();
         self.calls.clear();
@@ -266,6 +276,8 @@ pub struct Book {
     pub environment: String,
     /// Context budget of the resident main agent in tokens (compaction starts at 75%).
     pub main_context_tokens: usize,
+    /// A saved conversation for the next main agent to continue (`-c`), used once.
+    pub resume: std::sync::Mutex<Option<Vec<Message>>>,
     sessions: AtomicU64,
 }
 
@@ -286,6 +298,7 @@ impl Book {
             developer_tools,
             environment: environment(cwd),
             main_context_tokens: 64_000,
+            resume: std::sync::Mutex::new(None),
             sessions: AtomicU64::new(1),
         }
     }
@@ -310,7 +323,8 @@ impl Recipes for Book {
             )
             .resident()
             // The main agent hears everything all session: compact early so it stays fast.
-            .with_budget(self.main_context_tokens),
+            .with_budget(self.main_context_tokens)
+            .with_history(self.resume.lock().unwrap().take().unwrap_or_default()),
         )
     }
 
@@ -374,3 +388,8 @@ pub fn today() -> String {
 
 #[cfg(test)]
 mod tests;
+
+/// The conversation saved by `LlmAgent::snapshot` (None if the snapshot is not one).
+pub fn snapshot_messages(snapshot: &Value) -> Option<Vec<Message>> {
+    serde_json::from_value(snapshot.get("messages")?.clone()).ok()
+}

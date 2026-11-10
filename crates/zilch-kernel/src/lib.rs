@@ -62,6 +62,10 @@ pub trait Agent: Send {
     fn restart(&mut self, _summary: &str) -> bool {
         false
     }
+    /// What to keep of this program for a later session (the main agent's conversation).
+    fn snapshot(&self) -> Option<Value> {
+        None
+    }
 }
 
 /// What a tool call would touch, for the capability check.
@@ -111,6 +115,8 @@ pub trait Drivers: Send + Sync + 'static {
     fn save_plan(&self, _ticket: TicketId, _tasks: &[PlanTask]) {}
     /// A process is gone: drop whatever the drivers kept for it.
     fn release(&self, _pid: Pid) {}
+    /// Persist the main agent's snapshot (called each time it serves an order).
+    fn save_session(&self, _snapshot: &Value) {}
 }
 
 /// The recipe book: builds the programs the kernel runs.
@@ -145,6 +151,8 @@ pub struct KernelConfig {
     pub restart_window_ticks: u64,
     /// Token quota per group (like a cgroup); a process of a group over its quota is stopped.
     pub group_tokens: BTreeMap<Group, u64>,
+    /// Number of the first order (a continued session carries on counting).
+    pub first_ticket: TicketId,
 }
 
 impl Default for KernelConfig {
@@ -164,6 +172,7 @@ impl Default for KernelConfig {
             max_restarts: 2,
             restart_window_ticks: 6000, // 10 minutes at 100 ms
             group_tokens: BTreeMap::new(),
+            first_ticket: 1,
         }
     }
 }
@@ -508,6 +517,7 @@ pub fn start(cfg: KernelConfig, drivers: Arc<dyn Drivers>, recipes: Arc<dyn Reci
 
 impl Kernel {
     fn new(cfg: KernelConfig, drivers: Arc<dyn Drivers>, recipes: Arc<dyn Recipes>, bus: Arc<EventBus>) -> Self {
+        let first_ticket = cfg.first_ticket.max(1);
         let (tx, rx) = channel();
         Self {
             workers: Pool::new("zilch-step", cfg.workers),
@@ -523,7 +533,7 @@ impl Kernel {
             tick: 0,
             started: Instant::now(),
             next_pid: 1,
-            next_ticket: 1,
+            next_ticket: first_ticket,
             next_qid: 1,
             main: None,
             pending_orders: VecDeque::new(),
@@ -720,6 +730,11 @@ impl Kernel {
         }
         let ticket = self.acbs.get(&pid).map(|a| a.ticket).unwrap_or_default();
         self.end_ticket(ticket, true, summary);
+        // Keep the session: the main agent's conversation, written off the kernel thread.
+        if let Some(snapshot) = self.acbs.get(&pid).and_then(|a| a.agent.as_ref()).and_then(|ag| ag.snapshot()) {
+            let drivers = self.drivers.clone();
+            self.io.run(Box::new(move || drivers.save_session(&snapshot)));
+        }
         if let Some(a) = self.acbs.get_mut(&pid) {
             a.parked_slot = Some(idx);
         }

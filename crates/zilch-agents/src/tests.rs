@@ -277,3 +277,55 @@ fn a_history_over_budget_is_summarized_through_a_syscall_before_the_next_request
     }
     panic!("the history never got compacted");
 }
+
+#[test]
+fn a_session_is_saved_when_an_order_is_served_and_continued_by_a_new_kernel() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let file = dir.path().join("sessions").join("1.json");
+    let llm: Arc<dyn Backend> = Arc::new(ScriptedLlm::new(|req| {
+        let last = req.messages.last().map(|m| m.text().to_string()).unwrap_or_default();
+        let reply = if last.starts_with("Order #2") {
+            let remembers = req.messages.iter().any(|m| m.text().contains("remember the word banana"));
+            if remembers {
+                "the word was banana"
+            } else {
+                "I do not know"
+            }
+        } else {
+            "noted"
+        };
+        vec![LlmEvent::TextDelta(reply.into())]
+    }));
+    let binding = ModelBinding { provider: "fake".into(), model: "scripted".into(), ..Default::default() };
+    let run = |first_ticket: u64, resume: Option<Vec<Message>>, order: &str| -> (u64, String) {
+        let drivers =
+            DriverSet::new(&ws, ToolPolicy::default(), [("fake".to_string(), llm.clone())].into()).with_session_file(file.clone());
+        let book = Book::new(binding.clone(), binding.clone(), drivers.specs(ARCHITECT_TOOLS), drivers.specs(DEVELOPER_TOOLS), &ws);
+        *book.resume.lock().unwrap() = resume;
+        let bus = Arc::new(EventBus::new());
+        let events = bus.subscribe(10_000);
+        let cfg = KernelConfig { tick: Duration::from_millis(10), auto_approve: true, first_ticket, ..Default::default() };
+        let k = zilch_kernel::start(cfg, Arc::new(drivers), Arc::new(book), bus);
+        k.send(Cmd::Order(order.into()));
+        let served = loop {
+            let env = events.recv_timeout(Duration::from_secs(10)).expect("served");
+            if let KernelEvent::TicketServed { ticket, summary, .. } = &env.event {
+                break (*ticket, summary.clone());
+            }
+        };
+        // The session is written off the kernel thread; give it a moment, then stop.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !file.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        k.shutdown();
+        served
+    };
+    assert_eq!(run(1, None, "remember the word banana"), (1, "noted".into()));
+    let saved = zilch_drivers::session::load(&file).and_then(|v| snapshot_messages(&v)).expect("session saved");
+    assert!(saved.iter().any(|m| m.text() == "Order #1: remember the word banana"), "{saved:?}");
+    // `-c`: a new kernel, the main agent starts from the saved conversation, numbering goes on.
+    assert_eq!(run(2, Some(saved), "which word?"), (2, "the word was banana".into()));
+}

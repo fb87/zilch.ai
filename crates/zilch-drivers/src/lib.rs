@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod llm;
+pub mod session;
 pub mod tools;
 
 use llm::Backend;
@@ -29,6 +30,8 @@ pub struct DriverSet {
     locks: FileLocks,
     hashes: Mutex<HashMap<Pid, ReadHashes>>,
     backends: HashMap<String, Arc<dyn Backend>>,
+    /// Where the main agent's conversation is saved (None = no sessions).
+    session_file: Option<PathBuf>,
 }
 
 impl DriverSet {
@@ -40,7 +43,14 @@ impl DriverSet {
             locks: FileLocks::default(),
             hashes: Mutex::default(),
             backends,
+            session_file: None,
         }
+    }
+
+    /// Save the main agent's conversation to this file after every served order.
+    pub fn with_session_file(mut self, path: PathBuf) -> Self {
+        self.session_file = Some(path);
+        self
     }
 
     pub fn specs(&self, names: &[&str]) -> Vec<ToolSpec> {
@@ -104,5 +114,11 @@ impl Drivers for DriverSet {
 
     fn release(&self, pid: Pid) {
         self.hashes.lock().unwrap().remove(&pid);
+    }
+
+    fn save_session(&self, snapshot: &Value) {
+        if let Some(path) = &self.session_file {
+            let _ = session::save(path, &self.cwd, snapshot);
+        }
     }
 }

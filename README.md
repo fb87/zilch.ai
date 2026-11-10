@@ -173,6 +173,12 @@ Its context is compacted when it reaches 75% of `context_tokens` on its role (de
 old tool output is shortened first, then older turns are summarized by the model, so a long session
 does not keep getting slower. Subagents start fresh per task, so they stay small anyway.
 
+**Sessions.** After every served order the main agent's conversation is saved under
+`<data dir>/zilch/os-sessions/` (one directory per workspace, files mode 0600). `zilch-os -c`
+continues the most recent session of the current directory: the main agent remembers it and order
+numbers carry on. `--no-session` saves nothing. Work on an order that was not served yet is not
+saved; a continued session starts from the last served order. Plans need an explicit `y`.
+
 `@3 text` sends more input to process 3, `@developer text` to every live subagent of the newest
 order, and `@main text` to the main agent (when it is idle, that is simply the next order).
 Nothing in flight is cancelled: the note is read before the process's next model call. Notes to
@@ -194,7 +200,8 @@ mapping `[roles.master]` (or `[roles.architect]`) to the main agent and `[roles.
 `[roles.developer]`) to the subagents.
 
 ```sh
-zilch-os --model beam-free              # REPL: type an order, Enter approves the plan
+zilch-os --model beam-free              # REPL: type an order, y approves the plan
+zilch-os -c                             # continue the last session in this directory
 zilch-os -p "add a --version flag" --yes
 ```
 
