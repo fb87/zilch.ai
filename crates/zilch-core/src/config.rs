@@ -150,6 +150,8 @@ pub struct FileConfig {
     pub bash_protect_git: Option<bool>,
     pub max_session_tokens: Option<u64>,
     pub max_session_cost: Option<f64>,
+    /// Loop protection: identical repeats before an agent is nudged, then stopped (default 3, 0 = off).
+    pub loop_limit: Option<usize>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderCfg>,
     pub defaults: Option<RoleCfg>,
@@ -200,6 +202,9 @@ pub struct Config {
     pub bash_protect_git: bool,
     /// Team-wide token cap per session (prompt + completion), None = unlimited.
     pub max_session_tokens: Option<u64>,
+    /// Loop protection (see agent::supervisor): repeats tolerated before an agent is nudged and then
+    /// stopped, and failed attempts of an unchanged TODO before it is no longer run. 0 = off.
+    pub loop_limit: usize,
     /// Team-wide spend cap in USD per session (needs known prices), None = unlimited.
     pub max_session_cost: Option<f64>,
     pub providers: BTreeMap<String, ProviderCfg>,
@@ -332,6 +337,7 @@ impl Config {
             bash_protect_git: fc.bash_protect_git.unwrap_or(true),
             max_session_tokens: ov.max_session_tokens.or(fc.max_session_tokens),
             max_session_cost: ov.max_session_cost.or(fc.max_session_cost),
+            loop_limit: fc.loop_limit.unwrap_or(crate::agent::supervisor::DEFAULT_LOOP_LIMIT),
             providers: fc.providers,
             profiles,
         };
@@ -398,6 +404,7 @@ fn merge_file(dst: &mut FileConfig, src: FileConfig, base: &Path) {
     merge_opt(&mut dst.bash_protect_git, src.bash_protect_git);
     merge_opt(&mut dst.max_session_tokens, src.max_session_tokens);
     merge_opt(&mut dst.max_session_cost, src.max_session_cost);
+    merge_opt(&mut dst.loop_limit, src.loop_limit);
     for (k, v) in src.providers {
         dst.providers.entry(k).or_default().merge(v);
     }

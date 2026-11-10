@@ -32,6 +32,7 @@ fn agent(dir: &std::path::Path, model: Option<&str>, max_steps: usize) -> Agent 
         tools: worker_tools().filter(|t| !t.mutating()),
         history: vec![],
         max_steps,
+        loop_limit: 3,
         context_tokens: 128_000,
         ctx,
         hooks: None,

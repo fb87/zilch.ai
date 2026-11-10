@@ -2,6 +2,7 @@
 
 use super::todo::{scopes_overlap, Todo, TodoStatus};
 use super::{report_ok, TeamShared};
+use crate::agent::EventKind;
 use crate::tools::{truncate_output, Scope};
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
@@ -42,6 +43,7 @@ pub async fn run(shared: &Arc<TeamShared>, ids: Option<Vec<String>>) -> Result<S
     let target_set: HashSet<String> = targets.iter().cloned().collect();
     let cancel = shared.cancel.current();
     let mut running: HashMap<String, Vec<String>> = HashMap::new();
+    let mut keys: HashMap<String, u64> = HashMap::new();
     let mut set: JoinSet<Outcome> = JoinSet::new();
 
     loop {
@@ -75,6 +77,17 @@ pub async fn run(shared: &Arc<TeamShared>, ids: Option<Vec<String>>) -> Result<S
         };
 
         for t in to_start {
+            let key = task_key(&t);
+            if let Some(refusal) = refuse_repeat(shared, key) {
+                // Loop protection: this exact task keeps failing; running it again is waste.
+                shared.events.emit(
+                    "master",
+                    EventKind::Notice(format!("⚠ supervisor: [{}] not run — the same task already failed {} times", t.id, refusal.0)),
+                );
+                shared.set_todo_status(&t.id, TodoStatus::Failed, None, Some(refusal.1));
+                continue;
+            }
+            keys.insert(t.id.clone(), key);
             running.insert(t.id.clone(), t.files.clone());
             shared.set_todo_status(&t.id, TodoStatus::InProgress, None, None);
             let sh = shared.clone();
@@ -103,12 +116,25 @@ pub async fn run(shared: &Arc<TeamShared>, ids: Option<Vec<String>>) -> Result<S
             Err(e) => bail!("worker task panicked: {e}"),
         };
         running.remove(&id);
-        match outcome {
+        let key = keys.remove(&id);
+        let failure = match outcome {
             Ok((instance, report)) => {
-                let st = if report_ok(&report) { TodoStatus::Done } else { TodoStatus::Failed };
-                shared.set_todo_status(&id, st, Some(instance), Some(report));
+                let ok = report_ok(&report);
+                let st = if ok { TodoStatus::Done } else { TodoStatus::Failed };
+                shared.set_todo_status(&id, st, Some(instance), Some(report.clone()));
+                (!ok).then_some(report)
             }
-            Err(e) => shared.set_todo_status(&id, TodoStatus::Failed, None, Some(format!("Error: {e:#}"))),
+            Err(e) => {
+                let report = format!("Error: {e:#}");
+                shared.set_todo_status(&id, TodoStatus::Failed, None, Some(report.clone()));
+                (!report.contains("cancelled")).then_some(report)
+            }
+        };
+        if let (Some(key), Some(report)) = (key, failure) {
+            let mut f = shared.task_failures.lock().unwrap();
+            let e = f.entry(key).or_insert((0, String::new()));
+            e.0 += 1;
+            e.1 = report;
         }
         // Persist progress now: a crash later in this run must not lose finished TODOs.
         shared.checkpoint();
@@ -134,6 +160,36 @@ pub async fn run(shared: &Arc<TeamShared>, ids: Option<Vec<String>>) -> Result<S
         out.push('\n');
     }
     Ok(out)
+}
+
+/// Identity of a task for loop protection: the worker and its instructions, whitespace-normalized.
+/// A TODO re-run under a new id is the same task; one whose instructions changed is not.
+pub fn task_key(t: &Todo) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let worker = t.worker.split('#').next().unwrap_or(&t.worker);
+    let task = t.task.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (worker, task, &t.files).hash(&mut h);
+    h.finish()
+}
+
+/// If this task already failed `loop_limit - 1` times unchanged, the (count, report) to fail it
+/// with instead of running it again.
+fn refuse_repeat(shared: &TeamShared, key: u64) -> Option<(usize, String)> {
+    let limit = shared.cfg.loop_limit;
+    let f = shared.task_failures.lock().unwrap();
+    let (n, last) = f.get(&key)?;
+    (limit > 0 && *n + 1 >= limit).then(|| {
+        (
+            *n,
+            format!(
+                "[stopped by the supervisor: not run — this exact task already failed {n} times. Running it unchanged \
+                 will fail again: change the instructions (another approach, a smaller step), or report the blocker \
+                 to the user.]\nSTATUS: failed\n\nLast failure:\n{}",
+                truncate_output(last.trim(), 2000)
+            ),
+        )
+    })
 }
 
 async fn run_one(sh: Arc<TeamShared>, t: Todo) -> Result<(String, String)> {

@@ -40,6 +40,9 @@ pub struct TeamShared {
     worker_tools: ToolRegistry,
     /// The spec lane's documents (spec.md, design.md, plan.md, versions/).
     pub spec_store: Arc<SpecStore>,
+    /// Team-level loop protection: failed runs per unchanged task (worker + instructions), with
+    /// the last failure report. See scheduler::task_key.
+    pub task_failures: Mutex<std::collections::HashMap<u64, (usize, String)>>,
 }
 
 impl TeamShared {
@@ -167,6 +170,7 @@ impl TeamShared {
             tools: reg,
             history: vec![],
             max_steps: profile.max_steps,
+            loop_limit: self.cfg.loop_limit,
             context_tokens: profile.context_tokens,
             ctx,
             hooks: None,
@@ -379,6 +383,7 @@ impl Team {
             meter: Arc::new(crate::llm::catalog::CostMeter::new(cfg.max_session_cost)),
             worker_tools: tools::worker_tools(),
             spec_store: Arc::new(SpecStore::new(cfg.spec_dir.clone())),
+            task_failures: Mutex::default(),
             cfg,
         });
 
@@ -407,6 +412,7 @@ impl Team {
             tools: reg,
             history: vec![],
             max_steps: profile.max_steps,
+            loop_limit: shared.cfg.loop_limit,
             context_tokens: profile.context_tokens,
             ctx,
             hooks: Some(Arc::new(MasterHooks { shared: shared.clone(), plan_seen: Mutex::new(None) })),
@@ -446,6 +452,7 @@ impl Team {
             tools: sreg,
             history: vec![],
             max_steps: sprof.max_steps,
+            loop_limit: shared.cfg.loop_limit,
             context_tokens: sprof.context_tokens,
             ctx: sctx,
             hooks: Some(Arc::new(SpecHooks(shared.spec_store.clone()))),

@@ -39,6 +39,7 @@ fn agent(dir: &std::path::Path, script: Vec<Option<Vec<LlmEvent>>>) -> Agent {
         tools: worker_tools(),
         history: vec![],
         max_steps: 10,
+        loop_limit: 3,
         context_tokens: 128_000,
         ctx: Arc::new(ToolCtx::new("t", dir.to_path_buf(), gate, EventSink::null(), CancelCell::default(), FileLocks::default())),
         hooks: None,
@@ -144,4 +145,28 @@ async fn caps_refuse_before_sending_and_costs_are_recorded() {
     assert!(b.history.len() == 2);
     let err = b.run("second").await.unwrap_err().to_string();
     assert!(err.contains("cost cap"), "{err}");
+}
+
+#[tokio::test]
+async fn a_model_stuck_repeating_one_call_is_nudged_then_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+    // The model would make the same failing edit forever (10 scripted steps = max_steps).
+    let edit = || Some(vec![call(0, "edit_file", r#"{"path":"a.txt","old_string":"nope","new_string":"x"}"#)]);
+    let mut a = agent(dir.path(), (0..10).map(|_| edit()).collect());
+    let out = a.run("go").await.unwrap();
+    assert!(out.starts_with("[stopped by the supervisor:") && out.contains("STATUS: failed"), "{out}");
+    let steps = a.history.iter().filter(|m| m.role == Role::Assistant && !m.tool_calls.is_empty()).count();
+    assert_eq!(steps, 4, "nudged after 3 identical calls, stopped on the 4th instead of using all 10 steps");
+    assert!(a.history.iter().any(|m| m.role == Role::User && m.text().starts_with("[supervisor]")), "the nudge is in history");
+}
+
+#[tokio::test]
+async fn a_reply_that_keeps_repeating_while_streaming_is_cut() {
+    let dir = tempfile::tempdir().unwrap();
+    let spam: Vec<LlmEvent> = (0..500).map(|_| LlmEvent::TextDelta("Let me check that again. ".into())).collect();
+    let mut a = agent(dir.path(), vec![Some(spam), Some(vec![LlmEvent::TextDelta("Done, sorry.".into())])]);
+    assert_eq!(a.run("go").await.unwrap(), "Done, sorry.", "after the cut and the nudge the model answers normally");
+    let cut = a.history.iter().find(|m| m.text().contains("cut by the supervisor")).expect("cut reply kept, shortened");
+    assert!(cut.text().len() < 600, "only a short head of the runaway text stays in history");
 }

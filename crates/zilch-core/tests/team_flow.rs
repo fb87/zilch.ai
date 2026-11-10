@@ -280,3 +280,45 @@ async fn readonly_delegation_fans_out_in_parallel() {
     let reqs = fake.requests.lock().unwrap();
     assert!(reqs.iter().any(|r| r.messages[0].text().contains("You are an EXPLORER")));
 }
+
+#[tokio::test]
+async fn a_task_that_keeps_failing_unchanged_is_not_run_a_third_time() {
+    use zilch_core::team::todo::Todo;
+    let dir = tempfile::tempdir().unwrap();
+    // Every worker run fails.
+    let (team, fake, _, _rx) = setup(dir.path(), 2, Box::new(|_| vec![text("Could not do it.\nSTATUS: failed")]));
+    let todo = |id: &str, task: &str| Todo {
+        id: id.into(),
+        title: "fix the build".into(),
+        task: task.into(),
+        worker: "coder".into(),
+        files: vec!["src/**".into()],
+        depends_on: vec![],
+        model: None,
+        provider: None,
+        status: TodoStatus::Pending,
+        approved: true,
+        instance: None,
+        report: None,
+    };
+    let worker_runs = || fake.requests.lock().unwrap().len();
+    let run = |t: Todo| {
+        let shared = team.shared.clone();
+        async move {
+            shared.todos.lock().unwrap().items = vec![t];
+            team::scheduler::run(&shared, None).await.unwrap();
+            shared.todos.lock().unwrap().items[0].clone()
+        }
+    };
+    assert_eq!(run(todo("t1", "Make cargo build pass.")).await.status, TodoStatus::Failed);
+    // Retried under another id with only whitespace changed: still the same task.
+    assert_eq!(run(todo("t2", "Make  cargo build\npass.")).await.status, TodoStatus::Failed);
+    assert_eq!(worker_runs(), 2);
+    let third = run(todo("t3", "Make cargo build pass.")).await;
+    assert_eq!(third.status, TodoStatus::Failed);
+    assert!(third.report.as_deref().unwrap_or("").contains("already failed 2 times"), "{:?}", third.report);
+    assert_eq!(worker_runs(), 2, "no worker ran for the third identical attempt");
+    // Changed instructions are a new task and run again.
+    run(todo("t4", "Make cargo build pass: the error is a missing import in src/lib.rs.")).await;
+    assert_eq!(worker_runs(), 3);
+}

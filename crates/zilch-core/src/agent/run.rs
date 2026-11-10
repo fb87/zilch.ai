@@ -2,7 +2,8 @@
 
 use super::approval::ApprovalRequest;
 use super::events::EventKind;
-use crate::llm::{complete, ChatRequest, LlmClient, Message, ModelBinding, ToolCall, Usage};
+use super::supervisor::{nudge_message, CallRecord, StreamGuard, Supervisor, Verdict, STOPPED_BY_SUPERVISOR};
+use crate::llm::{complete_until, ChatRequest, LlmClient, Message, ModelBinding, ToolCall, Usage};
 use crate::tools::{ToolCtx, ToolRegistry};
 use anyhow::{bail, Result};
 use futures::future::join_all;
@@ -30,6 +31,8 @@ pub struct Agent {
     pub tools: ToolRegistry,
     pub history: Vec<Message>,
     pub max_steps: usize,
+    /// Loop protection: repeats tolerated before the supervisor nudges, then stops (0 = off).
+    pub loop_limit: usize,
     pub context_tokens: usize,
     pub ctx: Arc<ToolCtx>,
     pub hooks: Option<Arc<dyn TurnHooks>>,
@@ -76,6 +79,7 @@ impl Agent {
         let cancel = self.ctx.cancel.current();
         self.history.push(Message::user(input));
         let mut reminded = false;
+        let mut supervisor = Supervisor::new(self.loop_limit);
 
         for _step in 0..self.max_steps {
             if cancel.is_cancelled() {
@@ -132,10 +136,27 @@ impl Agent {
             let id = self.id.clone();
             let llm = self.llm.clone();
             self.emit(EventKind::Thinking);
-            let (msg, usage) = tokio::select! {
-                r = complete(llm.as_ref(), &req, |t| events.emit(&id, EventKind::TextDelta(t.to_string()))) => r?,
+            let mut guard = supervisor.enabled().then(StreamGuard::new);
+            let on_text = |t: &str| {
+                events.emit(&id, EventKind::TextDelta(t.to_string()));
+                guard.as_mut().is_none_or(|g| !g.push(t))
+            };
+            let (mut msg, mut usage, cut) = tokio::select! {
+                r = complete_until(llm.as_ref(), &req, on_text) => r?,
                 _ = cancel.cancelled() => bail!("cancelled"),
             };
+            if cut {
+                // The provider never sent usage for a dropped stream: count an estimate so the
+                // budget still sees it. Keep only a short head of the runaway text in history.
+                let text = msg.content.take().unwrap_or_default();
+                if usage.prompt_tokens == 0 {
+                    usage.prompt_tokens = estimate;
+                    usage.completion_tokens = (text.len() / 4) as u64;
+                }
+                let head: String = text.chars().take(400).collect();
+                msg.content = Some(format!("{head}… [cut by the supervisor: this reply kept repeating itself]"));
+                msg.tool_calls.clear();
+            }
             self.usage += usage;
             if let Some(b) = &self.ctx.budget {
                 b.add(usage.prompt_tokens + usage.completion_tokens);
@@ -146,9 +167,25 @@ impl Agent {
                 self.emit(EventKind::TextDone);
             }
             let calls = msg.tool_calls.clone();
+            let text = msg.text().to_string();
             self.history.push(msg);
 
+            if cut {
+                let verdict = supervisor.strike("kept repeating the same text in one reply".into());
+                if let Some(stop) = self.supervise(verdict) {
+                    return Ok(stop);
+                }
+                continue;
+            }
+
             if calls.is_empty() {
+                let verdict = supervisor.observe(&text, &[]);
+                if let Some(stop) = self.supervise(verdict) {
+                    return Ok(stop);
+                }
+                if matches!(self.history.last(), Some(m) if m.role == crate::llm::Role::User) {
+                    continue; // nudged: let it answer differently
+                }
                 if !reminded {
                     if let Some(nudge) = self.hooks.as_ref().and_then(|h| h.on_finish()) {
                         reminded = true;
@@ -160,13 +197,41 @@ impl Agent {
             }
 
             let results = self.execute_calls(&calls).await;
+            let records: Vec<CallRecord> = calls
+                .iter()
+                .zip(&results)
+                .map(|(c, r)| CallRecord { name: &c.function.name, arguments: &c.function.arguments, result: r })
+                .collect();
+            let verdict = supervisor.observe(&text, &records);
             for (call, result) in calls.iter().zip(results) {
                 self.history.push(Message::tool(&call.id, result));
+            }
+            if let Some(stop) = self.supervise(verdict) {
+                return Ok(stop);
             }
         }
         let note = format!("[stopped after reaching max_steps={}]", self.max_steps);
         self.history.push(Message::assistant(&note));
         Ok(note)
+    }
+
+    /// Act on the supervisor's verdict: a nudge goes into the history (the turn continues); a
+    /// stop returns the note that ends the turn. Both are announced to the user.
+    fn supervise(&mut self, verdict: Verdict) -> Option<String> {
+        match verdict {
+            Verdict::Ok => None,
+            Verdict::Nudge(reason) => {
+                self.emit(EventKind::Notice(format!("⚠ {} looping: {reason} — nudged", self.id)));
+                self.history.push(Message::user(nudge_message(&reason)));
+                None
+            }
+            Verdict::Stop(reason) => {
+                self.emit(EventKind::Notice(format!("⚠ {} stopped by the supervisor: {reason}", self.id)));
+                let note = format!("{STOPPED_BY_SUPERVISOR} it {reason}, again after a warning]\nSTATUS: failed");
+                self.history.push(Message::assistant(&note));
+                Some(note)
+            }
+        }
     }
 
     /// Approve sequentially (prompts are serialized anyway), then execute all approved calls concurrently.

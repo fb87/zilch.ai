@@ -24,17 +24,37 @@ pub trait LlmClient: Send + Sync {
 
 /// Run a request to completion, forwarding text deltas to `on_text`.
 pub async fn complete(client: &dyn LlmClient, req: &ChatRequest, mut on_text: impl FnMut(&str) + Send) -> Result<(Message, Usage)> {
+    let (msg, usage, _) = complete_until(client, req, |t| {
+        on_text(t);
+        true
+    })
+    .await?;
+    Ok((msg, usage))
+}
+
+/// Like [`complete`], but `on_text` can stop the reply early by returning false: the stream is
+/// dropped (closing the connection so the provider stops generating) and the partial message is
+/// returned with `true` as the third value.
+pub async fn complete_until(
+    client: &dyn LlmClient,
+    req: &ChatRequest,
+    mut on_text: impl FnMut(&str) -> bool + Send,
+) -> Result<(Message, Usage, bool)> {
     let mut stream = client.stream(req).await?;
     let mut acc = accumulate::Accumulator::default();
+    let mut cut = false;
     while let Some(ev) = stream.next().await {
         let ev = ev?;
-        if let LlmEvent::TextDelta(t) = &ev {
-            on_text(t);
-        }
+        let keep = if let LlmEvent::TextDelta(t) = &ev { on_text(t) } else { true };
         acc.push(&ev);
+        if !keep {
+            cut = true;
+            break;
+        }
     }
+    drop(stream);
     let usage = acc.usage;
-    Ok((acc.finish(), usage))
+    Ok((acc.finish(), usage, cut))
 }
 
 /// Named providers; every agent bound to a provider shares its client (and its concurrency limit).
