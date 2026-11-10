@@ -184,12 +184,23 @@ fn open_log(cli: &Cli) -> Option<(PathBuf, std::fs::File)> {
 }
 
 fn ps(k: &KernelHandle) -> String {
+    let st = k.stats();
+    let groups: Vec<String> = st
+        .groups
+        .iter()
+        .map(|(g, used, quota)| match quota {
+            Some(q) => format!("{} {}k/{}k", g.name(), used / 1000, q / 1000),
+            None => format!("{} {}k", g.name(), used / 1000),
+        })
+        .collect();
+    let tokens = if groups.is_empty() { "0".to_string() } else { groups.join(", ") };
+    let header = format!("workers {}/{} busy · ready queues {:?} · tokens {tokens}", st.busy_workers, st.workers, st.queued);
     let rows = k.ps();
     if rows.is_empty() {
-        return "No processes (place an order).".into();
+        return format!("{header}\nNo processes (place an order).");
     }
-    let mut s =
-        format!("{:>4} {:>6} {:<10} {:<16} {:>5} {:>8}  {}\n", "PID", "TICKET", "GROUP", "STATE", "STEPS", "TOKENS", "DOING / TITLE");
+    let mut s = format!("{header}\n");
+    s += &format!("{:>4} {:>6} {:<10} {:<16} {:>5} {:>8}  {}\n", "PID", "TICKET", "GROUP", "STATE", "STEPS", "TOKENS", "DOING / TITLE");
     for p in rows {
         let doing = if p.doing.is_empty() { p.title.clone() } else { format!("{} — {}", p.doing, p.title) };
         s.push_str(&format!(
@@ -258,6 +269,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         loop_limit: cfg.loop_limit.unwrap_or(defaults.loop_limit),
         max_steps: cfg.max_steps,
         max_tokens: cfg.max_task_tokens,
+        group_tokens: cfg.group_tokens.clone(),
         auto_approve: cli.yes,
         ..defaults
     };

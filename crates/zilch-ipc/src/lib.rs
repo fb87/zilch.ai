@@ -23,7 +23,7 @@ pub type TicketId = u64;
 pub const CLI_PID: Pid = 0;
 
 /// Stations of the kitchen; each has its own default capabilities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Group {
     /// Head chef: requirements, design, plan. Writes docs only.
     Architecture,
@@ -106,6 +106,9 @@ pub struct PlanTask {
     /// How to tell the task is done ("cargo test export::json passes").
     #[serde(default)]
     pub acceptance: Vec<String>,
+    /// Scheduling priority: 0 most urgent … 3 background (default 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u8>,
 }
 
 /// What an agent asks the kernel to do. A step may issue several; they run in parallel and the

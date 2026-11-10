@@ -171,7 +171,12 @@ steps after removing what changes from run to run (durations, timestamps, temp p
 A process that loops is nudged first; if it loops again, it is restarted with a summary of what
 it tried (built in code, no extra model call), at most twice in 10 minutes, and then stopped. A
 process that stops making progress is interrupted, then restarted or killed. When every process
-of an order waits for a message nobody can send, the youngest one is woken with an error. `zilch-os` reads the same config files as `zilch`,
+of an order waits for a message nobody can send, the youngest one is woken with an error.
+Tasks can carry a `priority` (0 most urgent … 3 background), and `[quotas]` caps the tokens of a
+group (`developer = 2000000`), like a cgroup. `/ps` shows the process table under a `top`-style
+header: busy workers, ready queues, tokens per group.
+
+`zilch-os` reads the same config files as `zilch`,
 mapping `[roles.master]` to the Architect and `[roles.coder]` to the Developer.
 
 ```sh

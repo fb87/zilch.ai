@@ -27,7 +27,8 @@ pub fn submit_plan_spec() -> ToolSpec {
             "task":{"type":"string","description":"Complete, self-contained brief for the developer"},
             "depends_on":{"type":"array","items":{"type":"string"}},
             "owned_paths":{"type":"array","items":{"type":"string"},"description":"Files/globs this task may write (disjoint from parallel tasks)"},
-            "acceptance":{"type":"array","items":{"type":"string"}}
+            "acceptance":{"type":"array","items":{"type":"string"}},
+            "priority":{"type":"integer","description":"0 most urgent … 3 background (default 1)"}
         },"required":["id","title","task","owned_paths"]}}},"required":["tasks"]}),
     )
 }

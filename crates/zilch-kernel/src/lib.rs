@@ -139,6 +139,8 @@ pub struct KernelConfig {
     /// Supervisor restarts allowed per process within `restart_window_ticks`; beyond that it is stopped.
     pub max_restarts: usize,
     pub restart_window_ticks: u64,
+    /// Token quota per group (like a cgroup); a process of a group over its quota is stopped.
+    pub group_tokens: BTreeMap<Group, u64>,
 }
 
 impl Default for KernelConfig {
@@ -157,6 +159,7 @@ impl Default for KernelConfig {
             age_ticks: 50,
             max_restarts: 2,
             restart_window_ticks: 6000, // 10 minutes at 100 ms
+            group_tokens: BTreeMap::new(),
         }
     }
 }
@@ -172,6 +175,7 @@ pub enum Cmd {
     Kill(Pid),
     KillTicket(TicketId),
     Ps(Sender<Vec<ProcInfo>>),
+    Stats(Sender<Stats>),
     Shutdown,
 }
 
@@ -188,6 +192,18 @@ pub struct ProcInfo {
     pub steps: u32,
     pub tokens: u64,
     pub age_ticks: u64,
+}
+
+/// Kernel-wide numbers, like the header of `top`.
+#[derive(Debug, Clone, Default)]
+pub struct Stats {
+    pub tick: u64,
+    pub workers: usize,
+    pub busy_workers: usize,
+    /// Ready processes per priority level (0 first).
+    pub queued: Vec<usize>,
+    /// Tokens used per group, with its quota if one is set.
+    pub groups: Vec<(Group, u64, Option<u64>)>,
 }
 
 // ───────────────────────────── process table ─────────────────────────────
@@ -402,6 +418,8 @@ pub struct Kernel {
     tickets: BTreeMap<TicketId, Ticket>,
     /// Open questions: qid → ticket.
     questions: BTreeMap<u64, TicketId>,
+    /// Tokens used per group (for quotas and stats).
+    group_used: BTreeMap<Group, u64>,
     workers: Pool,
     io: Pool,
     exec: Pool,
@@ -417,6 +435,11 @@ pub struct KernelHandle {
 impl KernelHandle {
     pub fn send(&self, cmd: Cmd) {
         let _ = self.tx.send(KEvent::Cmd(cmd));
+    }
+    pub fn stats(&self) -> Stats {
+        let (tx, rx) = channel();
+        self.send(Cmd::Stats(tx));
+        rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default()
     }
     pub fn ps(&self) -> Vec<ProcInfo> {
         let (tx, rx) = channel();
@@ -469,6 +492,7 @@ impl Kernel {
             queues: Default::default(),
             tickets: BTreeMap::new(),
             questions: BTreeMap::new(),
+            group_used: BTreeMap::new(),
         }
     }
 
@@ -526,6 +550,28 @@ impl Kernel {
                     })
                     .collect();
                 let _ = reply.send(rows);
+            }
+            Cmd::Stats(reply) => {
+                let mut groups: Vec<(Group, u64, Option<u64>)> =
+                    self.group_used.iter().map(|(g, u)| (*g, *u, self.cfg.group_tokens.get(g).copied())).collect();
+                for (g, q) in &self.cfg.group_tokens {
+                    if !self.group_used.contains_key(g) {
+                        groups.push((*g, 0, Some(*q)));
+                    }
+                }
+                groups.sort();
+                let workers = self.cfg.workers.max(1);
+                let _ = reply.send(Stats {
+                    tick: self.tick,
+                    workers,
+                    busy_workers: workers - self.idle_workers,
+                    queued: self
+                        .queues
+                        .iter()
+                        .map(|q| q.iter().filter(|p| self.acbs.get(p).is_some_and(|a| a.state == State::Ready)).count())
+                        .collect(),
+                    groups,
+                });
             }
             Cmd::Shutdown => {}
         }
@@ -665,7 +711,16 @@ impl Kernel {
         let reason = if a.steps >= self.cfg.max_steps {
             Some(format!("step budget exhausted ({} steps)", self.cfg.max_steps))
         } else {
-            self.cfg.max_tokens.filter(|m| a.tokens >= *m).map(|m| format!("token budget exhausted ({} of {m} tokens)", a.tokens))
+            let used = self.group_used.get(&a.group).copied().unwrap_or(0);
+            self.cfg.max_tokens.filter(|m| a.tokens >= *m).map(|m| format!("token budget exhausted ({} of {m} tokens)", a.tokens)).or_else(
+                || {
+                    self.cfg
+                        .group_tokens
+                        .get(&a.group)
+                        .filter(|q| used >= **q)
+                        .map(|q| format!("the {} group used up its token quota ({used} of {q} tokens)", a.group.name()))
+                },
+            )
         };
         match reason {
             Some(r) => {
@@ -810,6 +865,7 @@ impl Kernel {
         }
         if let SyscallResult::Completion { usage, .. } = &result {
             a.tokens += usage.prompt_tokens + usage.completion_tokens;
+            *self.group_used.entry(a.group).or_default() += usage.prompt_tokens + usage.completion_tokens;
             let model = a.inflight.get(idx).map(|f| f.summary.trim_start_matches("llm ").to_string()).unwrap_or_default();
             self.bus.publish(KernelEvent::Usage {
                 pid,
@@ -1041,7 +1097,8 @@ impl Kernel {
             let agent = self.recipes.developer(ticket, &task, &context);
             let caps = Caps { write: task.owned_paths.clone(), write_any: task.owned_paths.is_empty(), exec: true };
             let title = format!("[{}] {}", task.id, task.title);
-            let pid = self.spawn(agent, Some(root), ticket, Group::Development, title, caps, cancel.child(), 1);
+            let priority = task.priority.unwrap_or(1);
+            let pid = self.spawn(agent, Some(root), ticket, Group::Development, title, caps, cancel.child(), priority);
             let run = &mut self.tickets.get_mut(&ticket).unwrap().plan.as_mut().unwrap().runs[i];
             run.status = TaskStatus::Running;
             run.pid = Some(pid);
@@ -1208,7 +1265,8 @@ pub fn render_plan(tasks: &[PlanTask]) -> String {
         for id in wave {
             if let Some(t) = tasks.iter().find(|t| &t.id == id) {
                 let paths = if t.owned_paths.is_empty() { "any file".into() } else { t.owned_paths.join(", ") };
-                s.push_str(&format!("  ☐ [{}] {}  ({paths})\n", t.id, t.title));
+                let prio = t.priority.filter(|p| *p != 1).map(|p| format!(" · priority {p}")).unwrap_or_default();
+                s.push_str(&format!("  ☐ [{}] {}  ({paths}{prio})\n", t.id, t.title));
                 for a in &t.acceptance {
                     s.push_str(&format!("      ✓ {a}\n"));
                 }

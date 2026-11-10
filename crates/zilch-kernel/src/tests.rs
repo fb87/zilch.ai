@@ -22,7 +22,17 @@ impl Drivers for FakeDrivers {
         }
     }
     fn run(&self, ctx: &DriverCtx, call: Syscall) -> SyscallResult {
-        let Syscall::Tool { name, .. } = call else { return SyscallResult::Failed("no llm in this test".into()) };
+        let name = match call {
+            Syscall::Tool { name, .. } => name,
+            // Every model call "costs" 30 tokens.
+            _ => {
+                return SyscallResult::Completion {
+                    message: zilch_ipc::Message::assistant("thinking"),
+                    usage: zilch_ipc::Usage { prompt_tokens: 25, completion_tokens: 5 },
+                    cut: false,
+                }
+            }
+        };
         match name.as_str() {
             "work" => {
                 let start = Instant::now();
@@ -86,6 +96,7 @@ fn task(id: &str, deps: &[&str], paths: &[&str]) -> PlanTask {
         depends_on: deps.iter().map(|s| s.to_string()).collect(),
         owned_paths: paths.iter().map(|s| s.to_string()).collect(),
         acceptance: vec![],
+        priority: None,
     }
 }
 
@@ -450,4 +461,41 @@ fn processes_waiting_on_each_other_are_woken_instead_of_waiting_forever() {
         })
         .collect();
     assert_eq!(order, vec![3, 2], "the youngest waiter is woken first");
+}
+
+fn llm_call() -> Syscall {
+    Syscall::Complete(zilch_ipc::ChatRequest { binding: Default::default(), messages: vec![], tools: vec![], session: None })
+}
+
+#[test]
+fn urgent_tasks_start_first_when_workers_are_scarce() {
+    let drivers = Arc::new(FakeDrivers::default());
+    let mut low = task("LOW", &[], &["a"]);
+    low.priority = Some(3);
+    let mut high = task("HIGH", &[], &["b"]);
+    high.priority = Some(0);
+    // LOW is listed (and spawned) first; with one worker HIGH must still run first.
+    let mut run = Run::new(KernelConfig { workers: 1, ..cfg() }, drivers.clone(), Book { tasks: vec![low, high], dev: worker() });
+    run.k.send(Cmd::Order("x".into()));
+    let KernelEvent::Question { text, .. } = run.wait(|e| matches!(e, KernelEvent::Question { .. })) else { unreachable!() };
+    assert!(text.contains("[LOW] LOW  (a · priority 3)") && text.contains("[HIGH] HIGH  (b · priority 0)"), "{text}");
+    run.served();
+    let spans = drivers.spans.lock().unwrap().clone();
+    let first = spans.iter().min_by_key(|s| s.1).unwrap().0;
+    assert_eq!(first, 3, "pid 3 (HIGH) ran before pid 2 (LOW)");
+}
+
+#[test]
+fn a_group_over_its_token_quota_is_stopped_and_stats_show_usage() {
+    let drivers = Arc::new(FakeDrivers::default());
+    let dev: DevScript = Arc::new(|_| Box::new(Scripted(0, |_, _, _| StepResult::Syscalls(vec![llm_call()]))));
+    // Loop detection off: the fake model always gives the same reply.
+    let k = KernelConfig { group_tokens: [(Group::Development, 100)].into(), loop_limit: 0, ..cfg() };
+    let mut run = Run::new(k, drivers, Book { tasks: vec![task("T1", &[], &["a"])], dev });
+    run.k.send(Cmd::Order("x".into()));
+    let (_, summary) = run.served();
+    assert!(summary.contains("the developer group used up its token quota (120 of 100 tokens)"), "{summary}");
+    let stats = run.k.stats();
+    assert_eq!(stats.groups, vec![(Group::Development, 120, Some(100))]);
+    assert_eq!((stats.busy_workers, stats.queued.iter().sum::<usize>()), (0, 0));
 }
