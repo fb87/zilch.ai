@@ -57,6 +57,7 @@ impl DriverSet {
             locks: self.locks.clone(),
             read_hashes: hashes,
             progress: None,
+            alive: Some(ctx.alive.clone()),
         }
     }
 }
@@ -73,7 +74,7 @@ impl Drivers for DriverSet {
                     return SyscallResult::Failed(format!("unknown provider '{}'", req.binding.provider));
                 };
                 let (pid, bus) = (ctx.pid, ctx.bus);
-                match llm::complete(backend.as_ref(), &req, ctx.cancel, |t| {
+                match llm::complete(backend.as_ref(), &req, ctx.cancel, &*ctx.alive, |t| {
                     bus.publish(KernelEvent::TextDelta { pid, text: t.to_string() })
                 }) {
                     Ok((message, usage, cut)) => SyscallResult::Completion { message, usage, cut },

@@ -91,6 +91,9 @@ pub struct DriverCtx<'a> {
     pub ticket: TicketId,
     pub cancel: &'a CancelToken,
     pub bus: &'a EventBus,
+    /// Call while a long syscall is still alive (streaming, queued for a provider slot, backing
+    /// off): the hang detector then knows it is slow, not stuck. Cheap; rate-limited inside.
+    pub alive: Arc<dyn Fn() + Send + Sync>,
 }
 
 /// The equipment: everything with side effects. Called from driver pool threads.
@@ -352,8 +355,22 @@ struct Ticket {
 }
 
 enum KEvent {
-    WorkerDone { pid: Pid, agent: Option<Box<dyn Agent>>, result: Result<StepResult, String> },
-    SyscallDone { pid: Pid, batch: u64, idx: usize, result: SyscallResult },
+    WorkerDone {
+        pid: Pid,
+        agent: Option<Box<dyn Agent>>,
+        result: Result<StepResult, String>,
+    },
+    SyscallDone {
+        pid: Pid,
+        batch: u64,
+        idx: usize,
+        result: SyscallResult,
+    },
+    /// A driver call of this batch is still alive (see `DriverCtx::alive`).
+    Alive {
+        pid: Pid,
+        batch: u64,
+    },
     Cmd(Cmd),
 }
 
@@ -525,6 +542,12 @@ impl Kernel {
                 Ok(KEvent::Cmd(c)) => self.command(c),
                 Ok(KEvent::WorkerDone { pid, agent, result }) => self.step_done(pid, agent, result),
                 Ok(KEvent::SyscallDone { pid, batch, idx, result }) => self.syscall_done(pid, batch, idx, result),
+                Ok(KEvent::Alive { pid, batch }) => {
+                    let tick = self.tick;
+                    if let Some(a) = self.acbs.get_mut(&pid).filter(|a| a.batch == batch) {
+                        a.last_progress = tick;
+                    }
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -939,7 +962,17 @@ impl Kernel {
                         let result = if cancel.is_cancelled() {
                             SyscallResult::Failed("cancelled".into())
                         } else {
-                            let ctx = DriverCtx { pid, ticket, cancel: &cancel, bus: &bus };
+                            // Heartbeats to the kernel, at most one a second.
+                            let last = std::sync::Mutex::new(Instant::now() - Duration::from_secs(2));
+                            let alive_tx = std::sync::Mutex::new(tx.clone());
+                            let alive: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                                let mut l = last.lock().unwrap();
+                                if l.elapsed() >= Duration::from_secs(1) {
+                                    *l = Instant::now();
+                                    let _ = alive_tx.lock().unwrap().send(KEvent::Alive { pid, batch });
+                                }
+                            });
+                            let ctx = DriverCtx { pid, ticket, cancel: &cancel, bus: &bus, alive };
                             drivers.run(&ctx, call)
                         };
                         let _ = tx.send(KEvent::SyscallDone { pid, batch, idx, result });

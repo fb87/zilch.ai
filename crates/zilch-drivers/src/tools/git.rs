@@ -114,7 +114,7 @@ impl Tool for GitTool {
                 cmd.env_remove(k);
             }
         }
-        let out = super::output_with_timeout(cmd, TIMEOUT, &ctx.cancel).context("could not run git (is it installed?)")?;
+        let out = super::output_with_timeout(cmd, TIMEOUT, &ctx.cancel, &|| ctx.alive()).context("could not run git (is it installed?)")?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);

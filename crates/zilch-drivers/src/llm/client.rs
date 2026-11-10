@@ -23,12 +23,13 @@ struct Slots {
 }
 
 impl Slots {
-    fn acquire(&self, cancel: &CancelToken) -> Result<SlotGuard<'_>> {
+    fn acquire(&self, cancel: &CancelToken, alive: &dyn Fn()) -> Result<SlotGuard<'_>> {
         let mut free = self.free.lock().unwrap();
         while *free == 0 {
             if cancel.is_cancelled() {
                 bail!("cancelled");
             }
+            alive(); // queued for a provider slot: slow, not stuck
             free = self.cv.wait_timeout(free, Duration::from_millis(100)).unwrap().0;
         }
         *free -= 1;
@@ -107,12 +108,13 @@ impl HttpClient {
         self
     }
 
-    fn sleep_cancellable(d: Duration, cancel: &CancelToken) -> Result<()> {
+    fn sleep_cancellable(d: Duration, cancel: &CancelToken, alive: &dyn Fn()) -> Result<()> {
         let end = Instant::now() + d;
         while Instant::now() < end {
             if cancel.is_cancelled() {
                 bail!("cancelled");
             }
+            alive();
             std::thread::sleep(Duration::from_millis(50).min(end.saturating_duration_since(Instant::now())));
         }
         Ok(())
@@ -124,9 +126,9 @@ fn jitter_ms() -> u64 {
 }
 
 impl Backend for HttpClient {
-    fn stream(&self, req: &ChatRequest, cancel: &CancelToken, on_event: &mut dyn FnMut(LlmEvent) -> bool) -> Result<()> {
+    fn stream(&self, req: &ChatRequest, cancel: &CancelToken, alive: &dyn Fn(), on_event: &mut dyn FnMut(LlmEvent) -> bool) -> Result<()> {
         // Hold a provider slot for the whole lifetime of the stream.
-        let _slot = self.slots.acquire(cancel)?;
+        let _slot = self.slots.acquire(cancel, alive)?;
         let url = format!("{}{}", self.base_url, self.protocol.path());
         let body = self.protocol.body(req).to_string();
         let mut attempt = 0;
@@ -163,7 +165,7 @@ impl Backend for HttpClient {
                     Some(secs) => Duration::from_secs(secs.min(60)),
                     None => Duration::from_millis(500u64 * 2u64.pow(attempt) + jitter_ms()),
                 };
-                Self::sleep_cancellable(wait, cancel)?;
+                Self::sleep_cancellable(wait, cancel, alive)?;
                 continue;
             }
             bail!(err);
@@ -276,7 +278,7 @@ mod tests {
         let (url, seen) = serve(vec![busy, ok]);
         let c = HttpClient::new("p", url, Some("sk-test".into()), 2).with_session_header(Some("x-session".into()));
         let mut streamed = String::new();
-        let (msg, usage, cut) = complete(&c, &req(), &CancelToken::new(), |t| streamed.push_str(t)).unwrap();
+        let (msg, usage, cut) = complete(&c, &req(), &CancelToken::new(), &|| {}, |t| streamed.push_str(t)).unwrap();
         assert_eq!((msg.text(), streamed.as_str(), usage.prompt_tokens, cut), ("Hello", "Hello", 5, false));
         let heads = seen.lock().unwrap();
         assert_eq!(heads.len(), 2, "retried once after the 429");
@@ -289,7 +291,7 @@ mod tests {
         let bad = "HTTP/1.1 400 Bad Request\r\nContent-Length: 13\r\n\r\nunknown model".to_string();
         let (url, seen) = serve(vec![bad]);
         let c = HttpClient::new("p", url, None, 1);
-        let err = complete(&c, &req(), &CancelToken::new(), |_| {}).unwrap_err().to_string();
+        let err = complete(&c, &req(), &CancelToken::new(), &|| {}, |_| {}).unwrap_err().to_string();
         assert!(err.contains("400") && err.contains("unknown model"), "{err}");
         assert_eq!(seen.lock().unwrap().len(), 1);
     }
@@ -301,7 +303,7 @@ mod tests {
         let refs: Vec<&str> = spam.iter().map(String::as_str).chain(["[DONE]"]).collect();
         let (url, _) = serve(vec![sse(&refs)]);
         let c = HttpClient::new("p", url, None, 1);
-        let (msg, usage, cut) = complete(&c, &req(), &CancelToken::new(), |_| {}).unwrap();
+        let (msg, usage, cut) = complete(&c, &req(), &CancelToken::new(), &|| {}, |_| {}).unwrap();
         assert!(cut && msg.text().contains("cut by the supervisor") && msg.text().len() < 600);
         assert!(usage.completion_tokens > 0, "estimated for the budget");
     }

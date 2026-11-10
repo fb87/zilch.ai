@@ -144,6 +144,7 @@ impl Tool for Bash {
             if ctx.cancel.is_cancelled() {
                 break Err("cancelled; process group killed".into());
             }
+            ctx.alive();
             if start.elapsed() > timeout {
                 break Err(format!("timed out after {}s; process group killed", timeout.as_secs()));
             }

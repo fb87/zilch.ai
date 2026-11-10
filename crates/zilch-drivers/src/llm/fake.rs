@@ -27,13 +27,14 @@ impl ScriptedLlm {
 }
 
 impl Backend for ScriptedLlm {
-    fn stream(&self, req: &ChatRequest, cancel: &CancelToken, on_event: &mut dyn FnMut(LlmEvent) -> bool) -> Result<()> {
+    fn stream(&self, req: &ChatRequest, cancel: &CancelToken, alive: &dyn Fn(), on_event: &mut dyn FnMut(LlmEvent) -> bool) -> Result<()> {
         self.requests.lock().unwrap().push(req.clone());
         let end = std::time::Instant::now() + self.delay;
         while std::time::Instant::now() < end {
             if cancel.is_cancelled() {
                 anyhow::bail!("cancelled");
             }
+            alive(); // a slow but healthy model: still streaming
             std::thread::sleep(Duration::from_millis(5));
         }
         for ev in (self.script)(req) {

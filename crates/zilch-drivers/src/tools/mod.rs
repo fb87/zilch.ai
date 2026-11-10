@@ -122,6 +122,8 @@ pub struct ToolCtx {
     pub read_hashes: Arc<Mutex<HashMap<PathBuf, String>>>,
     /// Live output of long commands (latest line), for the process table.
     pub progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    /// Heartbeat to the kernel while a long call is still working (see `DriverCtx::alive`).
+    pub alive: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl ToolCtx {
@@ -134,6 +136,14 @@ impl ToolCtx {
             locks: FileLocks::default(),
             read_hashes: Arc::default(),
             progress: None,
+            alive: None,
+        }
+    }
+
+    /// Tell the kernel this call is still working (cheap; rate-limited by the kernel).
+    pub fn alive(&self) {
+        if let Some(a) = &self.alive {
+            a();
         }
     }
 
@@ -264,6 +274,7 @@ pub fn output_with_timeout(
     mut cmd: std::process::Command,
     timeout: std::time::Duration,
     cancel: &CancelToken,
+    alive: &dyn Fn(),
 ) -> Result<std::process::Output> {
     use std::io::Read;
     use std::process::Stdio;
@@ -284,6 +295,7 @@ pub fn output_with_timeout(
         if let Some(s) = child.try_wait()? {
             break s;
         }
+        alive();
         if cancel.is_cancelled() || start.elapsed() > timeout {
             let _ = child.kill();
             let _ = child.wait();

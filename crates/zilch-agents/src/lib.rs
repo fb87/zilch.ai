@@ -195,19 +195,23 @@ impl Agent for LlmAgent {
                         Some(self.dispatch(calls))
                     }
                 }
-                Some(other) if self.resident => {
-                    // Keep the session alive: retry once, then report the failure and wait.
+                Some(other) => {
+                    // A failed call (provider error, or interrupted by the hang detector) gets one
+                    // retry; a second failure in a row is reported: the main agent tells the guest and
+                    // waits, a subagent fails its task.
                     self.failures += 1;
                     if self.failures < 2 {
                         None
-                    } else {
+                    } else if self.resident {
                         self.failures = 0;
                         self.phase = Phase::AwaitInput;
                         Some(StepResult::Syscalls(vec![Syscall::Serve { summary: format!("[the model call failed: {}]", other.text()) }]))
+                    } else {
+                        Some(StepResult::Exit(ExitStatus::failed(format!(
+                            "[the model call failed twice: {}]\nSTATUS: failed",
+                            other.text()
+                        ))))
                     }
-                }
-                Some(other) => {
-                    Some(StepResult::Exit(ExitStatus::failed(format!("[the model call failed: {}]\nSTATUS: failed", other.text()))))
                 }
                 None => Some(StepResult::Exit(ExitStatus::failed("[the model call returned nothing]\nSTATUS: failed"))),
             },

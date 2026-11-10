@@ -45,6 +45,7 @@ impl Tool for GlobTool {
         {
             let mut hits: Vec<String> = walk(root.clone())
                 .filter_map(|p| {
+                    ctx.alive();
                     let rel = p.strip_prefix(&root).ok()?.to_string_lossy().into_owned();
                     matcher.is_match(&rel).then(|| p.strip_prefix(&cwd).unwrap_or(&p).to_string_lossy().into_owned())
                 })
@@ -92,6 +93,7 @@ impl Tool for GrepTool {
             let mut out = Vec::new();
             let mut total = 0usize;
             for p in walk(root) {
+                ctx.alive();
                 if let Some(f) = &filter {
                     let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     let rel = p.strip_prefix(&cwd).unwrap_or(&p).to_string_lossy().into_owned();

@@ -16,7 +16,8 @@ use zilch_kernel::CancelToken;
 
 /// Something that streams a chat completion. `on_event` returns false to stop the stream.
 pub trait Backend: Send + Sync {
-    fn stream(&self, req: &ChatRequest, cancel: &CancelToken, on_event: &mut dyn FnMut(LlmEvent) -> bool) -> Result<()>;
+    /// `alive` is called while the call is still making progress (queued, retrying, streaming).
+    fn stream(&self, req: &ChatRequest, cancel: &CancelToken, alive: &dyn Fn(), on_event: &mut dyn FnMut(LlmEvent) -> bool) -> Result<()>;
 }
 
 /// Run a request to completion: accumulate the reply, forward text as it streams, and cut a
@@ -25,12 +26,14 @@ pub fn complete(
     backend: &dyn Backend,
     req: &ChatRequest,
     cancel: &CancelToken,
+    alive: &dyn Fn(),
     mut on_text: impl FnMut(&str),
 ) -> Result<(Message, Usage, bool)> {
     let mut acc = accumulate::Accumulator::default();
     let mut guard = StreamGuard::new();
     let mut cut = false;
-    backend.stream(req, cancel, &mut |ev| {
+    backend.stream(req, cancel, alive, &mut |ev| {
+        alive();
         if let LlmEvent::TextDelta(t) = &ev {
             on_text(t);
             if guard.push(t) {
