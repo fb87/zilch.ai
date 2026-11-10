@@ -48,6 +48,15 @@ impl Drivers for FakeDrivers {
                 SyscallResult::Failed("cancelled".into())
             }
             "same" => SyscallResult::Output("same result".into()),
+            // Slow but healthy: runs well past the hang threshold, sending heartbeats.
+            "slow" => {
+                let end = Instant::now() + Duration::from_millis(3500);
+                while Instant::now() < end {
+                    (ctx.alive)();
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                SyscallResult::Output("slow done".into())
+            }
             _ => SyscallResult::Output("ok".into()),
         }
     }
@@ -686,4 +695,25 @@ fn a_killed_main_agent_is_replaced_by_a_new_one_on_the_next_order() {
     let (t, ok, _) = served_ticket(&mut run);
     assert_eq!((t, ok), (2, true));
     assert_eq!(mains.load(Ordering::SeqCst), 2, "a fresh main agent for the next order");
+}
+
+#[test]
+fn a_slow_call_that_sends_heartbeats_is_not_taken_for_a_hang() {
+    let drivers = Arc::new(FakeDrivers::default());
+    let dev: DevScript = Arc::new(|_| {
+        Box::new(Scripted(0, |n, wake, _| match n {
+            1 => StepResult::Syscalls(vec![tool("slow", json!({}))]),
+            _ => StepResult::Exit(ExitStatus::ok(format!("{}\nSTATUS: done", wake[0].text()))),
+        }))
+    });
+    // Hang threshold 1.5 s; the call takes 3.5 s but keeps saying it is alive (heartbeats reach
+    // the kernel at most once a second).
+    let mut run = Run::new(KernelConfig { hang_ticks: 150, ..cfg() }, drivers, Book { tasks: vec![task("T1", &[], &["a"])], dev });
+    run.k.send(Cmd::Order("x".into()));
+    let (ok, summary) = run.served();
+    assert!(ok && summary.contains("slow done"), "{summary}");
+    assert!(
+        !run.seen.iter().any(|e| matches!(e, KernelEvent::Signal { signal: Signal::Interrupt | Signal::Kill, .. })),
+        "no interrupt for a live call"
+    );
 }
