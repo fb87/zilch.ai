@@ -62,6 +62,9 @@ struct Cli {
     /// List the saved sessions of this directory and exit.
     #[arg(long)]
     sessions: bool,
+    /// Show the resolved setup and ping every model, then exit.
+    #[arg(long)]
+    doctor: bool,
     /// Show every model call and syscall result.
     #[arg(short, long)]
     verbose: bool,
@@ -432,6 +435,9 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         .with_costs(meter.clone(), cfg.max_session_tokens)
         .with_spec_dir(cfg.spec_dir.clone());
     let providers = drivers.providers();
+    if cli.doctor {
+        return Ok(doctor(&cfg, &meter, &cwd));
+    }
     let configured = (cfg.architect.clone(), cfg.developer.clone());
     // Sessions: the main agent's conversation is saved after every served order; -c continues the
     // most recent one of this directory.
@@ -1004,4 +1010,77 @@ fn recap(view: &View, session: Option<&PathBuf>) -> String {
 /// The spec documents' state, one paragraph.
 fn spec_status(dir: &std::path::Path) -> String {
     zilch_drivers::tools::spec_tools::SpecStore::new(dir.to_path_buf()).status().describe(dir)
+}
+
+/// --doctor: the resolved setup, then one tiny request to every distinct model.
+fn doctor(cfg: &Config, meter: &zilch_drivers::llm::catalog::CostMeter, cwd: &std::path::Path) -> i32 {
+    println!("zilch-os {} doctor — workspace {}", env!("CARGO_PKG_VERSION"), cwd.display());
+    if cfg.sources.is_empty() {
+        println!("  config      built-in defaults + environment (no config file found)");
+    }
+    for (i, s) in cfg.sources.iter().enumerate() {
+        println!("{}{}", if i == 0 { "  config      " } else { "              " }, s.display());
+    }
+    println!("  providers   {}", cfg.usable_providers().join(", "));
+    println!("  main/spec   {}", priced(meter, &cfg.architect));
+    println!("  subagents   {}", priced(meter, &cfg.developer));
+    let (_, sandbox) = zilch_drivers::tools::sandbox::status(cfg.policy.bash_sandbox, cfg.policy.bash.network);
+    println!("  commands    {sandbox}");
+    let caps = [cfg.max_session_tokens.map(|t| format!("{t} tokens")), cfg.max_session_cost.map(|c| format!("${c}"))]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    println!("  caps        {}", if caps.is_empty() { "none".to_string() } else { caps.join(", ") });
+    println!("  spec dir    {}", cfg.spec_dir.display());
+    println!(
+        "  sessions    {}",
+        zilch_drivers::session::default_root()
+            .map_or("unavailable".into(), |r| zilch_drivers::session::dir_for(&r, cwd).display().to_string())
+    );
+    let backends = cfg.backends();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut failed = false;
+    for b in [&cfg.architect, &cfg.developer] {
+        if !seen.insert(b.key()) {
+            continue;
+        }
+        let listed = {
+            let prefix = format!("{}/", b.provider);
+            let cat = meter.catalog.read().unwrap();
+            let any = cat.keys().any(|k| k.starts_with(&prefix));
+            match (any, cat.contains_key(&b.key())) {
+                (false, _) => "",
+                (true, true) => "",
+                (true, false) => " (not in the provider's model list!)",
+            }
+        };
+        let Some(backend) = backends.get(&b.provider) else {
+            println!("  ✗ {} — provider not usable (missing key?)", b.key());
+            failed = true;
+            continue;
+        };
+        let req = zilch_ipc::ChatRequest {
+            binding: zilch_ipc::ModelBinding { max_tokens: Some(256), ..b.clone() },
+            messages: vec![zilch_ipc::Message::user("Reply with the single word OK.")],
+            tools: vec![],
+            session: Some(format!("zilch-os-doctor-{}", std::process::id())),
+        };
+        let start = Instant::now();
+        match zilch_drivers::llm::complete(backend.as_ref(), &req, &zilch_kernel::CancelToken::new(), &|| {}, |_| {}) {
+            Ok((msg, _, _)) => {
+                let reply: String = msg.text().trim().chars().take(30).collect();
+                let reply = if reply.is_empty() { "(empty reply — the call works)".to_string() } else { reply };
+                println!("  ✓ {} answered in {:.1}s: {reply}{listed}", b.key(), start.elapsed().as_secs_f64());
+            }
+            Err(e) => {
+                println!("  ✗ {} — {e:#}{listed}", b.key());
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        1
+    } else {
+        0
+    }
 }

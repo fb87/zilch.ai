@@ -224,6 +224,7 @@ mapping `[roles.master]` (or `[roles.architect]`) to the main agent and `[roles.
 ```sh
 zilch-os --model beam-free              # REPL: type an order, y approves the plan
 zilch-os -c                             # continue the last session in this directory
+zilch-os --doctor                       # the resolved setup, and a ping of every model
 zilch-os -p "add a --version flag" --yes
 ```
 
