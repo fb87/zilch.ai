@@ -2,6 +2,7 @@
 //! what the kitchen does as it happens, relays the plan for approval, and serves the result.
 //! It never waits on the agents: the kernel runs on its own threads and reports on the event bus.
 
+mod completion;
 mod costs;
 mod ipc;
 #[allow(dead_code)] // ported whole from zilch-cli; streaming parts come later
@@ -414,6 +415,7 @@ Type an order to place it. While a plan waits for you: y approves, n rejects, an
 /redraw      clear the screen and re-render the last answer at the current width
 /help        this help
 /exit        quit (Ctrl-D)
+Tab completes commands, their arguments (groups, models, pids) and @ mentions.
 Ctrl-C cancels the newest open order.";
 
 fn main() {
@@ -640,12 +642,23 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
     }
 
     println!("{banner}\n{d}Type an order, or /help.{r}");
-    let mut rl: rustyline::Editor<status::StatusHelper, rustyline::history::DefaultHistory> = rustyline::Editor::new()?;
+    // Tab lists the choices (commands, their arguments, @ mentions) instead of cycling through them.
+    let editor_cfg = rustyline::Config::builder().completion_type(rustyline::CompletionType::List).build();
+    let mut rl: rustyline::Editor<status::StatusHelper, rustyline::history::DefaultHistory> = rustyline::Editor::with_config(editor_cfg)?;
     let mut printer = rl.create_external_printer()?;
+    // Completion from what is live now: process ids, and the models the providers list.
+    let (v_complete, m_complete) = (view.clone(), meter.clone());
+    let complete = move |line: &str, pos: usize| {
+        let pids = v_complete.live.lock().unwrap().keys().copied().collect();
+        let models = m_complete.catalog.read().unwrap().keys().filter_map(|k| k.split_once('/').map(|(_, m)| m.to_string())).collect();
+        completion::complete(line, pos, &completion::Live { pids, models })
+    };
     // The live status row above the prompt (terminals only), redrawn while something runs.
     let bar = color.then(|| Arc::new(status::StatusBar::default()));
+    // The helper is always set (completion works without colour too); the status row is only drawn
+    // for the two-row prompt used on terminals.
+    rl.set_helper(Some(status::StatusHelper { bar: bar.clone().unwrap_or_default(), complete: Some(Box::new(complete)) }));
     if let Some(bar) = &bar {
-        rl.set_helper(Some(status::StatusHelper(bar.clone())));
         status::spawn_refresher(bar.clone(), Box::new(rl.create_external_printer()?));
         let (v, bar) = (view.clone(), bar.clone());
         std::thread::Builder::new().name("zilch-status".into()).spawn(move || loop {

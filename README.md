@@ -68,8 +68,9 @@ How an order flows:
 | `/sessions` · `/recap` · `/clear` | saved sessions · this session's orders and last answer · a fresh session |
 | `/prompt [main\|developer]` · `/about` · `/redraw` · `/help` · `/exit` | |
 
-A status row above the prompt shows what each busy process is doing, a waiting plan or command
-question, and the session's spend.
+Tab completes commands, their arguments (groups, model names from the providers' lists, live pids)
+and `@` mentions. A status row above the prompt shows what each busy process is doing, a waiting
+plan or command question, and the session's spend.
 
 ## Configure
 

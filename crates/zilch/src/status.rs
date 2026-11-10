@@ -48,14 +48,23 @@ impl StatusBar {
     }
 }
 
-/// The rustyline helper: only the prompt highlighter does anything.
-pub struct StatusHelper(pub Arc<StatusBar>);
+/// Completion: (line, cursor) → (where the word starts, candidates).
+pub type CompleteFn = dyn Fn(&str, usize) -> (usize, Vec<String>) + Send + Sync;
+
+/// The rustyline helper: the prompt highlighter draws the status row; the completer offers commands,
+/// arguments and @ mentions.
+pub struct StatusHelper {
+    pub bar: Arc<StatusBar>,
+    pub complete: Option<Box<CompleteFn>>,
+}
 
 impl Highlighter for StatusHelper {
     fn highlight_prompt<'b, 's: 'b, 'p: 'b>(&'s self, prompt: &'p str, default: bool) -> Cow<'b, str> {
         // Only our two-row prompt carries a status row (approval questions etc. are left alone).
         match prompt.strip_prefix('\n') {
-            Some(rest) if default && !self.0.accepting.load(Ordering::SeqCst) => Cow::Owned(format!("\r\x1b[2K{}\n{rest}", self.0.text())),
+            Some(rest) if default && !self.bar.accepting.load(Ordering::SeqCst) => {
+                Cow::Owned(format!("\r\x1b[2K{}\n{rest}", self.bar.text()))
+            }
             _ => Cow::Borrowed(prompt),
         }
     }
@@ -63,13 +72,16 @@ impl Highlighter for StatusHelper {
     fn highlight_char(&self, _line: &str, _pos: usize, kind: CmdKind) -> bool {
         // Returning true makes rustyline do a forced refresh when the line is accepted, which is
         // when we blank the status row (see module docs).
-        self.0.accepting.store(kind == CmdKind::ForcedRefresh, Ordering::SeqCst);
+        self.bar.accepting.store(kind == CmdKind::ForcedRefresh, Ordering::SeqCst);
         true
     }
 }
 
 impl Completer for StatusHelper {
     type Candidate = String;
+    fn complete(&self, line: &str, pos: usize, _ctx: &rustyline::Context<'_>) -> rustyline::Result<(usize, Vec<String>)> {
+        Ok(self.complete.as_ref().map_or((pos, vec![]), |f| f(line, pos)))
+    }
 }
 impl Hinter for StatusHelper {
     type Hint = String;
