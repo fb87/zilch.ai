@@ -46,7 +46,7 @@ pub fn submit_plan_spec() -> ToolSpec {
             "title":{"type":"string"},
             "task":{"type":"string","description":"Complete, self-contained brief for the developer"},
             "depends_on":{"type":"array","items":{"type":"string"}},
-            "owned_paths":{"type":"array","items":{"type":"string"},"description":"Files/globs this task may write (disjoint from parallel tasks)"},
+            "owned_paths":{"type":"array","items":{"type":"string"},"description":"Files, directories (dir/ covers everything below) or globs this task may write; disjoint from parallel tasks"},
             "acceptance":{"type":"array","items":{"type":"string"}},
             "priority":{"type":"integer","description":"0 most urgent … 3 background (default 1)"},
             "worker":{"type":"string","description":"A subagent profile from the environment section (default: developer)"}

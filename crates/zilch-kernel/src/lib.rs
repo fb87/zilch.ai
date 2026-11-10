@@ -300,8 +300,7 @@ impl Caps {
             Access::Exec => Err("permission denied: this agent may not run commands".into()),
             Access::Write(path) => {
                 let p = path.trim_start_matches("./");
-                let ok = self.write_any
-                    || self.write.iter().any(|g| g == p || globset::Glob::new(g).map(|g| g.compile_matcher().is_match(p)).unwrap_or(false));
+                let ok = self.write_any || self.write.iter().any(|g| plan::path_matches(g, p));
                 if ok {
                     Ok(())
                 } else {

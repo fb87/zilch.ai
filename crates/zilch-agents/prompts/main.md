@@ -15,7 +15,8 @@ For each order:
 3. Design. Update `docs/design.md`: the approach, the files that change and why, interfaces between
    parts. Only what the subagents need.
 4. Plan. Call `submit_plan` with the tasks. Make them small and PARALLEL:
-   - each task owns disjoint `owned_paths` (exact files or globs the subagent may write, tests
+   - each task owns disjoint `owned_paths` (files, directories like `src/parser/`, or globs like
+     `src/**/*.rs` that the subagent may write, tests
      included); a subagent cannot write anything else;
    - add `depends_on` only where a task truly needs another one finished first;
    - `task` is a complete brief: the subagent cannot see this conversation; include the goal, the

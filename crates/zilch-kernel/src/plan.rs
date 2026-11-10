@@ -60,13 +60,36 @@ pub fn waves(tasks: &[PlanTask]) -> Result<Vec<Vec<String>>, String> {
     Ok(out)
 }
 
-/// Conservative overlap test between two write scopes ("anything" overlaps everything).
+/// Does an owned-path pattern cover `path`? A pattern without glob characters names a file or a
+/// directory: `src/x.rs`, `zilch_agent/` and `zilch_agent` all cover the path itself and everything
+/// below it (models write directories either way). Anything else is a glob (`src/**/*.rs`).
+pub fn path_matches(pattern: &str, path: &str) -> bool {
+    let pattern = pattern.trim_start_matches("./");
+    let path = path.trim_start_matches("./");
+    if pattern.is_empty() {
+        return false;
+    }
+    if !pattern.contains(['*', '?', '[', '{']) {
+        let dir = pattern.trim_end_matches('/');
+        return path == dir || path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'));
+    }
+    // Usual glob meaning: `*` stays within one directory, `**` crosses directories.
+    globset::GlobBuilder::new(pattern).literal_separator(true).build().map(|g| g.compile_matcher().is_match(path)).unwrap_or(false)
+}
+
+/// Conservative overlap test between two write scopes ("anything" overlaps everything): one
+/// pattern covers the other, or two globs could match the same file.
 pub fn scopes_overlap(a: &[String], b: &[String]) -> bool {
     if a.is_empty() || b.is_empty() {
         return true;
     }
-    let m = |p: &str, s: &str| globset::Glob::new(p).map(|g| g.compile_matcher().is_match(s)).unwrap_or(true);
-    a.iter().any(|x| b.iter().any(|y| x == y || m(x, y) || m(y, x)))
+    let is_glob = |p: &str| p.contains(['*', '?', '[', '{']);
+    a.iter().any(|x| {
+        b.iter().any(|y| {
+            // Two globs that do not cover each other may still match a common file: assume they do.
+            x == y || path_matches(x, y) || path_matches(y, x) || (is_glob(x) && is_glob(y))
+        })
+    })
 }
 
 /// Tasks that can start now: pending, dependencies done, and no write-scope overlap with a
@@ -154,5 +177,32 @@ mod tests {
         let mut st = vec![TaskStatus::Failed, TaskStatus::Pending, TaskStatus::Pending, TaskStatus::Pending];
         assert_eq!(propagate_failures(&t, &mut st), vec![1, 2]);
         assert_eq!(st[3], TaskStatus::Pending);
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn directories_cover_what_is_below_them_however_they_are_written() {
+        for dir in ["zilch_agent/", "zilch_agent", "./zilch_agent/"] {
+            assert!(path_matches(dir, "zilch_agent/config.py"), "{dir}");
+            assert!(path_matches(dir, "zilch_agent/sub/x.py"), "{dir}");
+            assert!(!path_matches(dir, "zilch_agent_old/x.py"), "a name prefix is not a directory: {dir}");
+            assert!(!path_matches(dir, "other/zilch_agent/x.py"), "{dir}");
+        }
+        assert!(path_matches("src/x.rs", "src/x.rs") && !path_matches("src/x.rs", "src/y.rs"));
+        assert!(path_matches("src/**/*.rs", "src/a/b.rs") && !path_matches("src/*.rs", "src/a/b.rs"));
+    }
+
+    #[test]
+    fn directory_scopes_overlap_their_files() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(scopes_overlap(&s(&["zilch_agent/"]), &s(&["zilch_agent/config.py"])));
+        assert!(scopes_overlap(&s(&["zilch_agent"]), &s(&["zilch_agent/**"])));
+        assert!(!scopes_overlap(&s(&["zilch_agent/"]), &s(&["tests/"])));
+        assert!(!scopes_overlap(&s(&["src/a.rs"]), &s(&["src/b.rs"])));
+        assert!(scopes_overlap(&s(&["src/*.rs"]), &s(&["src/a.rs"])));
     }
 }
