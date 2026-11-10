@@ -286,12 +286,16 @@ pub enum KernelEvent {
         prompt_tokens: u64,
         completion_tokens: u64,
     },
-    /// The kernel needs the guest (plan approval). Answer with the CLI's `Answer` command.
+    /// The kernel needs the guest: a plan to approve, or (approval = "ask") a command to allow.
+    /// Answer with the CLI's `Answer` command.
     Question {
         qid: u64,
         ticket: TicketId,
         pid: Pid,
         text: String,
+        /// A command waiting to run (y allow, n deny, a allow all commands this session).
+        #[serde(default)]
+        command: bool,
     },
     Notice {
         pid: Option<Pid>,

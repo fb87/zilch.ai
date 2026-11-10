@@ -35,6 +35,12 @@ struct Cli {
     /// Approve plans without asking.
     #[arg(long)]
     yes: bool,
+    /// Nothing asks: plans approved, commands run (same as --approval auto).
+    #[arg(long)]
+    yolo: bool,
+    /// ask (plans and commands) | plan (plans; default) | auto (nothing).
+    #[arg(long, value_name = "MODE")]
+    approval: Option<String>,
     /// Model for every group.
     #[arg(long)]
     model: Option<String>,
@@ -85,6 +91,8 @@ struct View {
     procs: Mutex<HashMap<Pid, (Group, String)>>,
     /// Plans waiting for the guest, oldest first: (qid, ticket).
     questions: Mutex<std::collections::VecDeque<(u64, TicketId)>>,
+    /// Questions that are commands waiting to run (approval = "ask"): qid → "3 wants to run: …".
+    commands: Mutex<HashMap<u64, String>>,
     open: Mutex<HashSet<TicketId>>,
     /// Live processes for the status row.
     live: Mutex<BTreeMap<Pid, Live>>,
@@ -193,8 +201,11 @@ impl View {
         }
         let spent = self.costs.meter.spent();
         let spent = if spent > 0.0 { format!("  {d}· ${spent:.4}{r}") } else { String::new() };
-        if let Some((_, ticket)) = self.question() {
+        if let Some((qid, ticket)) = self.question() {
             let rev = self.c("\x1b[7m");
+            if let Some(cmd) = self.commands.lock().unwrap().get(&qid) {
+                return (format!("{note}{b}{rev}? {cmd} — y allows · n denies · a allows all commands {r}"), false);
+            }
             return (
                 format!("{note}{b}{rev}? plan #{ticket} waits for you — y approves · n rejects · anything else is feedback {r}"),
                 false,
@@ -259,6 +270,11 @@ impl View {
                 format!("    {red}{pid} ✗ {summary}{r}{d}: {}{r}", first(&result.text(), 200))
             }
             KernelEvent::SyscallDone { pid, summary, .. } if self.verbose => format!("    {d}{pid} ✓ {summary}{r}"),
+            KernelEvent::Question { qid, ticket, text, command: true, .. } => {
+                self.questions.lock().unwrap().push_back((*qid, *ticket));
+                self.commands.lock().unwrap().insert(*qid, text.clone());
+                format!("{y}?{r} {b}{text}{r}\n{y}answer:{r} y = allow · n = deny · a = allow all commands this session {d}(at the allow prompt){r}")
+            }
             KernelEvent::Question { qid, ticket, text, .. } => {
                 self.questions.lock().unwrap().push_back((*qid, *ticket));
                 format!("{y}?{r} {b}plan for order #{ticket}{r}\n{text}\n{y}answer:{r} y = approve · n = reject · anything else = feedback to the main agent {d}(at the plan prompt){r}")
@@ -501,6 +517,15 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         bus.set_log(Box::new(file.try_clone()?));
     }
     let events = bus.subscribe(4096);
+    let approval = if cli.yes || cli.yolo {
+        "auto".to_string()
+    } else {
+        match cli.approval.as_deref() {
+            Some(a @ ("ask" | "plan" | "auto")) => a.to_string(),
+            Some(other) => anyhow::bail!("invalid --approval '{other}' (ask | plan | auto)"),
+            None => cfg.approval.clone(),
+        }
+    };
     let defaults = KernelConfig::default();
     let kcfg = KernelConfig {
         workers: cli.workers.unwrap_or(defaults.workers),
@@ -510,7 +535,8 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         max_tokens: cfg.max_task_tokens,
         group_tokens: cfg.group_tokens.clone(),
         first_ticket,
-        auto_approve: cli.yes,
+        auto_approve: approval == "auto",
+        ask_commands: approval == "ask",
         ..defaults
     };
     let color = std::io::stdout().is_terminal();
@@ -519,6 +545,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         verbose: cli.verbose,
         procs: Mutex::default(),
         questions: Mutex::default(),
+        commands: Mutex::default(),
         open: Mutex::default(),
         live: Mutex::default(),
         note: Mutex::default(),
@@ -573,10 +600,10 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 println!("{}{a}{}", view.c(YELLOW), view.c(RESET));
             }
             match &env.event {
-                KernelEvent::Question { qid, .. } if !cli.yes => {
+                KernelEvent::Question { qid, command, .. } if approval != "auto" => {
                     // Approval must be explicit; an empty line asks again, end of input rejects.
                     let answer = loop {
-                        eprint!("plan? [y/n/feedback] › ");
+                        eprint!("{}", if *command { "allow? [y/n/a] › " } else { "plan? [y/n/feedback] › " });
                         let mut line = String::new();
                         if stdin.lock().read_line(&mut line)? == 0 {
                             break "n".to_string();
@@ -681,6 +708,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         // With a status row the prompt is two rows; the first is filled with the status (status.rs).
         let row = if bar.is_some() { "\n" } else { "" };
         let prompt = match asked {
+            Some((q, _)) if view.commands.lock().unwrap().contains_key(&q) => format!("{row}allow? [y/n/a] › "),
             Some((_, t)) => format!("{row}plan #{t}? [y/n/feedback] › "),
             None => {
                 let spec = *view.lane.lock().unwrap() == Group::Spec;
@@ -715,11 +743,15 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             Err(e) => return Err(e.into()),
         };
         let input = line.trim();
+        // A question that arrived while this prompt was already drawn: a lone y / n / a is its answer
+        // (almost never meant as an order); anything longer still needs the question's prompt.
+        let short_answer = matches!(input.to_lowercase().as_str(), "y" | "yes" | "n" | "no" | "a" | "always");
+        let asked = asked.or_else(|| view.question().filter(|_| short_answer));
         // The order may have ended (cancelled, killed) after this prompt was drawn.
         let asked = asked.filter(|(_, t)| view.open.lock().unwrap().contains(t));
         if let (Some(_), true) = (asked, input.is_empty()) {
             // Approval must be explicit: a stray Enter does not approve the plan.
-            let msg = "the plan is still waiting: type y to approve, n to reject, or feedback";
+            let msg = "still waiting for your answer: y, n, or (plans) feedback / (commands) a";
             match &bar {
                 Some(_) => view.note(msg),
                 None => println!("({msg})"),
@@ -728,6 +760,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         }
         if let (Some((qid, _)), false) = (asked, input.starts_with('/') || input.starts_with('@')) {
             view.questions.lock().unwrap().retain(|(q, _)| *q != qid);
+            view.commands.lock().unwrap().remove(&qid);
             kernel.send(Cmd::Answer { qid, text: input.to_string() });
             continue;
         }

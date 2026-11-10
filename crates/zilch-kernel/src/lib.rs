@@ -155,6 +155,8 @@ pub struct KernelConfig {
     pub restart_window_ticks: u64,
     /// Token quota per group (like a cgroup); a process of a group over its quota is stopped.
     pub group_tokens: BTreeMap<Group, u64>,
+    /// approval = "ask": every command waits for the guest (y / n / a = allow all from now on).
+    pub ask_commands: bool,
     /// Number of the first order (a continued session carries on counting).
     pub first_ticket: TicketId,
 }
@@ -177,6 +179,7 @@ impl Default for KernelConfig {
             restart_window_ticks: 6000, // 10 minutes at 100 ms
             group_tokens: BTreeMap::new(),
             first_ticket: 1,
+            ask_commands: false,
         }
     }
 }
@@ -380,6 +383,22 @@ struct Ticket {
     served: bool,
 }
 
+/// A question waiting for the guest.
+enum Pending {
+    /// The plan of this order.
+    Plan(TicketId),
+    /// A command a process wants to run (approval = "ask").
+    Command { ticket: TicketId, pid: Pid, batch: u64, idx: usize, call: Box<Syscall> },
+}
+
+impl Pending {
+    fn ticket(&self) -> TicketId {
+        match self {
+            Pending::Plan(t) | Pending::Command { ticket: t, .. } => *t,
+        }
+    }
+}
+
 enum KEvent {
     WorkerDone {
         pid: Pid,
@@ -473,8 +492,8 @@ pub struct Kernel {
     queues: [VecDeque<Pid>; QUEUES],
     idle_workers: usize,
     tickets: BTreeMap<TicketId, Ticket>,
-    /// Open questions: qid → ticket.
-    questions: BTreeMap<u64, TicketId>,
+    /// Open questions for the guest.
+    questions: BTreeMap<u64, Pending>,
     /// Tokens used per group (for quotas and stats).
     group_used: BTreeMap<Group, u64>,
     workers: Pool,
@@ -798,7 +817,7 @@ impl Kernel {
         for c in children {
             self.finish(c, ExitStatus::failed("[stopped: the order ended]\nSTATUS: failed"), State::Killed);
         }
-        self.questions.retain(|_, tk| *tk != ticket);
+        self.questions.retain(|_, q| q.ticket() != ticket);
         self.bus.publish(KernelEvent::TicketServed { ticket, ok, summary });
         self.acbs.retain(|pid, a| a.ticket != ticket || mains.contains(pid));
     }
@@ -1049,36 +1068,81 @@ impl Kernel {
                             continue;
                         }
                     }
-                    let class = self.drivers.class(&call);
-                    if let Some(f) = self.acbs.get_mut(&pid).and_then(|a| a.inflight.get_mut(idx)) {
-                        f.class = class;
+                    // approval = "ask": a command waits for the guest (the hang detector skips it).
+                    if self.cfg.ask_commands && self.drivers.class(&call) == PoolClass::Exec {
+                        if let Some(f) = self.acbs.get_mut(&pid).and_then(|a| a.inflight.get_mut(idx)) {
+                            f.class = PoolClass::Exec;
+                        }
+                        let qid = self.next_qid;
+                        self.next_qid += 1;
+                        let text = format!("{pid} wants to run: {}", call.summary());
+                        self.questions.insert(qid, Pending::Command { ticket, pid, batch, idx, call: Box::new(call) });
+                        self.bus.publish(KernelEvent::Question { qid, ticket, pid, text, command: true });
+                        continue;
                     }
-                    let (drivers, bus, tx, cancel) = (self.drivers.clone(), self.bus.clone(), self.tx.clone(), cancel.clone());
-                    let job: Job = Box::new(move || {
-                        let result = if cancel.is_cancelled() {
-                            SyscallResult::Failed("cancelled".into())
-                        } else {
-                            // Heartbeats to the kernel, at most one a second.
-                            let last = std::sync::Mutex::new(Instant::now() - Duration::from_secs(2));
-                            let alive_tx = std::sync::Mutex::new(tx.clone());
-                            let alive: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                                let mut l = last.lock().unwrap();
-                                if l.elapsed() >= Duration::from_secs(1) {
-                                    *l = Instant::now();
-                                    let _ = alive_tx.lock().unwrap().send(KEvent::Alive { pid, batch });
-                                }
-                            });
-                            let ctx = DriverCtx { pid, ticket, cancel: &cancel, bus: &bus, alive };
-                            drivers.run(&ctx, call)
-                        };
-                        let _ = tx.send(KEvent::SyscallDone { pid, batch, idx, result });
-                    });
-                    match class {
-                        PoolClass::Io => self.io.run(job),
-                        PoolClass::Exec => self.exec.run(job),
-                    }
+                    self.dispatch_call(pid, batch, idx, ticket, cancel.clone(), call);
                 }
             }
+        }
+    }
+
+    /// Run a model or tool call on its driver pool; the result comes back as SyscallDone.
+    fn dispatch_call(&mut self, pid: Pid, batch: u64, idx: usize, ticket: TicketId, cancel: CancelToken, call: Syscall) {
+        let class = self.drivers.class(&call);
+        if let Some(f) = self.acbs.get_mut(&pid).and_then(|a| a.inflight.get_mut(idx)) {
+            f.class = class;
+        }
+        let (drivers, bus, tx) = (self.drivers.clone(), self.bus.clone(), self.tx.clone());
+        let job: Job = Box::new(move || {
+            let result = if cancel.is_cancelled() {
+                SyscallResult::Failed("cancelled".into())
+            } else {
+                // Heartbeats to the kernel, at most one a second.
+                let last = std::sync::Mutex::new(Instant::now() - Duration::from_secs(2));
+                let alive_tx = std::sync::Mutex::new(tx.clone());
+                let alive: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                    let mut l = last.lock().unwrap();
+                    if l.elapsed() >= Duration::from_secs(1) {
+                        *l = Instant::now();
+                        let _ = alive_tx.lock().unwrap().send(KEvent::Alive { pid, batch });
+                    }
+                });
+                let ctx = DriverCtx { pid, ticket, cancel: &cancel, bus: &bus, alive };
+                drivers.run(&ctx, call)
+            };
+            let _ = tx.send(KEvent::SyscallDone { pid, batch, idx, result });
+        });
+        match class {
+            PoolClass::Io => self.io.run(job),
+            PoolClass::Exec => self.exec.run(job),
+        }
+    }
+
+    /// The guest's answer to a command question: y runs it, a runs it and stops asking for the
+    /// rest of the session, anything else denies it (empty: still waiting).
+    #[allow(clippy::too_many_arguments)]
+    fn answer_command(&mut self, qid: u64, text: &str, ticket: TicketId, pid: Pid, batch: u64, idx: usize, call: Syscall) {
+        let current = self.acbs.get(&pid).filter(|a| a.state.alive() && a.batch == batch).map(|a| a.batch_cancel.clone());
+        let Some(cancel) = current else { return }; // the process moved on or ended
+        match text.trim().to_lowercase().as_str() {
+            "" => {
+                self.questions.insert(qid, Pending::Command { ticket, pid, batch, idx, call: Box::new(call) });
+            }
+            "y" | "yes" => self.dispatch_call(pid, batch, idx, ticket, cancel, call),
+            "a" | "always" => {
+                self.cfg.ask_commands = false;
+                self.bus.publish(KernelEvent::Notice {
+                    pid: None,
+                    text: "commands now run without asking for the rest of this session".into(),
+                });
+                self.dispatch_call(pid, batch, idx, ticket, cancel, call);
+            }
+            _ => self.fill(
+                pid,
+                batch,
+                idx,
+                SyscallResult::Failed("the guest did not allow this command; do something else or report".into()),
+            ),
         }
     }
 
@@ -1285,8 +1349,8 @@ impl Kernel {
         self.set_state(pid, State::Blocked(Block::Question));
         let qid = self.next_qid;
         self.next_qid += 1;
-        self.questions.insert(qid, ticket);
-        self.bus.publish(KernelEvent::Question { qid, ticket, pid, text });
+        self.questions.insert(qid, Pending::Plan(ticket));
+        self.bus.publish(KernelEvent::Question { qid, ticket, pid, text, command: false });
         if self.cfg.auto_approve {
             self.answer(qid, "y");
         }
@@ -1297,7 +1361,13 @@ impl Kernel {
         if text.trim().is_empty() {
             return;
         }
-        let Some(ticket) = self.questions.remove(&qid) else { return };
+        let ticket = match self.questions.remove(&qid) {
+            Some(Pending::Plan(ticket)) => ticket,
+            Some(Pending::Command { ticket, pid, batch, idx, call }) => {
+                return self.answer_command(qid, text, ticket, pid, batch, idx, *call)
+            }
+            None => return,
+        };
         let Some(root) = self.tickets.get(&ticket).map(|t| t.root) else { return };
         let reply = match text.trim().to_lowercase().as_str() {
             "y" | "yes" | "approve" => None,

@@ -802,3 +802,42 @@ fn the_spec_lane_has_its_own_resident_agent_running_beside_the_code_lane() {
     assert!(s.contains("Order #3: add a non-goal"), "{s}");
     assert!(seen.lock().unwrap().iter().any(|x| x == "spec: Order #1: draft a spec"));
 }
+
+#[test]
+fn with_approval_ask_commands_wait_for_the_guest() {
+    let drivers = Arc::new(FakeDrivers::default());
+    let results: Arc<Mutex<Vec<String>>> = Arc::default();
+    let log = results.clone();
+    let dev: DevScript = Arc::new(move |_| {
+        let log = log.clone();
+        Box::new(Scripted(0, move |n, wake, _| {
+            if let Some(r) = wake.first() {
+                log.lock().unwrap().push(r.text());
+            }
+            if n <= 3 {
+                StepResult::Syscalls(vec![tool("exec", json!({"command": format!("run {n}")}))])
+            } else {
+                StepResult::Exit(ExitStatus::ok("STATUS: done"))
+            }
+        }))
+    });
+    let mut run = Run::new(KernelConfig { ask_commands: true, ..cfg() }, drivers, Book { tasks: vec![task("T1", &[], &["a"])], dev });
+    run.k.send(Cmd::Order("x".into()));
+    let ask = |run: &mut Run| match run.wait(|e| matches!(e, KernelEvent::Question { command: true, .. })) {
+        KernelEvent::Question { qid, text, .. } => (qid, text),
+        _ => unreachable!(),
+    };
+    let (q1, text) = ask(&mut run);
+    assert!(text.contains("wants to run: exec"), "{text}");
+    run.k.send(Cmd::Answer { qid: q1, text: "".into() }); // a stray Enter: still waiting
+    run.k.send(Cmd::Answer { qid: q1, text: "n".into() });
+    let (q2, _) = ask(&mut run);
+    run.k.send(Cmd::Answer { qid: q2, text: "a".into() });
+    let (ok, _) = run.served();
+    assert!(ok);
+    let questions = run.seen.iter().filter(|e| matches!(e, KernelEvent::Question { command: true, .. })).count();
+    assert_eq!(questions, 2, "after `a` the third command ran without asking");
+    let r = results.lock().unwrap();
+    assert!(r[0].contains("did not allow"), "{r:?}");
+    assert_eq!((r[1].as_str(), r[2].as_str()), ("ok", "ok"));
+}

@@ -193,6 +193,11 @@ elsewhere a socket file in a private directory; only your user can connect) and 
 to `.zilch/ipc`. The Neovim plugin in `editor/nvim` (`:ZilchSend`) sends a selection plus a comment,
 which becomes an order in the requested lane or the active one.
 
+**Approval.** `approval = "plan"` (default): you approve each plan; subagents' commands then run in
+the sandbox without asking. `"ask"` (or `--approval ask`): every command also waits for `y` / `n` /
+`a` (allow all for the rest of the session). `"auto"` (or `--yolo`, `--yes`): nothing asks. A lone
+`y`, `n` or `a` answers a question even if it arrived while you were typing at the order prompt.
+
 **Sessions.** After every served order the main agent's conversation is saved under
 `<data dir>/zilch/os-sessions/` (one directory per workspace, files mode 0600). `zilch-os -c`
 continues the most recent session of the current directory: the main agent remembers it and order

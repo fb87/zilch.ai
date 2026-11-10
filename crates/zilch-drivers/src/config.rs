@@ -111,6 +111,7 @@ struct FileConfig {
     expensive_model_minutes: Option<u64>,
     expensive_model_spend: Option<f64>,
     spec_dir: Option<String>,
+    approval: Option<String>,
 }
 
 fn merge_opt<T>(dst: &mut Option<T>, src: Option<T>) {
@@ -155,6 +156,9 @@ pub struct Config {
     pub expensive_model_spend: f64,
     /// The spec lane's document directory (`spec_dir`, default `specs`).
     pub spec_dir: PathBuf,
+    /// `approval`: "plan" (default: approve plans; commands run in the sandbox), "ask" (commands
+    /// too), "auto" (nothing asks).
+    pub approval: String,
     /// Price overrides from the roles: (model key, input, output) USD per 1M tokens.
     price_overrides: Vec<(String, Option<f64>, Option<f64>)>,
     env: BTreeMap<String, String>,
@@ -218,6 +222,7 @@ impl Config {
             merge_opt(&mut fc.expensive_model_minutes, layer.expensive_model_minutes);
             merge_opt(&mut fc.expensive_model_spend, layer.expensive_model_spend);
             merge_opt(&mut fc.spec_dir, layer.spec_dir);
+            merge_opt(&mut fc.approval, layer.approval);
             if let Some(q) = layer.quotas {
                 fc.quotas.get_or_insert_with(BTreeMap::new).extend(q);
             }
@@ -315,6 +320,10 @@ impl Config {
             expensive_model_spend: fc.expensive_model_spend.unwrap_or(2.0).max(0.01),
             price_overrides,
             spec_dir: cwd.join(fc.spec_dir.clone().unwrap_or_else(|| "specs".into())),
+            approval: match fc.approval.as_deref().unwrap_or("plan") {
+                a @ ("ask" | "plan" | "auto") => a.to_string(),
+                other => bail!("invalid approval '{other}' (ask | plan | auto)"),
+            },
             sources,
             providers: fc.providers,
             architect: architect_b,
