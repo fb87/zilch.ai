@@ -240,3 +240,40 @@ fn the_resident_main_agent_serves_waits_and_survives_a_failed_call() {
         matches!(a.step(&view, vec![failed()]), StepResult::Syscalls(c) if matches!(&c[0], Syscall::Serve { summary } if summary.contains("503")))
     );
 }
+
+#[test]
+fn a_history_over_budget_is_summarized_through_a_syscall_before_the_next_request() {
+    let mut a =
+        LlmAgent::new(ModelBinding::default(), "s".into(), "Order #1: big job".into(), vec![], "x".into()).resident().with_budget(4_000);
+    let view = AcbView { pid: 1, ticket: 1, group: Group::Architecture, steps: 0, notes: vec![] };
+    a.step(&view, vec![]);
+    // Grow the conversation well past the budget with tool turns.
+    for i in 0..12 {
+        let mut m = Message::assistant("");
+        m.tool_calls = vec![ToolCall {
+            id: format!("c{i}"),
+            kind: "function".into(),
+            function: zilch_ipc::llm::FunctionCall { name: "read_file".into(), arguments: "{}".into() },
+        }];
+        let r = a.step(&view, vec![SyscallResult::Completion { message: m, usage: Usage::default(), cut: false }]);
+        assert!(matches!(r, StepResult::Syscalls(_)));
+        let next = a.step(&view, vec![SyscallResult::Output("y".repeat(1_400))]);
+        let StepResult::Syscalls(calls) = next else { panic!() };
+        let Syscall::Complete(req) = &calls[0] else { panic!() };
+        if req.messages[0].text().starts_with("You compress") {
+            // The summary request: answer it, and the real request follows with a short history.
+            let summary =
+                SyscallResult::Completion { message: Message::assistant("- read many files"), usage: Usage::default(), cut: false };
+            let StepResult::Syscalls(after) = a.step(&view, vec![summary]) else { panic!() };
+            let Syscall::Complete(req) = &after[0] else { panic!() };
+            assert!(
+                req.messages[1].text().starts_with("<conversation-summary>") && req.messages[1].text().contains("read many files"),
+                "{:?}",
+                req.messages[1]
+            );
+            assert!(compact::estimate_tokens("", &req.messages, &[]) < 3_000, "back under the budget");
+            return;
+        }
+    }
+    panic!("the history never got compacted");
+}

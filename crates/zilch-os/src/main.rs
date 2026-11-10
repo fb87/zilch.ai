@@ -207,7 +207,7 @@ impl View {
             KernelEvent::SyscallDone { pid, summary, .. } if self.verbose => format!("    {d}{pid} ✓ {summary}{r}"),
             KernelEvent::Question { qid, ticket, text, .. } => {
                 self.questions.lock().unwrap().push_back((*qid, *ticket));
-                format!("{y}?{r} {b}plan for order #{ticket}{r}\n{text}\n{y}answer:{r} Enter = approve · n = reject · anything else = feedback to the architect {d}(at the plan prompt; press Enter on an empty line if it is not showing){r}")
+                format!("{y}?{r} {b}plan for order #{ticket}{r}\n{text}\n{y}answer:{r} Enter = approve · n = reject · anything else = feedback to the main agent {d}(at the plan prompt; press Enter on an empty line if it is not showing){r}")
             }
             KernelEvent::Signal { pid, signal, reason } => format!("{y}⚠ {pid} {signal:?}{r}: {reason}"),
             KernelEvent::Exited { pid, ok, report } => {
@@ -350,8 +350,11 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         Overrides { model: cli.model.clone(), architect_model: cli.architect_model.clone(), developer_model: cli.developer_model.clone() };
     let cfg = Config::load(&cwd, &ov)?;
     let drivers = DriverSet::new(&cwd, cfg.policy.clone(), cfg.backends());
-    let book =
+    let mut book =
         Book::new(cfg.architect.clone(), cfg.developer.clone(), drivers.specs(ARCHITECT_TOOLS), drivers.specs(DEVELOPER_TOOLS), &cwd);
+    if let Some(t) = cfg.main_context_tokens {
+        book.main_context_tokens = t;
+    }
     let bus = Arc::new(EventBus::new());
     let log = open_log(&cli);
     if let Some((_, file)) = &log {

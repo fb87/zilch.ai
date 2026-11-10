@@ -169,6 +169,9 @@ task's `owned_paths`. The main agent can write only `docs/`. When every task is 
 agent checks the result and replies; that serves the order, and it waits for the next one. Orders
 typed while it is busy are queued. Cancelling an order (Ctrl-C, `/cancel`) stops its subagents but
 keeps the main agent and its context.
+Its context is compacted when it reaches 75% of `context_tokens` on its role (default 64000):
+old tool output is shortened first, then older turns are summarized by the model, so a long session
+does not keep getting slower. Subagents start fresh per task, so they stay small anyway.
 
 `@3 text` sends more input to process 3, `@developer text` to every live subagent of the newest
 order, and `@main text` to the main agent (when it is idle, that is simply the next order).

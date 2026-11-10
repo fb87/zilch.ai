@@ -55,6 +55,7 @@ pub struct RoleCfg {
     pub reasoning_effort: Option<String>,
     pub extra: Option<Map<String, Value>>,
     pub max_steps: Option<usize>,
+    pub context_tokens: Option<usize>,
 }
 
 impl RoleCfg {
@@ -67,6 +68,7 @@ impl RoleCfg {
         merge_opt(&mut self.reasoning_effort, o.reasoning_effort);
         merge_opt(&mut self.extra, o.extra);
         merge_opt(&mut self.max_steps, o.max_steps);
+        merge_opt(&mut self.context_tokens, o.context_tokens);
     }
     /// Unset fields taken from `under` (a lower-precedence role).
     fn over(mut self, under: &RoleCfg) -> RoleCfg {
@@ -127,6 +129,8 @@ pub struct Config {
     pub max_task_tokens: Option<u64>,
     /// Token quota per group (`[quotas]`).
     pub group_tokens: BTreeMap<Group, u64>,
+    /// Context budget of the main agent (`context_tokens` on its role); None = built-in default.
+    pub main_context_tokens: Option<usize>,
     env: BTreeMap<String, String>,
 }
 
@@ -266,6 +270,7 @@ impl Config {
         let cfg = Config {
             cwd: cwd.to_path_buf(),
             group_tokens,
+            main_context_tokens: architect.context_tokens,
             sources,
             providers: fc.providers,
             architect: architect_b,

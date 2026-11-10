@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use zilch_ipc::{ChatRequest, ExitStatus, Group, Message, ModelBinding, PlanTask, Syscall, SyscallResult, TicketId, ToolCall, ToolSpec};
 use zilch_kernel::{AcbView, Agent, Recipes, StepResult};
 
+pub mod compact;
+
 pub const MAIN_PROMPT: &str = include_str!("../prompts/main.md");
 pub const DEVELOPER_PROMPT: &str = include_str!("../prompts/developer.md");
 
@@ -40,6 +42,8 @@ enum Phase {
     AwaitTools,
     /// Resident only: served the last order, waiting for the next one.
     AwaitInput,
+    /// Waiting for the summary of `history[..cut]`.
+    Compacting(usize),
 }
 
 /// A model-driven process.
@@ -62,6 +66,10 @@ pub struct LlmAgent {
     /// instead of exiting, and a failed model call is retried once instead of ending it.
     resident: bool,
     failures: u32,
+    /// Context budget in tokens (see `compact`).
+    budget: usize,
+    /// The history was just compacted: send the next request without checking again.
+    just_compacted: bool,
 }
 
 impl LlmAgent {
@@ -79,6 +87,8 @@ impl LlmAgent {
             local: vec![],
             resident: false,
             failures: 0,
+            budget: 128_000,
+            just_compacted: false,
         }
     }
 
@@ -100,9 +110,24 @@ impl LlmAgent {
         })
     }
 
+    /// Ask the model, compacting the history first if it outgrew the budget.
     fn ask(&mut self) -> StepResult {
+        if !std::mem::take(&mut self.just_compacted) {
+            let plan =
+                compact::prepare(&self.binding, Some(self.session.clone()), &self.system, &self.tools, &mut self.messages, self.budget);
+            if let compact::Plan::Summarize { cut, request } = plan {
+                self.phase = Phase::Compacting(cut);
+                return StepResult::Syscalls(vec![Syscall::Complete(*request)]);
+            }
+        }
         self.phase = Phase::AwaitCompletion;
         StepResult::Syscalls(vec![self.request()])
+    }
+
+    /// Context budget in tokens (compaction starts at 75% of it).
+    pub fn with_budget(mut self, tokens: usize) -> Self {
+        self.budget = tokens.max(4_000);
+        self
     }
 
     /// Turn the model's tool calls into syscalls (`submit_plan` becomes the kernel's own call).
@@ -186,6 +211,16 @@ impl Agent for LlmAgent {
                 }
                 None => Some(StepResult::Exit(ExitStatus::failed("[the model call returned nothing]\nSTATUS: failed"))),
             },
+            Phase::Compacting(cut) => {
+                // The summary of the older turns (on failure the elided history is kept as is).
+                if let Some(SyscallResult::Completion { message, .. }) = wake.into_iter().next() {
+                    if !message.text().trim().is_empty() && cut < self.messages.len() {
+                        self.messages = compact::splice(&self.messages, cut, message.text());
+                    }
+                }
+                self.just_compacted = true;
+                None
+            }
             Phase::AwaitInput => {
                 // The next order (or a note) from the guest.
                 for r in wake {
@@ -225,6 +260,8 @@ pub struct Book {
     pub developer_tools: Vec<ToolSpec>,
     /// Environment section shared by every prompt (workspace, OS, date, AGENTS.md).
     pub environment: String,
+    /// Context budget of the resident main agent in tokens (compaction starts at 75%).
+    pub main_context_tokens: usize,
     sessions: AtomicU64,
 }
 
@@ -238,7 +275,15 @@ impl Book {
         cwd: &Path,
     ) -> Self {
         architect_tools.push(submit_plan_spec());
-        Self { architect, developer, architect_tools, developer_tools, environment: environment(cwd), sessions: AtomicU64::new(1) }
+        Self {
+            architect,
+            developer,
+            architect_tools,
+            developer_tools,
+            environment: environment(cwd),
+            main_context_tokens: 64_000,
+            sessions: AtomicU64::new(1),
+        }
     }
 
     fn session(&self, ticket: TicketId, group: Group) -> String {
@@ -259,7 +304,9 @@ impl Recipes for Book {
                 self.architect_tools.clone(),
                 self.session(ticket, Group::Architecture),
             )
-            .resident(),
+            .resident()
+            // The main agent hears everything all session: compact early so it stays fast.
+            .with_budget(self.main_context_tokens),
         )
     }
 
