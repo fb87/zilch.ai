@@ -18,14 +18,12 @@
 //!   {"type":"status"}
 //!     → {"ok": true, "active": "code", "code": "idle", "spec": "working", "docs": "..."}
 
-use crate::lanes::{Dispatcher, Lane};
-use crate::render::{CYAN, DIM, RESET};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
 
 fn uid() -> u32 {
     unsafe { libc::getuid() }
@@ -153,11 +151,8 @@ type Bound = Option<(UnixListener, Option<PathBuf>)>;
 fn bind(_workspace: &Path, endpoint: &str) -> std::io::Result<Bound> {
     use std::os::linux::net::SocketAddrExt;
     let addr = std::os::unix::net::SocketAddr::from_abstract_name(endpoint.trim_start_matches('@').as_bytes())?;
-    match std::os::unix::net::UnixListener::bind_addr(&addr) {
-        Ok(l) => {
-            l.set_nonblocking(true)?;
-            Ok(Some((UnixListener::from_std(l)?, None)))
-        }
+    match UnixListener::bind_addr(&addr) {
+        Ok(l) => Ok(Some((l, None))),
         // The name is held by a live process: another zilch serves this workspace.
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Ok(None),
         Err(e) => Err(e),
@@ -172,7 +167,7 @@ fn bind(workspace: &Path, _endpoint: &str) -> std::io::Result<Bound> {
     // reach the socket file.
     private_dir(path.parent().expect("socket file has a parent"))?;
     if path.exists() {
-        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+        if UnixStream::connect(&path).is_ok() {
             return Ok(None); // another zilch is serving this workspace
         }
         std::fs::remove_file(&path)?; // stale socket from a crash
@@ -182,17 +177,44 @@ fn bind(workspace: &Path, _endpoint: &str) -> std::io::Result<Bound> {
     Ok(Some((listener, Some(path))))
 }
 
-/// Only the user running zilch may talk to it.
+/// Only the user running zilch may talk to it (peer credentials, not file permissions).
 fn peer_allowed(stream: &UnixStream) -> bool {
-    peer_is(stream, uid())
+    peer_uid(stream) == Some(uid())
 }
 
-fn peer_is(stream: &UnixStream, expected: u32) -> bool {
-    stream.peer_cred().is_ok_and(|c| c.uid() == expected)
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &UnixStream) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: getsockopt fills `cred` (of the size we pass) for a valid socket descriptor.
+    let r = unsafe {
+        libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, &mut cred as *mut _ as *mut libc::c_void, &mut len)
+    };
+    (r == 0).then_some(cred.uid)
 }
 
-/// Start listening. Returns `Ok(None)` if another live zilch already serves this workspace.
-pub async fn serve(dispatcher: Arc<Dispatcher>, workspace: &Path) -> std::io::Result<Option<IpcGuard>> {
+#[cfg(not(target_os = "linux"))]
+fn peer_uid(stream: &UnixStream) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    let (mut uid, mut gid) = (0, 0);
+    // SAFETY: getpeereid writes the peer's ids for a valid connected socket.
+    let r = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    (r == 0).then_some(uid)
+}
+
+/// Submit `message` to a lane (None = the active one); Ok = the lane's name.
+pub type SubmitFn = dyn Fn(Option<&str>, String) -> Result<String, String> + Send + Sync;
+
+/// What the link needs from the REPL: submit a message to a lane (None = the active lane;
+/// returns the lane's name or an error), and report status as JSON.
+pub struct Hooks {
+    pub submit: Box<SubmitFn>,
+    pub status: Box<dyn Fn() -> Value + Send + Sync>,
+}
+
+/// Start listening on a thread. `Ok(None)` if another live zilch already serves this workspace.
+pub fn serve(hooks: Arc<Hooks>, workspace: &Path) -> std::io::Result<Option<IpcGuard>> {
     let endpoint = endpoint(workspace);
     let Some((listener, socket)) = bind(workspace, &endpoint)? else {
         return Ok(None);
@@ -203,76 +225,48 @@ pub async fn serve(dispatcher: Arc<Dispatcher>, workspace: &Path) -> std::io::Re
     }
     let guard = IpcGuard { endpoint: endpoint.clone(), socket, pointer: pointer.clone() };
     std::fs::write(&pointer, format!("{endpoint}\n"))?;
-    tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
+    std::thread::Builder::new().name("zilch-ipc".into()).spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
             if !peer_allowed(&stream) {
-                let _ = stream.write_all(b"{\"ok\":false,\"error\":\"permission denied\"}\n").await;
+                let _ = stream.write_all(b"{\"ok\":false,\"error\":\"permission denied\"}\n");
                 continue;
             }
-            let d = dispatcher.clone();
-            tokio::spawn(async move {
-                let _ = handle_conn(d, stream).await;
+            let h = hooks.clone();
+            std::thread::spawn(move || {
+                let _ = handle_conn(&h, stream);
             });
         }
-    });
+    })?;
     Ok(Some(guard))
 }
 
-async fn handle_conn(d: Arc<Dispatcher>, stream: UnixStream) -> std::io::Result<()> {
-    let (r, mut w) = stream.into_split();
-    let mut lines = BufReader::new(r).lines();
-    while let Some(line) = lines.next_line().await? {
+fn handle_conn(h: &Hooks, stream: UnixStream) -> std::io::Result<()> {
+    let mut w = stream.try_clone()?;
+    for line in BufReader::new(stream).lines() {
+        let line = line?;
         if line.trim().is_empty() {
             continue;
         }
         let reply = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => handle(&d, req).await,
+            Ok(req) => handle(h, req),
             Err(e) => json!({"ok": false, "error": format!("bad request: {e}")}),
         };
-        w.write_all(format!("{reply}\n").as_bytes()).await?;
+        w.write_all(format!("{reply}\n").as_bytes())?;
     }
     Ok(())
 }
 
-async fn handle(d: &Arc<Dispatcher>, req: Request) -> Value {
+fn handle(h: &Hooks, req: Request) -> Value {
     match req {
-        Request::Status => {
-            let state = |l: Lane| if d.busy(l) { "working" } else { "idle" };
-            json!({
-                "ok": true,
-                "active": d.active().name(),
-                "code": state(Lane::Code),
-                "spec": state(Lane::Spec),
-                "docs": d.team.spec_status().describe(&d.team.shared.spec_store.dir),
-            })
-        }
+        Request::Status => (h.status)(),
         Request::Send { text, lane, file, start, end, selection } => {
             if text.trim().is_empty() && selection.as_deref().is_none_or(|s| s.trim().is_empty()) {
                 return json!({"ok": false, "error": "empty message"});
             }
-            let lane = match lane.as_deref() {
-                None | Some("") => d.active(),
-                Some(l) => match Lane::parse(l) {
-                    Some(l) => l,
-                    None => return json!({"ok": false, "error": format!("unknown lane '{l}' (code | spec)")}),
-                },
-            };
             let message = compose(&text, file.as_deref(), start, end, selection.as_deref());
-            // Echo what arrived so the REPL shows the conversation's full context.
-            {
-                let mut s = d.screen.lock().await;
-                let loc =
-                    file.as_deref().map(|f| format!(" {f}{}", start.map(|s| format!(":{s}")).unwrap_or_default())).unwrap_or_default();
-                let first = text.lines().next().unwrap_or("").chars().take(100).collect::<String>();
-                let msg = format!("{}◆ editor → {} lane{}:{} {first}", s.c(CYAN), lane.name(), loc, s.c(RESET));
-                s.line(&msg);
-                if lane != d.active() {
-                    let note = format!("{}  (running in the background; /{} to follow it){}", s.c(DIM), lane.name(), s.c(RESET));
-                    s.line(&note);
-                }
-            }
-            match d.submit(lane, message) {
-                Ok(()) => json!({"ok": true, "lane": lane.name()}),
+            match (h.submit)(lane.as_deref().filter(|l| !l.is_empty()), message) {
+                Ok(lane) => json!({"ok": true, "lane": lane}),
                 Err(e) => json!({"ok": false, "error": e}),
             }
         }
@@ -301,8 +295,8 @@ mod tests {
         assert!(serde_json::from_str::<Request>(r#"{"type":"nope"}"#).is_err());
     }
 
-    #[tokio::test]
-    async fn one_listener_per_workspace_and_it_vanishes_on_drop() {
+    #[test]
+    fn one_listener_per_workspace_and_it_vanishes_on_drop() {
         let ws = tempfile::tempdir().unwrap();
         let ep = endpoint(ws.path());
         let (listener, socket) = bind(ws.path(), &ep).unwrap().expect("first bind");
@@ -319,13 +313,13 @@ mod tests {
         assert!(bind(ws.path(), &ep).unwrap().is_some());
     }
 
-    #[tokio::test]
-    async fn same_user_peer_is_allowed() {
+    #[test]
+    fn same_user_peer_is_allowed() {
         let ws = tempfile::tempdir().unwrap();
         let ep = endpoint(ws.path());
         let (listener, _socket) = bind(ws.path(), &ep).unwrap().unwrap();
         let addr = listener.local_addr().unwrap();
-        let client = tokio::spawn(async move {
+        let client = std::thread::spawn(move || {
             #[cfg(target_os = "linux")]
             {
                 use std::os::linux::net::SocketAddrExt;
@@ -336,10 +330,10 @@ mod tests {
             #[cfg(not(target_os = "linux"))]
             std::os::unix::net::UnixStream::connect(addr.as_pathname().unwrap()).unwrap()
         });
-        let (stream, _) = listener.accept().await.unwrap();
+        let (stream, _) = listener.accept().unwrap();
         assert!(peer_allowed(&stream));
-        assert!(!peer_is(&stream, uid().wrapping_add(1)), "another uid is refused");
-        drop(client.await.unwrap());
+        assert_eq!(peer_uid(&stream), Some(uid()), "the peer's uid is read from the socket");
+        drop(client.join().unwrap());
     }
 
     #[test]
@@ -355,5 +349,56 @@ mod tests {
         let link = t.path().join("link");
         std::os::unix::fs::symlink(&d, &link).unwrap();
         assert!(private_dir(&link).is_err(), "a symlink (possibly planted) must be refused");
+    }
+}
+
+#[cfg(test)]
+mod round_trip {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn connect(ep: &str) -> UnixStream {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::linux::net::SocketAddrExt;
+            let a = std::os::unix::net::SocketAddr::from_abstract_name(ep.trim_start_matches('@').as_bytes()).unwrap();
+            UnixStream::connect_addr(&a).unwrap()
+        }
+        #[cfg(not(target_os = "linux"))]
+        UnixStream::connect(ep).unwrap()
+    }
+
+    #[test]
+    fn an_editor_request_reaches_the_lane_and_status_answers() {
+        let ws = tempfile::tempdir().unwrap();
+        type Got = Arc<Mutex<Vec<(Option<String>, String)>>>;
+        let got: Got = Arc::default();
+        let sink = got.clone();
+        let hooks = Arc::new(Hooks {
+            submit: Box::new(move |lane, msg| {
+                sink.lock().unwrap().push((lane.map(str::to_string), msg));
+                Ok(lane.unwrap_or("code").to_string())
+            }),
+            status: Box::new(|| json!({"ok": true, "active": "code"})),
+        });
+        let guard = serve(hooks, ws.path()).unwrap().expect("listening");
+        assert_eq!(std::fs::read_to_string(pointer_path(ws.path())).unwrap().trim(), guard.endpoint, "editors find it");
+        let mut s = connect(&guard.endpoint);
+        let mut r = BufReader::new(s.try_clone().unwrap());
+        let mut ask = |req: &str| {
+            s.write_all(format!("{req}\n").as_bytes()).unwrap();
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+        let reply = ask(r#"{"type":"send","text":"why?","lane":"spec","file":"a.rs","start":3,"end":4,"selection":"let x = 1;"}"#);
+        assert_eq!(reply, json!({"ok": true, "lane": "spec"}));
+        assert_eq!(ask(r#"{"type":"send","text":"  "}"#)["error"], "empty message");
+        assert_eq!(ask(r#"{"type":"status"}"#)["active"], "code");
+        let got = got.lock().unwrap();
+        assert_eq!(got[0].0.as_deref(), Some("spec"));
+        assert_eq!(got[0].1, "[From the editor] a.rs:3-4\n```rs\nlet x = 1;\n```\nwhy?");
+        drop(guard);
+        assert!(!pointer_path(ws.path()).exists(), "the pointer goes away with zilch");
     }
 }

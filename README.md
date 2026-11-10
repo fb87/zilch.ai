@@ -1,26 +1,29 @@
 # zilch
 
-A minimal, extensible coding agent written in Rust from scratch, for any **OpenAI-compatible** API
-(OpenAI, OpenRouter, Ollama, vLLM, llama.cpp, …).
+A coding agent written in Rust from scratch, for any **OpenAI-compatible** API (OpenAI,
+OpenRouter, OpenCode, Ollama, vLLM, llama.cpp, …), built like a small operating system: the CLI is
+the waiter, a kernel is the kitchen, agents are cooks. No agent framework and no async runtime —
+plain `std` threads.
 
-- **One master.** It is the only agent you talk to and works like *plan mode* plus a team lead: it reads code, writes a TODO plan, asks you to approve it, then coordinates workers. It can never edit files or run commands.
-- **Parallel workers.** Worker profiles such as `coder` run as several instances at once (`coder#1`, `coder#2`, …). A scheduler runs the TODO dependency graph in parallel waves. Each TODO declares the files it touches, so the scheduler keeps overlapping work apart, and stale-edit detection stops one worker from overwriting another's change.
-- **Every agent has its own system prompt and model.** The prompt is a built-in default you can extend or replace, and each agent can use a different model and even a different provider.
+- **One main agent, many subagents.** You talk to one main agent that keeps the whole session's
+  context. For a change it writes requirements, a design and a plan; you approve the plan; the
+  kernel starts one fresh **subagent** per task and runs independent tasks in parallel. Each
+  subagent may write only the files its task owns.
+- **A real kernel.** Agents are processes with a pid, run one step at a time on a pool of step
+  workers, and reach the outside world only through syscalls (model calls and tool calls alike) run
+  on driver pools. A timer tick drives a supervisor that nudges, restarts or stops looping and hung
+  processes.
+- **Two lanes.** `/spec` switches to a requirements engineer that maintains a versioned
+  specification; `/code` back to the main agent, which builds from it. Both run in parallel.
 
 ```
- you ⇄ MASTER (read_file, glob, grep, git · todo_write, propose_plan, run_todos, delegate)
-          │  TODO DAG → scheduler (max_workers, file-scope conflicts)
-          ├── coder#1   read/write/edit/glob/grep/git/bash
-          ├── coder#2   …in parallel
-          └── explorer#1 read-only investigation
+ you ⇄ CLI (waiter) ──orders/answers──▶ KERNEL (kitchen) ──events──▶ CLI, JSONL log
+                                          │ process table · scheduler + timer tick · supervisor
+            ┌─────────────────────────────┼───────────────────────────────┐
+     main agent (code lane)        spec agent (spec lane)        subagents, explorers
+     docs only · plans · explore   spec.md / design / plan       owned paths · read-only
+            └──── syscalls ──▶ driver pools: LLM (HTTP) · files/search/git · bash (sandbox)
 ```
-
-**Tools.** `glob` and `grep` run in-process on ripgrep's own crates (`.gitignore`-aware, no external
-binaries). `git` is read-only (status, diff, log, show) so the master can check what workers changed
-with a diff instead of re-reading files; repository config cannot make it run programs (external
-diff drivers, textconv, fsmonitor and hooks are off). `edit_file` takes an `edits` list to make
-several changes to a file in one call, all or none. Agents with `bash` are told which fast CLI
-tools are installed (`rg`, `fd`, `jq`, `ast-grep`) and to prefer them over `grep -r` and `find`.
 
 ## Build
 
@@ -34,351 +37,207 @@ cargo test
 
 ```sh
 export OPENAI_API_KEY=...
-zilch                                  # REPL
-zilch -p "add a --version flag"        # one-shot; final answer on stdout
-zilch --model o4-mini --worker-model coder=gpt-4.1-mini --workers 6
-zilch --yolo                           # auto-approve plans and actions
+zilch                                  # REPL: type an order; y approves the plan
+zilch -p "add a --version flag" --yes  # one order, then exit (0 = served)
+zilch -c                               # continue the last session in this directory
+zilch --model gpt-4.1 --developer-model gpt-4.1-mini --workers 8
+zilch --doctor                         # the resolved setup, and a ping of every model
 OPENAI_BASE_URL=http://localhost:11434/v1 zilch --model qwen2.5-coder   # Ollama
 ```
 
-How a change request flows:
-1. The master explores the code.
-2. It writes TODOs with `todo_write`.
-3. It calls `propose_plan`, and you see the TODOs grouped into parallel waves and choose approve, give feedback, or reject.
-4. It calls `run_todos`, and workers execute in parallel while a live panel shows progress.
-5. The master verifies the results, adds fix TODOs if needed, and reports back.
+How an order flows:
+1. The main agent explores the code (several read-only **explorers** can investigate in parallel).
+2. It updates `docs/requirements.md` and `docs/design.md`, and calls `submit_plan`.
+3. You see the tasks grouped into parallel waves: `y` approves, `n` rejects, anything else is
+   feedback. A stray Enter never approves.
+4. The kernel runs the plan as a dependency graph: independent tasks at once on their own
+   subagents, dependents after them, overlapping file scopes never at the same time. A failed task
+   blocks its dependents.
+5. The main agent checks the result and replies; that serves the order. Orders typed while it is
+   busy are queued; a follow-up can refer to earlier orders.
 
-**Approval modes** (`--approval` or `approval = …` in config):
-- `plan` (default): approving the plan authorizes each TODO's writes to its declared files. `bash` and writes outside those files still ask. Prompts from parallel workers queue up one at a time while the other workers keep running.
-- `ask`: ask before every mutating action.
-- `auto`: never ask (same as `--yolo`).
+**REPL commands**
 
-**REPL commands:** `/todos`, `/team`, `/models`, `/model <agent> <model> [provider]` (switch for this session; `default` switches back), `/ack`, `/prompt <agent>`, `/usage`, `/reset <instance>`, `/about`, `/redraw`, `/clear`, `/exit`.
-Ctrl-C cancels the current turn, including the master and every running worker.
+| | |
+|---|---|
+| `/ps` | process table with a `top`-style header: calls in flight, busy/waiting processes, tokens per group |
+| `/kill <pid>` · `/cancel` · Ctrl-C | stop one process · cancel the newest order (the main agent keeps its context) |
+| `@3 text` · `@developer text` · `@main text` · `@spec text` | more input for a process or group, read before its next model call; nothing is cancelled |
+| `/spec` · `/code` · `/status` | switch lanes · which lane you type into, what runs, the spec documents' state |
+| `/usage` · `/models` · `/model main\|developer <model> [provider]` · `/ack` | tokens and USD · models in use · switch for this session (`default` switches back) · silence the high-cost warning |
+| `/sessions` · `/recap` · `/clear` | saved sessions · this session's orders and last answer · a fresh session |
+| `/prompt [main\|developer]` · `/about` · `/redraw` · `/help` · `/exit` | |
+
+A status row above the prompt shows what each busy process is doing, a waiting plan or command
+question, and the session's spend.
 
 ## Configure
 
-Config layers, later wins: built-in defaults < central `~/.config/zilch/config.toml` < `./.zilch/config.toml` < env vars (`OPENAI_BASE_URL`, `OPENAI_API_KEY`, `ZILCH_MODEL`, `ZILCH_PROVIDER`) < CLI flags.
-
-Put providers and models in the central file once and every workspace uses them; a workspace's
-`.zilch/config.toml` only needs what differs, and is merged key by key on top. The central directory
-is `$XDG_CONFIG_HOME/zilch` or `~/.config/zilch` (on macOS, `~/Library/Application Support/zilch` is read
-too) and may also hold `agents/*.toml` and prompt files. `zilch --doctor` prints which files were loaded.
-Sandboxed commands cannot read `~/.config/zilch` or the macOS directory, so with `chmod 600` it is a
-reasonable place for `api_key = "…"` (a custom `$XDG_CONFIG_HOME` location is not hidden; add it to `bash_hide`).
+Layers, later wins: `~/.config/zilch/config.toml` (or `$XDG_CONFIG_HOME/zilch`; on macOS also
+`~/Library/Application Support/zilch`) < `./.zilch/config.toml` < env (`OPENAI_BASE_URL`,
+`OPENAI_API_KEY`, `ZILCH_MODEL`, `ZILCH_PROVIDER`) < flags. A workspace file only needs what
+differs. Sandboxed commands cannot read the zilch config directory, so with `chmod 600` it is a
+reasonable place for `api_key = "…"`. `zilch --doctor` shows which files were loaded.
 
 ```toml
-max_workers = 4
-approval = "plan"
-markdown_indent = 2                # indent of rendered answers in the terminal (0 = off)
+approval = "plan"                  # plan (default) | ask | auto
+spec_dir = "specs"                 # the spec lane's documents
+loop_limit = 3                     # supervisor: repeats before a nudge (0 = off)
+max_session_cost = 5.0             # USD cap, checked before each model call
+max_session_tokens = 2_000_000
 
 [providers.openai]                 # exists by default
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 max_concurrent = 8                 # per-provider request limit
 
-[providers.openrouter]
-base_url = "https://openrouter.ai/api/v1"
-api_key_env = "OPENROUTER_API_KEY"
+[providers.opencode]
+base_url = "https://opencode.ai/inference/go/openai/v1"
+api_key_env = "OPENCODE_API_KEY"
+session_header = "x-opencode-session"
 
-[providers.local]
-base_url = "http://localhost:11434/v1"
-
-[defaults]                         # fallback binding for every agent
+[defaults]                         # every agent unless its role says otherwise
 provider = "openai"
 model = "gpt-4.1"
 
-[roles.master]
+[roles.master]                     # the main agent (also [roles.architect]); the spec agent follows it
 model = "o4-mini"
 reasoning_effort = "high"
+context_tokens = 64000             # compaction starts at 75%
 
-[roles.spec]                       # spec lane (/spec); without a model it uses the master's
-model = "o3"
+[roles.coder]                      # the subagents (also [roles.developer])
+provider = "opencode"
+model = "qwen3.8-flash"
+system_prompt = "Prefer small diffs."
+prompt_mode = "append"             # append (default) | replace; or system_prompt_file = "…"
 
-[roles.coder]
-provider = "openrouter"
-model = "qwen/qwen3-coder"
-temperature = 0.2
-system_prompt_file = "prompts/coder.md"   # relative to this .zilch dir
-prompt_mode = "append"                    # append (default) | replace
+[roles.tester]                     # any other role: a custom subagent profile
+description = "runs and writes tests"
+tools = ["read_file", "glob", "grep", "bash"]
 
-[roles.explorer]
-provider = "local"
-model = "qwen2.5-coder:14b"
+[quotas]                           # token caps per group, like cgroups
+developer = 2_000_000
 ```
 
-**Extra worker profiles** go in `.zilch/agents/<name>.toml`, and the master sees them in its team roster:
+Custom profiles can also be files: `.zilch/agents/<name>.toml`. The main agent sees the profiles
+and gives a task to one with the task's `worker` field; the task then runs on that profile's model,
+tools and prompt. Every agent's prompt ends with the environment (workspace, OS, date) and the
+nearest `AGENTS.md`. Startup stops if a group's provider is unknown or its key is missing.
 
+**Approval.** `plan`: you approve each plan; subagents' commands then run in the sandbox without
+asking. `ask` (`--approval ask`): every command also waits for `y` / `n` / `a` (allow all for the
+rest of the session). `auto` (`--yolo`, `--yes`): nothing asks. A lone `y`, `n` or `a` answers a
+question even if it arrived while you were typing.
+
+## The kernel
+
+```
+crates/zilch-ipc      pids, groups, messages, mailboxes (send never blocks), syscalls, kernel events,
+                      the event bus (slow subscribers get Lagged) and the JSONL log
+crates/zilch-kernel   process table, scheduler (priority queues, aging) driven by a timer tick, syscall
+                      dispatch to driver pools, capabilities, plan DAG firing, lanes, supervisor, budgets
+crates/zilch-drivers  LLM over blocking HTTP (and a scripted fake), file/search/git tools, sandboxed bash,
+                      spec documents, sessions, config, price catalog
+crates/zilch-agents   one LLM-driven program; the main agent, spec agent, subagents and explorers are recipes
+crates/zilch          the `zilch` binary: REPL, status row, plan/command questions, editor link
+```
+
+- **Processes and syscalls.** One kernel thread owns every process. A step never does I/O: model
+  calls and tool calls are syscalls that run on driver pools (commands on their own pool), several
+  per step in parallel, so step workers never wait on the network. Long calls send heartbeats, so
+  slow is not mistaken for stuck.
+- **Capabilities.** The main agent writes only `docs/`, the spec agent only its spec documents,
+  a subagent only its task's `owned_paths`, explorers nothing; only subagents run commands.
+- **Supervisor** (code only, no extra model calls). Loops are compared after removing what changes
+  from run to run (durations, timestamps, temp paths, addresses): the same call with the same result
+  3×, the same reply 3×, 5 failing steps in a row, or a reply that keeps repeating itself while it
+  streams (cut on the spot). First a one-line nudge; then a restart with a summary of what was tried
+  (at most twice in 10 minutes); then a stop. A process with no progress is interrupted, then
+  restarted or killed. Processes waiting on each other's mailboxes are woken instead of hanging.
+- **Scheduling.** Tasks can carry a `priority` (0 urgent … 3 background); waiting work ages upward;
+  per-process step and token budgets; `[quotas]` per group.
+- **Context.** Subagents and explorers start fresh per task. The resident agents compact their
+  history at 75% of their budget: old tool output is shortened first, then older turns are
+  summarized.
+- **Events.** Everything the kernel does is an event; the JSONL log (`<data dir>/zilch/logs/`, mode
+  0600) records every syscall result, which is what a replay needs.
+
+## Lanes
+
+`/spec` switches to the spec lane's resident agent, a requirements engineer that interviews you (a
+few focused questions per turn, with suggested answers) and maintains `spec.md` (requirements with
+stable ids and EARS acceptance criteria), `design.md` and `plan.md` in `spec_dir`. Versioning is
+enforced by zilch: `release_spec` freezes the draft as an immutable `versions/spec-vN.md` with a
+changelog entry, and design and plan are stamped with the spec version they derive from. `/code`
+switches back; the main agent works from the spec lane's design and plan. Both lanes run in
+parallel; spec orders are marked in the output.
+
+## Sessions
+
+After every served order the resident agents' conversations are saved to
+`<data dir>/zilch/os-sessions/<workspace>/<id>.json` (owner-only, atomic writes, outside the repo).
+
+```sh
+zilch -c                      # continue the latest session in this directory
+zilch -c -p "now add tests"   # … non-interactively
+zilch --sessions              # list this directory's sessions
+zilch --resume <id>           # continue a specific one
+zilch --no-session            # don't save
+```
+
+Order numbers carry on in a continued session. Work on an order that was not served yet is not
+saved. `/clear` starts a fresh session; the old one stays resumable.
+
+## Costs and models
+
+At startup zilch reads each provider's `{base}/models` (OpenCode and OpenRouter publish prices and
+context windows); `price_in` / `price_out` on a role override them, `discover = false` on a
+provider skips the lookup. `/usage` shows tokens and USD per agent and model, the status row the
+session's spend; the caps stop a call before it would exceed them. `/model` switches a group for
+the session. A model whose output price is at least `expensive_model_price` (default 10 USD/1M) and
+that has been in use for `expensive_model_minutes` (30) or cost `expensive_model_spend` ($2)
+pulses in the status row until `/ack` (next step) or until no group uses it.
+
+**Protocols** — each provider speaks one of:
 ```toml
-description = "Reviews diffs for bugs; never edits"
-tools = ["read_file", "grep", "glob", "bash"]
-model = "gpt-4.1"
-system_prompt = "You are a meticulous code reviewer…"
+[providers.openai]
+protocol = "chat"      # POST {base}/chat/completions (default)
+[providers.oai-resp]
+protocol = "responses" # POST {base}/responses
+[providers.anthropic]
+base_url = "https://api.anthropic.com/v1"
+api_key_env = "ANTHROPIC_API_KEY"
+protocol = "anthropic" # POST {base}/messages (x-api-key auth)
 ```
-
-**System prompts** are put together when an agent is spawned, in this order:
-1. The built-in default (`crates/zilch-core/prompts/*.md`) and/or your prompt.
-2. A role contract you can't remove: the master never edits and works through TODOs; workers stay in scope and end with a `STATUS:` report.
-3. Environment details (cwd, OS, date, agent id, tools, team roster).
-4. `AGENTS.md`, if present.
-
-`{{cwd}}`, `{{date}}`, `{{agent_id}}`, `{{tools}}`, `{{workers}}` and `{{os}}` are filled in. A worker instance keeps its prompt and model for its whole lifetime. A TODO can set `model` (and `provider`) to send a hard item to a stronger model.
-
-Agents: `master` (code lane), `spec` (spec lane), `coder` and `explorer` (workers), plus your own. Each
-agent's binding comes from `[roles.<name>]`, then `[defaults]`; the `spec` agent first falls back to
-`[roles.master]`, so one master setting (or `--model`) drives both lanes.
-
-Startup stops with an error if a profile uses an unknown provider or its API key is missing, and
-warns when an agent's model is not in its provider's `/models` list (`zilch --doctor` checks every
-agent and sends each model a tiny request).
-
-## Layout
-
-```
-crates/zilch-core   library: no terminal I/O; frontends consume AgentEvents
-  llm/              Chat Completions types, hand-written SSE parser, delta accumulator, provider registry
-  tools/            Tool trait, worker tools (read/write/edit/glob/grep/git/bash), master tools (todo/plan/run/delegate)
-  agent/            agent loop (concurrent tool calls), approval gate, events
-  team/             Team, WorkerPool, TODO list, DAG scheduler, file locks, plan review
-  config.rs profile.rs prompt.rs
-crates/zilch-cli    `zilch` binary: REPL, live panel, approval and plan-review prompts
-```
-
-### zilch-os (experimental, branch `dev/os-kernel`)
-
-A rebuild of zilch as an agent operating system, built alongside the crates above with **std threads
-only** (no async runtime). Think of it as a restaurant: the CLI is the waiter, the kernel is the
-kitchen, agents are cooks.
-
-```
-crates/zilch-ipc      pids, messages, mailboxes (send never blocks), syscalls, kernel events, event bus + JSONL log
-crates/zilch-kernel   process table, scheduler driven by a timer tick, syscall dispatch to driver pools,
-                      capabilities, plan DAG firing, supervisor (loops, hung processes), budgets
-crates/zilch-drivers  LLM over blocking HTTP (and a scripted fake), file/search/git tools, sandboxed bash, config
-crates/zilch-agents   one LLM-driven program; the resident main agent and the subagents are recipes (prompt + tools)
-crates/zilch-os       `zilch-os` binary: orders, plan approval, /ps, /kill, /cancel
-```
-
-**One main agent, many subagents.** The main agent is a single process that lives for the whole
-session. Every order goes to it, and so does every subagent report and every note you send, so it
-keeps the context: a follow-up order can refer to an earlier one. For each order it explores the
-code, updates `docs/requirements.md` and `docs/design.md`, and calls `submit_plan`. You approve
-the plan. The kernel then starts one **subagent** per task, running independent tasks in
-parallel. Each subagent starts with a fresh context holding only its brief, and can write only its
-task's `owned_paths`. The main agent can write only `docs/`. When every task is done, the main
-agent checks the result and replies; that serves the order, and it waits for the next one. Orders
-typed while it is busy are queued. Cancelling an order (Ctrl-C, `/cancel`) stops its subagents but
-keeps the main agent and its context.
-Its context is compacted when it reaches 75% of `context_tokens` on its role (default 64000):
-old tool output is shortened first, then older turns are summarized by the model, so a long session
-does not keep getting slower. Subagents start fresh per task, so they stay small anyway.
-
-**Costs and models.** At startup zilch-os reads each provider's model list (prices, context
-sizes); `price_in` / `price_out` on a role override them. `/usage` shows tokens and USD per agent and
-model, the status row the session's spend. `max_session_tokens` and `max_session_cost` stop model
-calls before they would exceed the cap. `/model main|developer <model> [provider]` switches a group
-for the session (`default` switches back), `/models` shows both. A model with an output price of at
-least `expensive_model_price` (default 10 USD/1M) that has been in use for 30 minutes or cost $2
-pulses in the status row until `/ack` or until you switch back. Also `/about`, `/redraw`, `/prompt`.
-
-**Spec lane.** `/spec` switches to a second lane with its own resident agent, a requirements
-engineer that interviews you and maintains `spec.md`, `design.md` and `plan.md` in `spec_dir`
-(default `specs`) through `write_doc` / `edit_doc`; `release_spec` freezes immutable versions, and
-design and plan are stamped with the spec version they derive from. `/code` switches back; the
-main agent works from the spec lane's design and plan. Both lanes run in parallel and are saved
-with the session. `@spec text` reaches the spec agent; `/status` shows the documents' state.
-
-**Editor link.** The REPL listens on a local socket (Linux: an abstract socket, nothing on disk;
-elsewhere a socket file in a private directory; only your user can connect) and writes its address
-to `.zilch/ipc`. The Neovim plugin in `editor/nvim` (`:ZilchSend`) sends a selection plus a comment,
-which becomes an order in the requested lane or the active one.
-
-**Approval.** `approval = "plan"` (default): you approve each plan; subagents' commands then run in
-the sandbox without asking. `"ask"` (or `--approval ask`): every command also waits for `y` / `n` /
-`a` (allow all for the rest of the session). `"auto"` (or `--yolo`, `--yes`): nothing asks. A lone
-`y`, `n` or `a` answers a question even if it arrived while you were typing at the order prompt.
-
-**Prompts and profiles.** A role can add to its built-in prompt or replace it: `system_prompt` or
-`system_prompt_file` (relative to its config directory) with `prompt_mode = "append" | "replace"`, on
-`[roles.master]` (main agent), `[roles.coder]` (subagents) or `[roles.spec]`. Any other role, in
-`config.toml` or as `agents/<name>.toml`, is a custom subagent profile with its own `model`, `tools`,
-prompt and `description`; the main agent sees the list and can give a plan task to one with the
-task's `worker` field (e.g. a `tester` with `tools = ["read_file", "bash"]`).
-
-**Explorers.** For a broad investigation the main agent calls `explore` with several questions: each
-goes to its own read-only explorer (read, glob, grep, git; no writes, no commands), they run in
-parallel, and the main agent gets all reports at once.
-
-**Sessions.** After every served order the main agent's conversation is saved under
-`<data dir>/zilch/os-sessions/` (one directory per workspace, files mode 0600). `zilch-os -c`
-continues the most recent session of the current directory: the main agent remembers it and order
-numbers carry on. `--sessions` lists this directory's sessions, `--resume <id>` continues a specific
-one; in the REPL `/sessions` lists them, `/recap` shows this session's orders and last answer, and
-`/clear` starts a fresh session (the old one stays resumable). `--no-session` saves nothing. Work on an order that was not served yet is not
-saved; a continued session starts from the last served order. Plans need an explicit `y`.
-
-`@3 text` sends more input to process 3, `@developer text` to every live subagent of the newest
-order, and `@main text` to the main agent (when it is idle, that is simply the next order).
-Nothing in flight is cancelled: the note is read before the process's next model call. Notes to
-subagents are copied to the main agent.
-
-LLM calls and tool calls are both syscalls, so step workers never wait on the network. Every
-syscall result goes to the event log, which is the data a replay needs. The supervisor compares
-steps after removing what changes from run to run (durations, timestamps, temp paths, addresses).
-A process that loops is nudged first; if it loops again, it is restarted with a summary of what
-it tried (built in code, no extra model call), at most twice in 10 minutes, and then stopped. A
-process that stops making progress is interrupted, then restarted or killed. When every process
-of an order waits for a message nobody can send, the youngest one is woken with an error.
-Tasks can carry a `priority` (0 most urgent … 3 background), and `[quotas]` caps the tokens of a
-group (`developer = 2000000`), like a cgroup. `/ps` shows the process table under a `top`-style
-header: calls in flight (model calls, commands, tool calls), busy and waiting processes, step workers, tokens per group.
-
-`zilch-os` reads the same config files as `zilch`,
-mapping `[roles.master]` (or `[roles.architect]`) to the main agent and `[roles.coder]` (or
-`[roles.developer]`) to the subagents.
-
-```sh
-zilch-os --model beam-free              # REPL: type an order, y approves the plan
-zilch-os -c                             # continue the last session in this directory
-zilch-os --doctor                       # the resolved setup, and a ping of every model
-zilch-os -p "add a --version flag" --yes
-```
-
-**Extension points:**
-- `LlmClient`: add a backend.
-- `Tool`: add a tool (and its name to a profile's `tools`).
-- `Approver` / `PlanReviewer`: a different UI.
-- `EventSink`: a different renderer, such as a TUI or a server.
-
-## Testing
-
-```sh
-cargo test                                   # offline: unit, integration, fuzz (proptest), corner cases
-PROPTEST_CASES=10000 cargo test --test fuzz  # fuzz harder
-# Live tests against a real FREE model (read-only tools, temp dirs only):
-OPENCODE_API_KEY=... cargo test -p zilch-core --test live_corners -- --ignored --nocapture --test-threads=2
-OPENCODE_API_KEY=... cargo test -p zilch-core --test live_compaction -- --ignored --nocapture
-```
-Fuzzed properties cover the SSE decoder/parser, tool-call reassembly, `edit_file` semantics,
-output truncation, path normalization, file scopes, TODO graphs, and history compaction
-(never splitting a tool call from its results).
 
 ## Safety & operations
 
 | Concern | What zilch does | Config |
 |---|---|---|
-| File access | File tools are **sandboxed to the workspace**: `..`, absolute paths and symlinks that resolve outside it are refused; writes into `.git/` are refused | `sandbox = false` to disable |
-| Secrets | `bash` runs **without secret env vars** (every provider `api_key_env`, plus `*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, …) so a prompt-injected `env` can't leak keys | `bash_env_passthrough = ["GITHUB_TOKEN"]` |
-| Arbitrary commands | `bash` runs in zilch's **built-in sandbox** — no external tools needed. Linux: native user/mount/PID/IPC/UTS(/net) namespaces implemented in Rust (the `zilch` binary re-executes itself as the sandbox helper); macOS: the OS's Seatbelt. Host filesystem read-only, only the workspace, a private `/tmp` and `/dev/shm` writable, credential stores hidden (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, zilch config/logs, …), tool caches (`~/.cargo`, `~/.cache`, `~/.npm`, …) copy-on-write via overlayfs, `.git/` read-only, own PID namespace (the command is PID 1; everything inside dies with it), optional no-network (loopback only). `auto` falls back to unsandboxed with a visible warning when user namespaces are disabled; `required` refuses | `bash_sandbox = "auto" \| "required" \| "off"`, `bash_network = false`, `bash_hide`, `bash_writable`, `bash_overlay`, `bash_protect_git` |
-| Runaway commands | each `bash` call runs in its own process group; on finish/timeout/cancel the **whole group is killed** (no orphaned servers) | `timeout_secs` per call (max 600) |
-| Runaway cost | optional **team-wide token cap**; agents stop with a clear error when it's reached (soft cap: checked before each request) | `max_session_tokens = 2_000_000` / `--max-tokens` |
-| Stuck agents | a code-only **supervisor** (no extra tokens) watches every agent: the same tool call with the same result 3× in a turn (which also catches read → failed edit cycles), the same reply 3×, 5 steps in a row of failing tool calls, or a reply that keeps repeating itself while it streams (cut on the spot). First time: a one-line nudge to change approach; next time: the turn stops (a worker's TODO fails, so the master re-plans). At team level, a TODO whose unchanged task already failed twice is not run again | `loop_limit = 3` (0 = off) |
-| Hung providers | no headers or no stream data for `idle_timeout_secs` → error instead of hanging; 429/408/5xx retried with backoff, `Retry-After` honoured, 4xx not retried | `[providers.x] idle_timeout_secs = 180` |
-| Context overflow | history compaction near each agent's `context_tokens` (see above) | `context_tokens = 128000` |
-| Debugging | every session writes a **JSONL event log** (mode 0600) to `<data dir>/zilch/logs/`; its path is printed on errors | `--log FILE`, `--no-log` |
-| Setup problems | `zilch --doctor` prints the resolved config and pings every distinct model | |
-| Interrupts | Ctrl-C cancels the turn (all agents); twice within 2s force-quits; `-p` exits 130 when cancelled, 1 on error | |
-
-## Sessions
-
-Every turn is saved automatically (after success, failure or Ctrl-C) to
-`<data dir>/zilch/sessions/<id>.json` (owner-only, atomic writes, outside the repo):
-master history, TODO list and approvals, every worker instance with its history and model.
-
-```sh
-zilch -c                      # continue the latest session in this directory (REPL); shows a recap
-zilch -c -p "now add tests"   # continue it non-interactively
-zilch --sessions              # list sessions for this directory
-zilch --resume <id>           # resume a specific one
-zilch --no-session            # don't save
-```
-On resume, TODOs that were in progress go back to pending, a crash mid-turn is trimmed back to a
-consistent point, and workers must re-read files before editing them (stale-edit protection is
-never trusted across processes). `/clear` starts a new session; the old one stays resumable.
-
-Resuming prints a short recap (no model call) so you can decide what to do next: the first and
-last request, the last answer (or a warning if the last request was interrupted), TODO progress
-with unfinished and failed items first, and the workers that kept their context. `/recap` shows it
-again at any time.
-
-## Protocols, costs and releases
-
-**Protocols** — each provider speaks one of:
-```toml
-[providers.openai]     # default
-protocol = "chat"      # POST {base}/chat/completions
-[providers.oai-resp]
-protocol = "responses" # POST {base}/responses   (OpenAI Responses API)
-[providers.anthropic]
-base_url = "https://api.anthropic.com/v1"
-api_key_env = "ANTHROPIC_API_KEY"
-protocol = "anthropic" # POST {base}/messages    (x-api-key auth)
-```
-
-**Costs** — at startup zilch reads each provider's `{base}/models` (OpenCode and OpenRouter
-publish prices and context windows) so `/usage`, the REPL footer and `--doctor` show USD, and
-`context_tokens` defaults to the model's real context window. Override or fill in prices per role
-with `price_in` / `price_out` (USD per 1M tokens); `discover = false` on a provider skips the lookup.
-`max_session_cost = 5.0` (or `--max-cost 5`) stops the team before a request would exceed the cap;
-`max_session_tokens` likewise, both checked **before** sending.
-
-**High-cost model warning** — a model whose output price is at least `expensive_model_price`
-(default `10`, USD per 1M tokens; `0` = off) gets a pulsing segment in the status row once it has
-been in use for `expensive_model_minutes` (default 30) or cost `expensive_model_spend` (default
-`2.0`) — e.g. a strong model switched in for one hard task and forgotten. It keeps pulsing until
-`/ack` (silenced until the next 30 min / $2 step) or until no agent uses that model any more
-(`/model <agent> default`).
-
-**Sandbox on macOS** — `bash` runs under `sandbox-exec` with the same policy (writes limited to the
-workspace, temp dirs and tool caches; secrets and the Keychain hidden; optional no-network). No
-copy-on-write there, so caches are writable directly. `bash_sandbox = "required"` refuses to run
-commands without an OS sandbox on either platform. `.git/` is read-only to commands by default
-(`bash_protect_git = false` to let agents commit).
-
-**Releases** — pushing a `v*` tag builds and tests Linux (gnu + static musl, x86_64 + aarch64) and
-macOS (Intel + Apple Silicon) binaries and publishes them with `SHA256SUMS`:
-```sh
-curl -LO https://github.com/<owner>/zilch/releases/latest/download/zilch-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz
-```
-
-## Live progress
-
-While agents work, the CLI shows an animated status line per busy agent with what it is doing
-and for how long, including the latest output line of long-running commands:
-```
-⠹ master · thinking · 4s
-  ⠼ [t2] Add CLI flags · coder#2 · bash(cargo test) · 1m07s · Compiling serde v1.0.200
-```
-Without a terminal (e.g. `zilch -p … 2> log`), a plain `… coder#2 still running bash(cargo test) (1m00s)`
-heartbeat is printed every 30s instead, so logs never look frozen.
-
-## Spec lane and code lane
-
-Two conversations run **in parallel** in the REPL; `/spec` and `/code` only switch which one you
-are typing into — neither stops the other:
-
-- **`/spec` — requirements engineering.** The spec master interviews you (a few focused questions
-  per turn, with suggested answers), reads the code so it never asks what the repo already says,
-  and maintains three documents in the spec directory (`spec_dir = "…"` or `--spec-dir`,
-  default `specs/`):
-  - `spec.md` — requirements with stable ids (FR-n, NFR-n) and EARS acceptance criteria;
-  - `design.md` and `plan.md` — derived from a **released** spec version.
-- **Versioning is enforced by zilch, not just the prompt:** `release_spec` freezes the draft as an
-  immutable `versions/spec-vN.md` with a changelog entry; every write of design/plan is stamped
-  `based-on: spec vN` and requires a released version.
-- **`/code` — implementation**, as before. The code master works from `plan.md`/`design.md`
-  (never `spec.md`); its context shows which spec version the plan is based on, warns when it is
-  **stale**, and notes when the spec lane updated the plan mid-run.
-
-While a lane works in the background its output is summarized (`✓ code lane finished — /code to
-see its answer`); switching shows what it said. Approvals and plan reviews from either lane appear
-above the prompt and your next line answers them. `/status` shows both lanes and the document
-versions; `zilch -p "…" --lane spec` talks to the spec lane non-interactively. Both conversations
-are saved in the session and resume with `-c`.
+| File access | File tools are confined to the workspace (`..`, absolute paths and symlinks resolving outside are refused; no writes into `.git/`), on top of the kernel's capabilities | `sandbox = false` to disable |
+| Parallel edits | per-file locks; stale-edit detection refuses to overwrite a file changed since it was read | |
+| Secrets | `bash` runs without secret env vars (every provider `api_key_env`, `*_API_KEY`, `*_TOKEN`, `*_SECRET`, …) | `bash_env_passthrough = ["GITHUB_TOKEN"]` |
+| Commands | `bash` runs in zilch's built-in sandbox. Linux: native user/mount/PID/IPC/UTS(/net) namespaces in Rust (the `zilch` binary re-executes itself as the helper); macOS: Seatbelt. Read-only host, writable workspace and private `/tmp`, credential stores hidden, tool caches copy-on-write, `.git/` read-only, own PID namespace, optional no-network | `bash_sandbox = "auto" \| "required" \| "off"`, `bash_network`, `bash_hide`, `bash_writable`, `bash_protect_git` |
+| Runaway commands | each call in its own process group, killed on finish, timeout or cancel | `timeout_secs` per call (max 600) |
+| Runaway cost | session token and USD caps, group quotas, per-process budgets, the supervisor | see Configure |
+| Hung providers | no data for `idle_timeout_secs` → error; 429/408/5xx retried with backoff, `Retry-After` honoured | `[providers.x] idle_timeout_secs = 180` |
+| Debugging | JSONL event log per session; `--verbose` shows every model call and result | `--log FILE`, `--no-log` |
+| Setup problems | `zilch --doctor` | |
 
 ## Editor integration (Neovim)
 
 `editor/nvim` is a small Neovim plugin: select code, `:ZilchSend why is this rounding here?`, and
-the running zilch receives the file, line range, selected code and your comment in the active lane
-(or `:ZilchCode` / `:ZilchSpec` to pick one). It talks to the REPL over a local socket (abstract on Linux, owner-only, peer-uid checked) using
-newline-delimited JSON — see [`editor/nvim/README.md`](editor/nvim/README.md).
+the running zilch receives the file, line range, selected code and your comment as an order in the
+active lane (`:ZilchCode` / `:ZilchSpec` pick one; `:ZilchStatus` shows both lanes). It talks to the
+REPL over a local socket — abstract on Linux, a private socket file elsewhere, peer-uid checked —
+whose address zilch writes to `.zilch/ipc`. See [`editor/nvim/README.md`](editor/nvim/README.md).
+
+## Testing and releases
+
+```sh
+cargo test     # offline: kernel behaviour with scripted agents, tools, protocols, end-to-end orders
+               # with a scripted model on real files, sessions, the editor link
+```
+
+Pushing a `v*` tag builds and tests Linux (gnu + static musl, x86_64 + aarch64) and macOS (Intel +
+Apple Silicon) binaries and publishes them with `SHA256SUMS`.

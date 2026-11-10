@@ -1,14 +1,14 @@
 [package]
-name = "zilch-os"
+name = "zilch"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "zilch as an agent OS: the CLI (waiter) in front of the kernel (kitchen)."
+description = "zilch: the CLI (waiter) in front of the agent kernel (kitchen)."
 
 [[bin]]
-name = "zilch-os"
+name = "zilch"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,5 +1,5 @@
 //! Session files: the main agent's conversation, saved each time it serves an order, so
-//! `zilch-os -c` can continue where the last session in this directory left off.
+//! `zilch -c` can continue where the last session in this directory left off.
 //! Layout: `<data dir>/zilch/os-sessions/<workspace key>/<id>.json` (mode 0600).
 
 use serde_json::{json, Value};

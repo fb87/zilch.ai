@@ -48,7 +48,7 @@ jobs:
           grep -E -A3 "^---- |panicked at|^error|error\\[" test.log | head -80 |
             while IFS= read -r line; do echo "::error title=${{ matrix.target }}::${line}"; done
       - name: build
-        run: cargo build --release --locked --target ${{ matrix.target }} -p zilch-cli
+        run: cargo build --release --locked --target ${{ matrix.target }} -p zilch
       - name: package
         shell: bash
         run: |

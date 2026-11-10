@@ -423,7 +423,7 @@ impl Book {
     fn session(&self, ticket: TicketId, group: Group) -> String {
         let n = self.sessions.fetch_add(1, Ordering::Relaxed);
         let salt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
-        format!("zilch-os-t{ticket}-{}-{n}-{salt:08x}", group.name())
+        format!("zilch-t{ticket}-{}-{n}-{salt:08x}", group.name())
     }
 }
 

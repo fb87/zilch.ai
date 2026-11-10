@@ -1,4 +1,4 @@
-//! `zilch-os`: the waiter. Takes the guest's order, hands it to the kitchen (the kernel), shows
+//! `zilch`: the waiter. Takes the guest's order, hands it to the kitchen (the kernel), shows
 //! what the kitchen does as it happens, relays the plan for approval, and serves the result.
 //! It never waits on the agents: the kernel runs on its own threads and reports on the event bus.
 
@@ -24,9 +24,9 @@ use zilch_kernel::{Cmd, KernelConfig, KernelHandle};
 
 #[derive(Parser)]
 #[command(
-    name = "zilch-os",
+    name = "zilch",
     version,
-    about = "zilch as an agent OS: the architect plans your order, developers cook it in parallel, the result is served."
+    about = "zilch: a coding agent built like a small OS — a main agent plans your order, subagents cook it in parallel, the result is served."
 )]
 struct Cli {
     /// Place one order and exit when it is served.
@@ -471,7 +471,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             Some(id) => {
                 let p = dir.join(format!("{id}.json"));
                 if !p.exists() {
-                    anyhow::bail!("no session '{id}' in this directory (see zilch-os --sessions)");
+                    anyhow::bail!("no session '{id}' in this directory (see zilch --sessions)");
                 }
                 Some(p)
             }
@@ -588,7 +588,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
     let (d, r) = (view.c(DIM), view.c(RESET));
     let (_, sandbox) = zilch_drivers::tools::sandbox::status(cfg.policy.bash_sandbox, cfg.policy.bash.network);
     let banner = format!(
-        "{}zilch-os {}{} {d}· main {} · subagents {} · {} workers{r}\n{d}commands: {sandbox}{r}{}",
+        "{}zilch {}{} {d}· main {} · subagents {} · {} workers{r}\n{d}commands: {sandbox}{r}{}",
         view.c(BOLD),
         env!("CARGO_PKG_VERSION"),
         r,
@@ -648,7 +648,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         rl.set_helper(Some(status::StatusHelper(bar.clone())));
         status::spawn_refresher(bar.clone(), Box::new(rl.create_external_printer()?));
         let (v, bar) = (view.clone(), bar.clone());
-        std::thread::Builder::new().name("zilch-os-status".into()).spawn(move || loop {
+        std::thread::Builder::new().name("zilch-status".into()).spawn(move || loop {
             let (text, busy) = v.status_line();
             bar.set(status::clip(&text, terminal_width()), busy);
             std::thread::sleep(Duration::from_millis(100));
@@ -704,7 +704,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         }
     };
     let v = view.clone();
-    std::thread::Builder::new().name("zilch-os-view".into()).spawn(move || {
+    std::thread::Builder::new().name("zilch-view".into()).spawn(move || {
         for env in events.iter() {
             v.track(&env.event);
             if let Some(s) = v.render(&env.event) {
@@ -986,7 +986,7 @@ fn model_cmd(
 /// /about: version, project, where things are.
 fn about(cwd: &std::path::Path, sources: &[PathBuf], session: Option<&PathBuf>) -> String {
     let mut lines = vec![
-        format!("zilch-os {} — {}", env!("CARGO_PKG_VERSION"), env!("CARGO_PKG_DESCRIPTION")),
+        format!("zilch {} — {}", env!("CARGO_PKG_VERSION"), env!("CARGO_PKG_DESCRIPTION")),
         format!("  repository  {}", env!("CARGO_PKG_REPOSITORY")),
         format!("  author      {}", env!("CARGO_PKG_AUTHORS").replace(':', ", ")),
         format!("  license     {}", env!("CARGO_PKG_LICENSE")),
@@ -1027,7 +1027,7 @@ fn sessions_list(dir: &std::path::Path, current: Option<&PathBuf>) -> String {
         let last: String = e.orders.last().map(|t| t.split_once(": ").map(|x| x.1).unwrap_or(t)).unwrap_or("").chars().take(60).collect();
         s.push_str(&format!("{mark} {}  {:<12} {:>3} order(s)  {last}\n", e.id, ago(e.updated_ms), e.orders.len()));
     }
-    s.push_str("continue one with: zilch-os --resume <id>   (or -c for the newest)");
+    s.push_str("continue one with: zilch --resume <id>   (or -c for the newest)");
     s
 }
 
@@ -1062,7 +1062,7 @@ fn spec_status(dir: &std::path::Path) -> String {
 
 /// --doctor: the resolved setup, then one tiny request to every distinct model.
 fn doctor(cfg: &Config, meter: &zilch_drivers::llm::catalog::CostMeter, cwd: &std::path::Path) -> i32 {
-    println!("zilch-os {} doctor — workspace {}", env!("CARGO_PKG_VERSION"), cwd.display());
+    println!("zilch {} doctor — workspace {}", env!("CARGO_PKG_VERSION"), cwd.display());
     if cfg.sources.is_empty() {
         println!("  config      built-in defaults + environment (no config file found)");
     }
@@ -1111,7 +1111,7 @@ fn doctor(cfg: &Config, meter: &zilch_drivers::llm::catalog::CostMeter, cwd: &st
             binding: zilch_ipc::ModelBinding { max_tokens: Some(256), ..b.clone() },
             messages: vec![zilch_ipc::Message::user("Reply with the single word OK.")],
             tools: vec![],
-            session: Some(format!("zilch-os-doctor-{}", std::process::id())),
+            session: Some(format!("zilch-doctor-{}", std::process::id())),
         };
         let start = Instant::now();
         match zilch_drivers::llm::complete(backend.as_ref(), &req, &zilch_kernel::CancelToken::new(), &|| {}, |_| {}) {

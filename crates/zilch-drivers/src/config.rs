@@ -1,7 +1,7 @@
-//! Configuration: the same files and keys as zilch (`~/.config/zilch/config.toml`,
-//! `./.zilch/config.toml`, environment, CLI flags; later wins). Unknown keys are ignored, so one
-//! config serves both zilch and zilch-os. Roles map onto groups: `[roles.architect]` (falling back
-//! to `[roles.master]`) and `[roles.developer]` (falling back to `[roles.coder]`).
+//! Configuration: `~/.config/zilch/config.toml`, `./.zilch/config.toml`, environment, CLI flags
+//! (later wins). The keys are the previous zilch's, so existing config files keep working, and unknown
+//! keys are ignored. Roles map onto groups: `[roles.architect]` (falling back to `[roles.master]`)
+//! for the main agent, `[roles.developer]` (falling back to `[roles.coder]`) for the subagents.
 
 use crate::llm::client::HttpClient;
 use crate::llm::protocol::Protocol;
