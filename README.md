@@ -144,6 +144,37 @@ crates/zilch-core   library: no terminal I/O; frontends consume AgentEvents
 crates/zilch-cli    `zilch` binary: REPL, live panel, approval and plan-review prompts
 ```
 
+### zilch-os (experimental, branch `dev/os-kernel`)
+
+A rebuild of zilch as an agent operating system, built alongside the crates above with **std threads
+only** (no async runtime). Think of it as a restaurant: the CLI is the waiter, the kernel is the
+kitchen, agents are cooks.
+
+```
+crates/zilch-ipc      pids, messages, mailboxes (send never blocks), syscalls, kernel events, event bus + JSONL log
+crates/zilch-kernel   process table, scheduler driven by a timer tick, syscall dispatch to driver pools,
+                      capabilities, plan DAG firing, supervisor (loops, hung processes), budgets
+crates/zilch-drivers  LLM over blocking HTTP (and a scripted fake), file/search/git tools, sandboxed bash, config
+crates/zilch-agents   one LLM-driven program; the Architect and Developer are recipes (prompt + tools)
+crates/zilch-os       `zilch-os` binary: orders, plan approval, /ps, /kill, /cancel
+```
+
+An order goes to an **Architect** process. It explores the code, writes `docs/requirements.md` and
+`docs/design.md`, and calls `submit_plan`. You approve the plan. The kernel then starts one
+**Developer** process per task, running independent tasks in parallel. Each Developer can write
+only its task's `owned_paths`; the Architect can write only `docs/`. When every task is done, the
+Architect checks the result and the order is served.
+
+LLM calls and tool calls are both syscalls, so step workers never wait on the network. Every
+syscall result goes to the event log, which is the data a replay needs. A process that stops
+making progress is interrupted, and then killed. `zilch-os` reads the same config files as `zilch`,
+mapping `[roles.master]` to the Architect and `[roles.coder]` to the Developer.
+
+```sh
+zilch-os --model beam-free              # REPL: type an order, Enter approves the plan
+zilch-os -p "add a --version flag" --yes
+```
+
 **Extension points:**
 - `LlmClient`: add a backend.
 - `Tool`: add a tool (and its name to a profile's `tools`).

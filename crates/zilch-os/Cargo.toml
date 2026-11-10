@@ -1,0 +1,24 @@
+[package]
+name = "zilch-os"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "zilch as an agent OS: the CLI (waiter) in front of the kernel (kitchen)."
+
+[[bin]]
+name = "zilch-os"
+path = "src/main.rs"
+
+[dependencies]
+zilch-ipc = { path = "../zilch-ipc" }
+zilch-kernel = { path = "../zilch-kernel" }
+zilch-drivers = { path = "../zilch-drivers" }
+zilch-agents = { path = "../zilch-agents" }
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+rustyline = "15"
+unicode-width = "0.2"
+libc = "0.2"
+dirs = "5"

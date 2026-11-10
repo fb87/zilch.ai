@@ -2630,6 +2630,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "zilch-os"
+version = "0.1.3"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dirs",
+ "libc",
+ "rustyline",
+ "unicode-width",
+ "zilch-agents",
+ "zilch-drivers",
+ "zilch-ipc",
+ "zilch-kernel",
+]
+
+[[package]]
 name = "zlib-rs"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
