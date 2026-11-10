@@ -230,9 +230,11 @@ impl View {
             }
             KernelEvent::Notice { text, .. } => format!("  {d}{text}{r}"),
             KernelEvent::Lagged { missed } => format!("  {d}(display missed {missed} events; the log has them){r}"),
-            KernelEvent::State { .. } | KernelEvent::TextDelta { .. } | KernelEvent::Usage { .. } | KernelEvent::SyscallDone { .. } => {
-                return None
-            }
+            KernelEvent::Told { .. }
+            | KernelEvent::State { .. }
+            | KernelEvent::TextDelta { .. }
+            | KernelEvent::Usage { .. }
+            | KernelEvent::SyscallDone { .. } => return None,
         })
     }
 }
@@ -308,6 +310,8 @@ fn ps(k: &KernelHandle) -> String {
 
 const HELP: &str = "\
 Type an order to place it. While a plan waits for you: Enter approves, n rejects, anything else is feedback.
+@<pid> text  more input for one process (read before its next model call)
+@architect text / @developer text   the same for every live process of that group
 /ps          the process table (pid, group, state, what it is doing)
 /kill <pid>  stop one process (its task fails; dependents are blocked)
 /cancel      cancel the newest open order
@@ -473,7 +477,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         let input = line.trim();
         // The order may have ended (cancelled, killed) after this prompt was drawn.
         let asked = asked.filter(|(_, t)| view.open.lock().unwrap().contains(t));
-        if let (Some((qid, _)), false) = (asked, input.starts_with('/')) {
+        if let (Some((qid, _)), false) = (asked, input.starts_with('/') || input.starts_with('@')) {
             view.questions.lock().unwrap().retain(|(q, _)| *q != qid);
             kernel.send(Cmd::Answer { qid, text: input.to_string() });
             continue;
@@ -489,6 +493,25 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             continue;
         }
         let _ = rl.add_history_entry(input);
+        if let Some(rest) = input.strip_prefix('@') {
+            let (who, text) = rest.split_once(char::is_whitespace).map(|(w, t)| (w, t.trim())).unwrap_or((rest, ""));
+            let msg = match zilch_ipc::Target::parse(who) {
+                None => format!("@{who}: not a pid or group (architect, developer)"),
+                Some(_) if text.is_empty() => format!("@{who}: nothing to send"),
+                Some(target) => match kernel.tell(target, text) {
+                    Ok(how) => {
+                        println!("  {}✉ you → @{who}: {text}{}", view.c(DIM), view.c(RESET));
+                        format!("✉ {how}")
+                    }
+                    Err(e) => format!("@{who}: {e}"),
+                },
+            };
+            match &bar {
+                Some(_) => view.note(&msg),
+                None => println!("({msg})"),
+            }
+            continue;
+        }
         let (cmd, arg) = input.split_once(' ').map(|(c, a)| (c, a.trim())).unwrap_or((input, ""));
         match cmd {
             "/exit" | "/quit" => break,

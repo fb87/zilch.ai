@@ -51,6 +51,8 @@ pub enum MsgKind {
     Question,
     Answer,
     Cancel,
+    /// Extra input from the guest (`@pid …` / `@group …` at the prompt).
+    Guest,
 }
 
 /// A note passed between cooks. Large payloads live in files; messages carry text.
@@ -88,6 +90,28 @@ impl Mailbox {
     }
     pub fn is_empty(&self) -> bool {
         self.q.is_empty()
+    }
+}
+
+/// Who a guest message is for: one process, or every live process of a group in the newest order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    Pid(Pid),
+    Group(Group),
+}
+
+impl Target {
+    /// `"3"` → pid 3; `"architect"`, `"developer"`, `"reviewer"` (or plurals) → that group.
+    pub fn parse(s: &str) -> Option<Self> {
+        if let Ok(pid) = s.parse::<Pid>() {
+            return Some(Target::Pid(pid));
+        }
+        match s.to_ascii_lowercase().trim_end_matches('s') {
+            "architect" => Some(Target::Group(Group::Architecture)),
+            "developer" | "dev" => Some(Target::Group(Group::Development)),
+            "reviewer" => Some(Target::Group(Group::Review)),
+            _ => None,
+        }
     }
 }
 
@@ -262,6 +286,12 @@ pub enum KernelEvent {
         pid: Option<Pid>,
         text: String,
     },
+    /// The guest sent extra input to a process (`@pid …`); `how` says when it will be read.
+    Told {
+        pid: Pid,
+        text: String,
+        how: String,
+    },
     Signal {
         pid: Pid,
         signal: Signal,
@@ -432,5 +462,19 @@ mod tests {
         assert_eq!(text.lines().count(), 1);
         let line: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
         assert_eq!((line["seq"].as_u64(), line["tick"].as_u64(), line["type"].as_str()), (Some(2), Some(7), Some("Exited")));
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+
+    #[test]
+    fn mentions_parse_to_pids_and_groups() {
+        assert_eq!(Target::parse("3"), Some(Target::Pid(3)));
+        assert_eq!(Target::parse("architect"), Some(Target::Group(Group::Architecture)));
+        assert_eq!(Target::parse("Developers"), Some(Target::Group(Group::Development)));
+        assert_eq!(Target::parse("dev"), Some(Target::Group(Group::Development)));
+        assert_eq!(Target::parse("T2"), None);
     }
 }

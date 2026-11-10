@@ -185,3 +185,16 @@ fn a_restart_drops_the_conversation_and_starts_from_the_task_plus_summary() {
     let first = req.messages[1].text();
     assert!(first.starts_with("Write a.txt") && first.contains("you looped"), "{first}");
 }
+
+#[test]
+fn a_note_arriving_with_the_final_reply_is_read_instead_of_exiting() {
+    let mut a = LlmAgent::new(ModelBinding::default(), "s".into(), "task".into(), vec![], "x".into());
+    let view = AcbView { pid: 1, ticket: 1, group: Group::Development, steps: 0, notes: vec![] };
+    a.step(&view, vec![]);
+    let done = || SyscallResult::Completion { message: Message::assistant("All done.\nSTATUS: done"), usage: Usage::default(), cut: false };
+    let with_note = AcbView { notes: vec!["[guest] also add a test".into()], ..view.clone() };
+    let StepResult::Syscalls(calls) = a.step(&with_note, vec![done()]) else { panic!("it must not exit with an unread note") };
+    let Syscall::Complete(req) = &calls[0] else { panic!() };
+    assert_eq!(req.messages.last().unwrap().text(), "[guest] also add a test");
+    assert!(matches!(a.step(&view, vec![done()]), StepResult::Exit(_)), "without new input the final reply ends it");
+}

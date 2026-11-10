@@ -499,3 +499,56 @@ fn a_group_over_its_token_quota_is_stopped_and_stats_show_usage() {
     assert_eq!(stats.groups, vec![(Group::Development, 120, Some(100))]);
     assert_eq!((stats.busy_workers, stats.queued.iter().sum::<usize>()), (0, 0));
 }
+
+#[test]
+fn the_guest_can_send_input_to_a_process_or_a_group() {
+    use zilch_ipc::Target;
+    let drivers = Arc::new(FakeDrivers::default());
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let log = seen.clone();
+    // T1 (pid 2) works for a while and records the notes it is given; T2 (pid 3) waits for a message.
+    let dev: DevScript = Arc::new(move |t| {
+        let log = log.clone();
+        let waiter = t.id == "T2";
+        Box::new(Scripted(0, move |n, wake, view: &AcbView| {
+            log.lock().unwrap().extend(view.notes.iter().cloned());
+            match (waiter, n) {
+                (true, 1) => StepResult::Syscalls(vec![Syscall::Recv]),
+                (true, _) => StepResult::Exit(ExitStatus::ok(format!("got {}\nSTATUS: done", wake[0].text()))),
+                (false, 1..=3) => StepResult::Syscalls(vec![tool("work", json!({"n": n}))]),
+                (false, _) => StepResult::Exit(ExitStatus::ok("STATUS: done")),
+            }
+        }))
+    });
+    let mut run = Run::new(cfg(), drivers, Book { tasks: vec![task("T1", &[], &["a"]), task("T2", &[], &["b"])], dev });
+    run.k.send(Cmd::Order("x".into()));
+    run.wait(|e| matches!(e, KernelEvent::SyscallIssued { pid: 3, .. }));
+    run.wait(|e| matches!(e, KernelEvent::SyscallIssued { pid: 2, .. }));
+
+    assert!(run.k.tell(Target::Pid(2), "use thiserror").unwrap().contains("before its next model call"));
+    assert!(run.k.tell(Target::Pid(3), "here you go").unwrap().contains("delivered now"));
+    assert!(run.k.tell(Target::Pid(99), "x").unwrap_err().contains("no process 99"));
+    assert!(run.k.tell(Target::Pid(2), "   ").unwrap_err().contains("nothing to send"));
+    assert!(run.k.tell(Target::Group(Group::Review), "x").unwrap_err().contains("no live reviewer"));
+    let (_, summary) = run.served();
+    assert!(summary.contains("got [message from 0 (Guest)]\nhere you go"), "{summary}");
+    assert!(seen.lock().unwrap().iter().any(|n| n == "[guest] use thiserror"), "{:?}", seen.lock().unwrap());
+    assert!(run.seen.iter().any(|e| matches!(e, KernelEvent::Told { pid: 2, text, .. } if text == "use thiserror")), "logged for replay");
+    assert!(run.k.tell(Target::Pid(2), "late").is_err(), "a finished process cannot be told anything");
+}
+
+#[test]
+fn a_group_message_reaches_every_live_member_of_the_newest_order() {
+    use zilch_ipc::Target;
+    let drivers = Arc::new(FakeDrivers::default());
+    let dev: DevScript = Arc::new(|_| Box::new(Scripted(0, |_, _, _| StepResult::Syscalls(vec![tool("hang", json!({}))]))));
+    let mut run = Run::new(cfg(), drivers, Book { tasks: vec![task("T1", &[], &["a"]), task("T2", &[], &["b"])], dev });
+    run.k.send(Cmd::Order("x".into()));
+    run.wait(|e| matches!(e, KernelEvent::SyscallIssued { pid: 3, .. }));
+    let how = run.k.tell(Target::Group(Group::Development), "stop and report").unwrap();
+    assert!(how.contains("2:") && how.contains("3:"), "{how}");
+    let arch = run.k.tell(Target::Group(Group::Architecture), "also add docs").unwrap();
+    assert!(arch.contains("1: queued: it reads it when its tasks finish"), "{arch}");
+    run.k.send(Cmd::KillTicket(1));
+    run.served();
+}

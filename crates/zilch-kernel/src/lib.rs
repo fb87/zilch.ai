@@ -28,7 +28,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use supervisor::{nudge_message, CallRecord, Supervisor, Verdict};
 use zilch_ipc::{
-    EventBus, ExitStatus, Group, KernelEvent, Mailbox, Msg, MsgKind, Pid, PlanTask, Signal, Syscall, SyscallResult, TicketId, CLI_PID,
+    EventBus, ExitStatus, Group, KernelEvent, Mailbox, Msg, MsgKind, Pid, PlanTask, Signal, Syscall, SyscallResult, Target, TicketId,
+    CLI_PID,
 };
 
 // ───────────────────────────── contracts ─────────────────────────────
@@ -174,6 +175,12 @@ pub enum Cmd {
     },
     Kill(Pid),
     KillTicket(TicketId),
+    /// Extra input from the guest for a process or a group; the reply says how it was delivered.
+    Tell {
+        target: Target,
+        text: String,
+        reply: Sender<Result<String, String>>,
+    },
     Ps(Sender<Vec<ProcInfo>>),
     Stats(Sender<Stats>),
     Shutdown,
@@ -436,6 +443,12 @@ impl KernelHandle {
     pub fn send(&self, cmd: Cmd) {
         let _ = self.tx.send(KEvent::Cmd(cmd));
     }
+    /// Send the guest's `text` to a process or group; Ok says when it will be read.
+    pub fn tell(&self, target: Target, text: &str) -> Result<String, String> {
+        let (tx, rx) = channel();
+        self.send(Cmd::Tell { target, text: text.to_string(), reply: tx });
+        rx.recv_timeout(Duration::from_secs(2)).unwrap_or_else(|_| Err("the kernel did not answer".into()))
+    }
     pub fn stats(&self) -> Stats {
         let (tx, rx) = channel();
         self.send(Cmd::Stats(tx));
@@ -527,6 +540,9 @@ impl Kernel {
             Cmd::Order(text) => self.open_ticket(text),
             Cmd::Answer { qid, text } => self.answer(qid, &text),
             Cmd::Kill(pid) => self.kill(pid, "killed by the user"),
+            Cmd::Tell { target, text, reply } => {
+                let _ = reply.send(self.tell(target, &text));
+            }
             Cmd::KillTicket(t) => {
                 if let Some(root) = self.tickets.get(&t).map(|t| t.root) {
                     self.kill(root, "order cancelled by the user");
@@ -1148,6 +1164,66 @@ impl Kernel {
                 self.fire(ticket);
             }
         }
+    }
+
+    /// Guest input for a process (or each live process of a group in the newest open order).
+    /// A process waiting on its mailbox is woken with it; any other live process reads it in front
+    /// of its next model call (nothing in flight is cancelled).
+    fn tell(&mut self, target: Target, text: &str) -> Result<String, String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err("nothing to send".into());
+        }
+        let pids: Vec<Pid> = match target {
+            Target::Pid(pid) => match self.acbs.get(&pid) {
+                Some(a) if a.state.alive() => vec![pid],
+                Some(_) => return Err(format!("process {pid} has already finished")),
+                None => return Err(format!("no process {pid} (see /ps)")),
+            },
+            Target::Group(g) => {
+                let ticket = self.tickets.iter().filter(|(_, t)| !t.served).map(|(id, _)| *id).max();
+                let pids: Vec<Pid> =
+                    self.acbs.values().filter(|a| a.group == g && a.state.alive() && Some(a.ticket) == ticket).map(|a| a.pid).collect();
+                if pids.is_empty() {
+                    return Err(format!("no live {} in an open order", g.name()));
+                }
+                pids
+            }
+        };
+        let mut outcomes = Vec::new();
+        for pid in pids {
+            let a = self.acbs.get_mut(&pid).expect("checked");
+            let how = match a.state {
+                State::Blocked(Block::Recv) => {
+                    let slot = a.parked_slot.take();
+                    let batch = a.batch;
+                    if let Some(slot) = slot {
+                        self.fill(
+                            pid,
+                            batch,
+                            slot,
+                            SyscallResult::Message(Msg { from: CLI_PID, kind: MsgKind::Guest, body: text.to_string() }),
+                        );
+                    }
+                    "delivered now (it was waiting for a message)"
+                }
+                State::Blocked(Block::Child) => {
+                    a.notes.push(format!("[guest] {text}"));
+                    "queued: it reads it when its tasks finish"
+                }
+                State::Blocked(Block::Question) => {
+                    a.notes.push(format!("[guest] {text}"));
+                    "queued: it reads it after the plan is answered"
+                }
+                _ => {
+                    a.notes.push(format!("[guest] {text}"));
+                    "it reads it before its next model call"
+                }
+            };
+            self.bus.publish(KernelEvent::Told { pid, text: text.to_string(), how: how.into() });
+            outcomes.push(format!("{pid}: {how}"));
+        }
+        Ok(outcomes.join("; "))
     }
 
     fn kill(&mut self, pid: Pid, reason: &str) {

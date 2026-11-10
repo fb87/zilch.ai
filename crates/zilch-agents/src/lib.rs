@@ -144,8 +144,10 @@ impl Agent for LlmAgent {
                     let calls = message.tool_calls.clone();
                     let text = message.text().to_string();
                     self.messages.push(message);
-                    if calls.is_empty() {
+                    if calls.is_empty() && view.notes.is_empty() {
                         Some(StepResult::Exit(ExitStatus::ok(text)))
+                    } else if calls.is_empty() {
+                        None // new input arrived (guest note, nudge): read it and answer again
                     } else {
                         Some(self.dispatch(calls))
                     }
