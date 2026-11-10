@@ -717,3 +717,25 @@ fn a_slow_call_that_sends_heartbeats_is_not_taken_for_a_hang() {
         "no interrupt for a live call"
     );
 }
+
+#[test]
+fn a_plan_is_approved_only_by_an_explicit_yes() {
+    let drivers = Arc::new(FakeDrivers::default());
+    let mut run = Run::new(
+        KernelConfig { auto_approve: false, ..cfg() },
+        drivers.clone(),
+        Book { tasks: vec![task("T1", &[], &["a"])], dev: worker() },
+    );
+    run.k.send(Cmd::Order("x".into()));
+    let KernelEvent::Question { qid, .. } = run.wait(|e| matches!(e, KernelEvent::Question { .. })) else { unreachable!() };
+    // A stray Enter does nothing: the plan keeps waiting and nothing runs.
+    run.k.send(Cmd::Answer { qid, text: "   ".into() });
+    std::thread::sleep(Duration::from_millis(150));
+    let ps = run.k.ps();
+    assert!(ps.iter().any(|p| p.pid == 1 && p.state == "blocked(question)"), "{ps:?}");
+    assert!(drivers.spans.lock().unwrap().is_empty());
+    // "Y" (any case) approves.
+    run.k.send(Cmd::Answer { qid, text: "Y".into() });
+    let (ok, summary) = run.served();
+    assert!(ok && summary.contains("[T1] T1 — Done"), "{summary}");
+}

@@ -152,7 +152,7 @@ impl View {
         if let Some((_, ticket)) = self.question() {
             let rev = self.c("\x1b[7m");
             return (
-                format!("{note}{b}{rev}? plan #{ticket} waits for you — Enter approves · n rejects · anything else is feedback {r}"),
+                format!("{note}{b}{rev}? plan #{ticket} waits for you — y approves · n rejects · anything else is feedback {r}"),
                 false,
             );
         }
@@ -207,7 +207,7 @@ impl View {
             KernelEvent::SyscallDone { pid, summary, .. } if self.verbose => format!("    {d}{pid} ✓ {summary}{r}"),
             KernelEvent::Question { qid, ticket, text, .. } => {
                 self.questions.lock().unwrap().push_back((*qid, *ticket));
-                format!("{y}?{r} {b}plan for order #{ticket}{r}\n{text}\n{y}answer:{r} Enter = approve · n = reject · anything else = feedback to the main agent {d}(at the plan prompt; press Enter on an empty line if it is not showing){r}")
+                format!("{y}?{r} {b}plan for order #{ticket}{r}\n{text}\n{y}answer:{r} y = approve · n = reject · anything else = feedback to the main agent {d}(at the plan prompt){r}")
             }
             KernelEvent::Signal { pid, signal, reason } => format!("{y}⚠ {pid} {signal:?}{r}: {reason}"),
             KernelEvent::Exited { pid, ok, report } => {
@@ -311,7 +311,7 @@ fn ps(k: &KernelHandle) -> String {
 }
 
 const HELP: &str = "\
-Type an order to place it. While a plan waits for you: Enter approves, n rejects, anything else is feedback.
+Type an order to place it. While a plan waits for you: y approves, n rejects, anything else is feedback (an empty line does nothing).
 @<pid> text  more input for one process (read before its next model call)
 @main text   more input for the main agent (when it is idle, this is simply the next order)
 @developer text   the same for every live subagent of the newest order
@@ -408,10 +408,18 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             }
             match &env.event {
                 KernelEvent::Question { qid, .. } if !cli.yes => {
-                    eprint!("plan? › ");
-                    let mut line = String::new();
-                    stdin.lock().read_line(&mut line)?;
-                    kernel.send(Cmd::Answer { qid: *qid, text: line.trim().to_string() });
+                    // Approval must be explicit; an empty line asks again, end of input rejects.
+                    let answer = loop {
+                        eprint!("plan? [y/n/feedback] › ");
+                        let mut line = String::new();
+                        if stdin.lock().read_line(&mut line)? == 0 {
+                            break "n".to_string();
+                        }
+                        if !line.trim().is_empty() {
+                            break line.trim().to_string();
+                        }
+                    };
+                    kernel.send(Cmd::Answer { qid: *qid, text: answer });
                 }
                 KernelEvent::TicketServed { ok, .. } => {
                     kernel.shutdown();
@@ -455,7 +463,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         // With a status row the prompt is two rows; the first is filled with the status (status.rs).
         let row = if bar.is_some() { "\n" } else { "" };
         let prompt = match asked {
-            Some((_, t)) => format!("{row}plan #{t}? › "),
+            Some((_, t)) => format!("{row}plan #{t}? [y/n/feedback] › "),
             None => format!("{row}zilch-os › "),
         };
         if let Some(b) = &bar {
@@ -483,6 +491,15 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         let input = line.trim();
         // The order may have ended (cancelled, killed) after this prompt was drawn.
         let asked = asked.filter(|(_, t)| view.open.lock().unwrap().contains(t));
+        if let (Some(_), true) = (asked, input.is_empty()) {
+            // Approval must be explicit: a stray Enter does not approve the plan.
+            let msg = "the plan is still waiting: type y to approve, n to reject, or feedback";
+            match &bar {
+                Some(_) => view.note(msg),
+                None => println!("({msg})"),
+            }
+            continue;
+        }
         if let (Some((qid, _)), false) = (asked, input.starts_with('/') || input.starts_with('@')) {
             view.questions.lock().unwrap().retain(|(q, _)| *q != qid);
             kernel.send(Cmd::Answer { qid, text: input.to_string() });

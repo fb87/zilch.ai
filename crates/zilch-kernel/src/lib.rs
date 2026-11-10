@@ -171,7 +171,8 @@ impl Default for KernelConfig {
 /// Commands from the CLI.
 pub enum Cmd {
     Order(String),
-    /// Answer a `Question` (plan approval: "" / "y" approve, "n" / "r" reject, else feedback).
+    /// Answer a `Question` (plan approval: "y" approves, "n" / "r" rejects, other text is feedback;
+    /// an empty answer is ignored and the plan keeps waiting).
     Answer {
         qid: u64,
         text: String,
@@ -1192,15 +1193,19 @@ impl Kernel {
         self.questions.insert(qid, ticket);
         self.bus.publish(KernelEvent::Question { qid, ticket, pid, text });
         if self.cfg.auto_approve {
-            self.answer(qid, "");
+            self.answer(qid, "y");
         }
     }
 
     fn answer(&mut self, qid: u64, text: &str) {
+        // Approval must be explicit: an empty answer (a stray Enter) leaves the plan waiting.
+        if text.trim().is_empty() {
+            return;
+        }
         let Some(ticket) = self.questions.remove(&qid) else { return };
         let Some(root) = self.tickets.get(&ticket).map(|t| t.root) else { return };
         let reply = match text.trim().to_lowercase().as_str() {
-            "" | "a" | "y" | "yes" | "approve" => None,
+            "y" | "yes" | "approve" => None,
             "r" | "n" | "no" | "reject" => {
                 Some("The guest rejected this plan. Do not implement anything; stop and say so briefly.".to_string())
             }
