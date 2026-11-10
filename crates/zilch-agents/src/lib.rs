@@ -20,6 +20,7 @@ pub type SharedBinding = Arc<RwLock<ModelBinding>>;
 
 pub const MAIN_PROMPT: &str = include_str!("../prompts/main.md");
 pub const DEVELOPER_PROMPT: &str = include_str!("../prompts/developer.md");
+pub const SPEC_PROMPT: &str = include_str!("../prompts/spec.md");
 
 /// The Architect's extra tool: hand the plan to the kernel.
 pub fn submit_plan_spec() -> ToolSpec {
@@ -296,6 +297,11 @@ pub struct Book {
     pub main_context_tokens: usize,
     /// A saved conversation for the next main agent to continue (`-c`), used once.
     pub resume: std::sync::Mutex<Option<Vec<Message>>>,
+    /// The spec lane: its tools (empty = no spec lane), where its documents live, its saved
+    /// conversation. It follows the main agent's model.
+    pub spec_tools: Vec<ToolSpec>,
+    pub spec_dir: String,
+    pub resume_spec: std::sync::Mutex<Option<Vec<Message>>>,
     sessions: AtomicU64,
 }
 
@@ -317,8 +323,18 @@ impl Book {
             environment: environment(cwd),
             main_context_tokens: 64_000,
             resume: std::sync::Mutex::new(None),
+            spec_tools: vec![],
+            spec_dir: String::new(),
+            resume_spec: std::sync::Mutex::new(None),
             sessions: AtomicU64::new(1),
         }
+    }
+
+    /// Give this kitchen a spec lane with these tools; its documents live in `dir`.
+    pub fn with_spec(mut self, tools: Vec<ToolSpec>, dir: &Path) -> Self {
+        self.spec_tools = tools;
+        self.spec_dir = dir.display().to_string();
+        self
     }
 
     /// The model a group uses now.
@@ -337,8 +353,16 @@ impl Book {
 
     /// `/prompt`: the system prompt a group's agents get.
     pub fn system_prompt(&self, group: Group) -> String {
-        let base = if group == Group::Architecture { MAIN_PROMPT } else { DEVELOPER_PROMPT };
-        format!("{base}\n{}", self.environment)
+        match group {
+            Group::Architecture if !self.spec_dir.is_empty() => format!(
+                "{MAIN_PROMPT}\nThe spec lane keeps the agreed specification in {dir}: when {dir}/design.md and {dir}/plan.md exist, they are the design and plan to work from (read them; do not edit them).\n{}",
+                self.environment,
+                dir = self.spec_dir
+            ),
+            Group::Architecture => format!("{MAIN_PROMPT}\n{}", self.environment),
+            Group::Spec => format!("{SPEC_PROMPT}\n- Spec directory: {}\n{}", self.spec_dir, self.environment),
+            _ => format!("{DEVELOPER_PROMPT}\n{}", self.environment),
+        }
     }
 
     fn session(&self, ticket: TicketId, group: Group) -> String {
@@ -350,7 +374,7 @@ impl Book {
 
 impl Recipes for Book {
     fn architect(&self, ticket: TicketId, order: &str) -> Box<dyn Agent> {
-        let system = format!("{MAIN_PROMPT}\n{}", self.environment);
+        let system = self.system_prompt(Group::Architecture);
         Box::new(
             LlmAgent::new(
                 self.binding(Group::Architecture),
@@ -365,6 +389,25 @@ impl Recipes for Book {
             .with_budget(self.main_context_tokens)
             .with_history(self.resume.lock().unwrap().take().unwrap_or_default()),
         )
+    }
+
+    fn spec(&self, ticket: TicketId, order: &str) -> Option<Box<dyn Agent>> {
+        if self.spec_tools.is_empty() {
+            return None;
+        }
+        Some(Box::new(
+            LlmAgent::new(
+                self.binding(Group::Architecture),
+                self.system_prompt(Group::Spec),
+                order.to_string(),
+                self.spec_tools.clone(),
+                self.session(ticket, Group::Spec),
+            )
+            .with_shared_binding(self.architect.clone())
+            .resident()
+            .with_budget(self.main_context_tokens)
+            .with_history(self.resume_spec.lock().unwrap().take().unwrap_or_default()),
+        ))
     }
 
     fn developer(&self, ticket: TicketId, task: &PlanTask, context: &str) -> Box<dyn Agent> {

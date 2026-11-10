@@ -610,6 +610,11 @@ impl Recipes for MainBook {
         self.seen.lock().unwrap().push(order.to_string());
         Box::new(Main { phase: 0, seen: self.seen.clone(), tasks: self.tasks.clone() })
     }
+    fn spec(&self, _: TicketId, order: &str) -> Option<Box<dyn Agent>> {
+        self.seen.lock().unwrap().push(format!("spec: {order}"));
+        // A spec agent never plans: phase 2 answers every order directly.
+        Some(Box::new(Main { phase: 2, seen: self.seen.clone(), tasks: vec![] }))
+    }
     fn developer(&self, _: TicketId, t: &PlanTask, _: &str) -> Box<dyn Agent> {
         (self.dev)(t)
     }
@@ -759,4 +764,41 @@ fn stats_show_calls_in_flight_even_when_no_step_worker_is_busy() {
     assert_eq!(st.busy_workers, 0, "step workers are free while calls run on the driver pools");
     run.k.send(Cmd::KillTicket(1));
     run.served();
+}
+
+#[test]
+fn the_spec_lane_has_its_own_resident_agent_running_beside_the_code_lane() {
+    use zilch_ipc::Target;
+    let (mut run, seen, mains) = main_run(worker());
+    run.k.send(Cmd::OrderTo(Group::Spec, "draft a spec".into()));
+    run.k.send(Cmd::Order("plan some code".into()));
+    let (a, b) = (served_ticket(&mut run), served_ticket(&mut run));
+    let mut served = [a.0, b.0];
+    served.sort();
+    assert_eq!(served, [1, 2], "both lanes served");
+    let groups: Vec<(Pid, Group)> = run
+        .seen
+        .iter()
+        .filter_map(|e| match e {
+            KernelEvent::Spawned { pid, group, .. } if matches!(group, Group::Spec | Group::Architecture) => Some((*pid, *group)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(groups.len(), 2, "one resident per lane: {groups:?}");
+    assert_ne!(groups[0].0, groups[1].0);
+    assert!(run.seen.iter().any(|e| matches!(e, KernelEvent::TicketOpened { ticket: 1, lane: Group::Spec, .. })));
+    assert_eq!(mains.load(Ordering::SeqCst), 1, "the code lane's main agent is not the spec agent");
+    // @spec while the spec agent is idle starts the spec lane's next order.
+    let spec_pid = groups.iter().find(|(_, g)| *g == Group::Spec).unwrap().0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !run.k.ps().iter().any(|p| p.pid == spec_pid && p.state == "blocked(recv)") {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let how = run.k.tell(Target::Group(Group::Spec), "add a non-goal").unwrap();
+    assert!(how.contains("order #3"), "{how}");
+    let (t, _, s) = served_ticket(&mut run);
+    assert_eq!(t, 3);
+    assert!(s.contains("Order #3: add a non-goal"), "{s}");
+    assert!(seen.lock().unwrap().iter().any(|x| x == "spec: Order #1: draft a spec"));
 }

@@ -181,6 +181,13 @@ for the session (`default` switches back), `/models` shows both. A model with an
 least `expensive_model_price` (default 10 USD/1M) that has been in use for 30 minutes or cost $2
 pulses in the status row until `/ack` or until you switch back. Also `/about`, `/redraw`, `/prompt`.
 
+**Spec lane.** `/spec` switches to a second lane with its own resident agent, a requirements
+engineer that interviews you and maintains `spec.md`, `design.md` and `plan.md` in `spec_dir`
+(default `specs`) through `write_doc` / `edit_doc`; `release_spec` freezes immutable versions, and
+design and plan are stamped with the spec version they derive from. `/code` switches back; the
+main agent works from the spec lane's design and plan. Both lanes run in parallel and are saved
+with the session. `@spec text` reaches the spec agent; `/status` shows the documents' state.
+
 **Sessions.** After every served order the main agent's conversation is saved under
 `<data dir>/zilch/os-sessions/` (one directory per workspace, files mode 0600). `zilch-os -c`
 continues the most recent session of the current directory: the main agent remembers it and order

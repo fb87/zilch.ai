@@ -110,6 +110,7 @@ struct FileConfig {
     expensive_model_price: Option<f64>,
     expensive_model_minutes: Option<u64>,
     expensive_model_spend: Option<f64>,
+    spec_dir: Option<String>,
 }
 
 fn merge_opt<T>(dst: &mut Option<T>, src: Option<T>) {
@@ -152,6 +153,8 @@ pub struct Config {
     pub expensive_model_price: f64,
     pub expensive_model_minutes: u64,
     pub expensive_model_spend: f64,
+    /// The spec lane's document directory (`spec_dir`, default `specs`).
+    pub spec_dir: PathBuf,
     /// Price overrides from the roles: (model key, input, output) USD per 1M tokens.
     price_overrides: Vec<(String, Option<f64>, Option<f64>)>,
     env: BTreeMap<String, String>,
@@ -214,6 +217,7 @@ impl Config {
             merge_opt(&mut fc.expensive_model_price, layer.expensive_model_price);
             merge_opt(&mut fc.expensive_model_minutes, layer.expensive_model_minutes);
             merge_opt(&mut fc.expensive_model_spend, layer.expensive_model_spend);
+            merge_opt(&mut fc.spec_dir, layer.spec_dir);
             if let Some(q) = layer.quotas {
                 fc.quotas.get_or_insert_with(BTreeMap::new).extend(q);
             }
@@ -310,6 +314,7 @@ impl Config {
             expensive_model_minutes: fc.expensive_model_minutes.unwrap_or(30).max(1),
             expensive_model_spend: fc.expensive_model_spend.unwrap_or(2.0).max(0.01),
             price_overrides,
+            spec_dir: cwd.join(fc.spec_dir.clone().unwrap_or_else(|| "specs".into())),
             sources,
             providers: fc.providers,
             architect: architect_b,
@@ -408,7 +413,7 @@ mod tests {
             z.join("config.toml"),
             r#"
 max_workers = 8
-spec_dir = "specs"          # zilch-only key: ignored
+spec_dir = "specs"
 [providers.opencode]
 base_url = "https://example.test/v1"
 api_key_env = "OC_KEY"

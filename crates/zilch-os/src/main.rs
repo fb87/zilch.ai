@@ -93,6 +93,9 @@ struct View {
     last_summary: Mutex<Option<String>>,
     /// This session's orders for /recap: (number, text, answer once served).
     orders: Mutex<Vec<(TicketId, String, Option<String>)>>,
+    /// The lane typed orders go to (Architecture = code, Spec = spec), and each order's lane.
+    lane: Mutex<Group>,
+    lanes_of: Mutex<HashMap<TicketId, Group>>,
 }
 
 /// What the status row knows about one process.
@@ -125,8 +128,11 @@ impl View {
     /// Keep the status row's picture of live processes up to date.
     fn track(&self, ev: &KernelEvent) {
         if let KernelEvent::Usage { pid, model, prompt_tokens, completion_tokens } = ev {
-            let main = self.procs.lock().unwrap().get(pid).is_some_and(|(g, _)| *g == Group::Architecture);
-            let who = if main { "main" } else { "subagents" };
+            let who = match self.procs.lock().unwrap().get(pid).map(|(g, _)| *g) {
+                Some(Group::Architecture) => "main",
+                Some(Group::Spec) => "spec",
+                _ => "subagents",
+            };
             self.costs.record(who, model, zilch_ipc::Usage { prompt_tokens: *prompt_tokens, completion_tokens: *completion_tokens });
         }
         let mut live = self.live.lock().unwrap();
@@ -157,7 +163,9 @@ impl View {
                 live.remove(pid);
             }
             // The resident main agent outlives every order.
-            KernelEvent::TicketServed { ticket, .. } => live.retain(|_, l| l.ticket != *ticket || l.group == Group::Architecture),
+            KernelEvent::TicketServed { ticket, .. } => {
+                live.retain(|_, l| l.ticket != *ticket || matches!(l.group, Group::Architecture | Group::Spec))
+            }
             _ => {}
         }
     }
@@ -191,7 +199,9 @@ impl View {
         let live = self.live.lock().unwrap();
         let busy: Vec<(&Pid, &Live)> = live.iter().filter(|(_, l)| l.state == "running" || l.state == "blocked(io)").collect();
         // The main agent waiting for the next order is idle, not "waiting" on anything.
-        let waiting = live.values().filter(|l| !(l.group == Group::Architecture && l.state == "blocked(recv)")).count() - busy.len();
+        let waiting =
+            live.values().filter(|l| !(matches!(l.group, Group::Architecture | Group::Spec) && l.state == "blocked(recv)")).count()
+                - busy.len();
         if busy.is_empty() {
             let rest = if waiting > 0 { format!("{waiting} waiting") } else { "idle".into() };
             return (format!("{note}{d}{rest}{r}{spent}"), false);
@@ -202,7 +212,11 @@ impl View {
             .iter()
             .map(|(pid, l)| {
                 let (what, secs) = l.doing.as_ref().map(|(w, t)| (w.as_str(), t.elapsed().as_secs())).unwrap_or(("thinking", 0));
-                let who = if l.group == Group::Architecture { "main".to_string() } else { format!("{pid}") };
+                let who = match l.group {
+                    Group::Architecture => "main".to_string(),
+                    Group::Spec => "spec".to_string(),
+                    _ => format!("{pid}"),
+                };
                 format!("{who} {d}{what} · {secs}s{r}")
             })
             .collect();
@@ -216,15 +230,18 @@ impl View {
             s.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("STATUS:")).unwrap_or("").chars().take(n).collect::<String>()
         };
         Some(match ev {
-            KernelEvent::TicketOpened { ticket, text } => {
+            KernelEvent::TicketOpened { ticket, text, lane } => {
                 self.open.lock().unwrap().insert(*ticket);
                 self.orders.lock().unwrap().push((*ticket, text.clone(), None));
-                format!("{cy}● order #{ticket}{r} {}", first(text, 100))
+                self.lanes_of.lock().unwrap().insert(*ticket, *lane);
+                let mark = if *lane == Group::Spec { "spec " } else { "" };
+                format!("{cy}● {mark}order #{ticket}{r} {}", first(text, 100))
             }
             KernelEvent::Spawned { pid, group, title, .. } => {
                 self.procs.lock().unwrap().insert(*pid, (*group, title.clone()));
                 match group {
                     Group::Architecture => format!("  {d}+ {pid} main agent{r}"),
+                    Group::Spec => format!("  {d}+ {pid} spec agent{r}"),
                     _ => format!("  {cy}+{r} {pid} {} {b}{title}{r}", group.name()),
                 }
             }
@@ -245,7 +262,7 @@ impl View {
             KernelEvent::Signal { pid, signal, reason } => format!("{y}⚠ {pid} {signal:?}{r}: {reason}"),
             KernelEvent::Exited { pid, ok, report } => {
                 let (group, title) = self.procs.lock().unwrap().get(pid).cloned().unwrap_or((Group::Development, String::new()));
-                if group == Group::Architecture {
+                if matches!(group, Group::Architecture | Group::Spec) {
                     return None; // the served ticket shows its report
                 }
                 let mark = if *ok && zilch_kernel::report_ok(report) { format!("{g}✓{r}") } else { format!("{red}✗{r}") };
@@ -260,10 +277,11 @@ impl View {
                 self.questions.lock().unwrap().retain(|(_, t)| t != ticket);
                 let width = terminal_width().saturating_sub(2).max(20);
                 let body = markdown::Markdown::new(self.color).with_indent(2).text(summary.trim(), width);
+                let mark = if self.lanes_of.lock().unwrap().get(ticket) == Some(&Group::Spec) { "spec " } else { "" };
                 let end = if *ok {
-                    format!("{g}── order #{ticket} served ──{r}")
+                    format!("{g}── {mark}order #{ticket} served ──{r}")
                 } else {
-                    format!("{red}── order #{ticket} not served ──{r}")
+                    format!("{red}── {mark}order #{ticket} not served ──{r}")
                 };
                 format!("{body}\n{end}")
             }
@@ -358,6 +376,9 @@ Type an order to place it. While a plan waits for you: y approves, n rejects, an
 @<pid> text  more input for one process (read before its next model call)
 @main text   more input for the main agent (when it is idle, this is simply the next order)
 @developer text   the same for every live subagent of the newest order
+/spec        switch to the spec lane (requirements → spec.md, design.md, plan.md, released versions)
+/code        switch back to the code lane (the main agent and its subagents)
+/status      which lane you type into, what runs, and the spec documents' state
 /ps          the process table (pid, group, state, what it is doing)
 /kill <pid>  stop one process (its task fails; dependents are blocked)
 /cancel      cancel the newest open order
@@ -406,7 +427,9 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
     // session caps, and a client for every usable provider (so /model can switch).
     let meter = Arc::new(zilch_drivers::llm::catalog::CostMeter::new(cfg.max_session_cost));
     *meter.catalog.write().unwrap() = cfg.discover_catalog();
-    let mut drivers = DriverSet::new(&cwd, cfg.policy.clone(), cfg.backends()).with_costs(meter.clone(), cfg.max_session_tokens);
+    let mut drivers = DriverSet::new(&cwd, cfg.policy.clone(), cfg.backends())
+        .with_costs(meter.clone(), cfg.max_session_tokens)
+        .with_spec_dir(cfg.spec_dir.clone());
     let providers = drivers.providers();
     let configured = (cfg.architect.clone(), cfg.developer.clone());
     // Sessions: the main agent's conversation is saved after every served order; -c continues the
@@ -448,7 +471,8 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         drivers = drivers.with_session_file(path);
     }
     let mut book =
-        Book::new(cfg.architect.clone(), cfg.developer.clone(), drivers.specs(ARCHITECT_TOOLS), drivers.specs(DEVELOPER_TOOLS), &cwd);
+        Book::new(cfg.architect.clone(), cfg.developer.clone(), drivers.specs(ARCHITECT_TOOLS), drivers.specs(DEVELOPER_TOOLS), &cwd)
+            .with_spec(drivers.specs(zilch_drivers::SPEC_TOOLS), &cfg.spec_dir);
     if let Some(t) = cfg.main_context_tokens {
         book.main_context_tokens = t;
     }
@@ -460,6 +484,8 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         let id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         session_note = format!("↺ continuing session {id}: {} order(s), last: {last}", orders.len());
         *book.resume.lock().unwrap() = Some(msgs.clone());
+        // The spec lane's conversation too, when the session had one.
+        *book.resume_spec.lock().unwrap() = zilch_drivers::session::load_spec(path).and_then(|v| zilch_agents::snapshot_messages(&v));
     }
     let book = Arc::new(book);
     let bus = Arc::new(EventBus::new());
@@ -499,6 +525,8 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         )),
         last_summary: Mutex::default(),
         orders: Mutex::default(),
+        lane: Mutex::new(Group::Architecture),
+        lanes_of: Mutex::default(),
     });
     // A continued session's earlier orders count for /recap.
     if let Some((_, msgs)) = &resumed {
@@ -598,7 +626,15 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         let row = if bar.is_some() { "\n" } else { "" };
         let prompt = match asked {
             Some((_, t)) => format!("{row}plan #{t}? [y/n/feedback] › "),
-            None => format!("{row}zilch-os › "),
+            None => {
+                let spec = *view.lane.lock().unwrap() == Group::Spec;
+                match (bar.is_some(), spec) {
+                    (true, false) => format!("{row}⧉ › "),
+                    (true, true) => format!("{row}⌬ › "),
+                    (false, false) => "[code] › ".to_string(),
+                    (false, true) => "[spec] › ".to_string(),
+                }
+            }
         };
         if let Some(b) = &bar {
             b.reading.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -682,6 +718,19 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 Some(t) => kernel.send(Cmd::KillTicket(t)),
                 None => println!("No open order."),
             },
+            "/spec" | "/code" => {
+                let lane = if cmd == "/spec" { Group::Spec } else { Group::Architecture };
+                *view.lane.lock().unwrap() = lane;
+                let msg = match lane {
+                    Group::Spec => format!("→ spec lane: requirements engineering (spec, design, plan). {}", spec_status(&cfg.spec_dir)),
+                    _ => "→ code lane: planning and implementation (works from the spec lane's design.md and plan.md).".to_string(),
+                };
+                println!("{}{msg}{}", view.c(CYAN), view.c(RESET));
+            }
+            "/status" => {
+                let lane = if *view.lane.lock().unwrap() == Group::Spec { "spec" } else { "code" };
+                println!("typing into: {lane} lane\n{}\n{}", ps(&kernel).lines().next().unwrap_or(""), spec_status(&cfg.spec_dir));
+            }
             "/usage" => println!("{}", view.costs.report()),
             "/sessions" => match &sessions {
                 Some(dir) => println!("{}", sessions_list(dir, session_path.as_ref())),
@@ -691,8 +740,15 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             "/clear" => {
                 // A fresh session: the main agent (and any order it is on) stops; the next order
                 // starts a new one with an empty context, saved to a new session file.
-                let main = view.live.lock().unwrap().iter().find(|(_, l)| l.group == Group::Architecture).map(|(p, _)| *p);
-                if let Some(pid) = main {
+                let residents: Vec<Pid> = view
+                    .live
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, l)| matches!(l.group, Group::Architecture | Group::Spec))
+                    .map(|(p, _)| *p)
+                    .collect();
+                for pid in residents {
                     kernel.send(Cmd::Kill(pid));
                 }
                 let old = session_path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned());
@@ -702,6 +758,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 *view.last_summary.lock().unwrap() = None;
                 // A resumed conversation not yet handed to a main agent must not reach the new one.
                 *book.resume.lock().unwrap() = None;
+                *book.resume_spec.lock().unwrap() = None;
                 let resume = old.map(|id| format!(" (the previous one stays resumable: --resume {id})")).unwrap_or_default();
                 println!("Fresh session: the next order starts a new main agent with an empty context{resume}.");
             }
@@ -737,7 +794,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 }
             }
             c if c.starts_with('/') => println!("Unknown command {c}. /help lists them."),
-            _ => kernel.send(Cmd::Order(input.to_string())),
+            _ => kernel.send(Cmd::OrderTo(*view.lane.lock().unwrap(), input.to_string())),
         }
     }
     kernel.shutdown();
@@ -892,4 +949,9 @@ fn recap(view: &View, session: Option<&PathBuf>) -> String {
         s.push_str(&format!("\nLast answer:\n{}", markdown::Markdown::new(view.color).with_indent(2).text(last.trim(), width)));
     }
     s.trim_end().to_string()
+}
+
+/// The spec documents' state, one paragraph.
+fn spec_status(dir: &std::path::Path) -> String {
+    zilch_drivers::tools::spec_tools::SpecStore::new(dir.to_path_buf()).status().describe(dir)
 }

@@ -32,6 +32,8 @@ pub enum Group {
     Development,
     /// Expediter at the pass (milestone 4).
     Review,
+    /// The spec lane's requirements engineer: one per session, maintains spec/design/plan.
+    Spec,
 }
 
 impl Group {
@@ -40,6 +42,7 @@ impl Group {
             Group::Architecture => "main",
             Group::Development => "developer",
             Group::Review => "reviewer",
+            Group::Spec => "spec",
         }
     }
 }
@@ -111,6 +114,7 @@ impl Target {
             "main" | "architect" => Some(Target::Group(Group::Architecture)),
             "developer" | "dev" => Some(Target::Group(Group::Development)),
             "reviewer" => Some(Target::Group(Group::Review)),
+            "spec" => Some(Target::Group(Group::Spec)),
             _ => None,
         }
     }
@@ -162,7 +166,7 @@ impl Syscall {
         match self {
             Syscall::Complete(r) => format!("llm {}", r.binding.key()),
             Syscall::Tool { name, args, .. } => {
-                let detail = ["path", "command", "pattern"]
+                let detail = ["path", "command", "pattern", "doc"]
                     .iter()
                     .find_map(|k| args.get(*k).and_then(|v| v.as_str()))
                     .map(|s| s.lines().next().unwrap_or("").chars().take(80).collect::<String>())
@@ -244,6 +248,8 @@ pub enum KernelEvent {
     TicketOpened {
         ticket: TicketId,
         text: String,
+        /// Architecture = the code lane, Spec = the spec lane.
+        lane: Group,
     },
     Spawned {
         pid: Pid,

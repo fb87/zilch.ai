@@ -10,6 +10,7 @@ pub mod sandbox;
 #[cfg(target_os = "linux")]
 pub mod sandbox_linux;
 pub mod search;
+pub mod spec_tools;
 
 use anyhow::Result;
 use serde_json::Value;
@@ -332,6 +333,21 @@ pub(crate) fn arg_opt_u64(args: &Value, key: &str) -> Option<u64> {
 }
 pub(crate) fn arg_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// Today's date (UTC) as YYYY-MM-DD without a date crate (Howard Hinnant's civil_from_days).
+pub fn today() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}-{m:02}-{day:02}")
 }
 
 #[cfg(test)]

@@ -20,6 +20,8 @@ use zilch_kernel::{Access, DriverCtx, Drivers};
 /// Tools of each group (the kernel's capabilities restrict their writes further).
 pub const ARCHITECT_TOOLS: &[&str] = &["read_file", "write_file", "edit_file", "glob", "grep", "git"];
 pub const DEVELOPER_TOOLS: &[&str] = &["read_file", "write_file", "edit_file", "glob", "grep", "git", "bash"];
+/// The spec lane: read the code, write only the documents of the spec directory.
+pub const SPEC_TOOLS: &[&str] = &["read_file", "glob", "grep", "git", "write_doc", "edit_doc", "release_spec"];
 
 /// Per-process content hashes of files read (stale-edit detection).
 type ReadHashes = Arc<Mutex<HashMap<PathBuf, String>>>;
@@ -70,6 +72,15 @@ impl DriverSet {
         let mut v: Vec<String> = self.backends.keys().cloned().collect();
         v.sort();
         v
+    }
+
+    /// The spec lane's documents live in `dir` (write_doc / edit_doc / release_spec).
+    pub fn with_spec_dir(mut self, dir: PathBuf) -> Self {
+        let store = Arc::new(tools::spec_tools::SpecStore::new(dir));
+        self.tools.register(Arc::new(tools::spec_tools::WriteDoc(store.clone())));
+        self.tools.register(Arc::new(tools::spec_tools::EditDoc(store.clone())));
+        self.tools.register(Arc::new(tools::spec_tools::ReleaseSpec(store)));
+        self
     }
 
     /// Save the main agent's conversation to this file after every served order.
@@ -170,9 +181,10 @@ impl Drivers for DriverSet {
         self.hashes.lock().unwrap().remove(&pid);
     }
 
-    fn save_session(&self, snapshot: &Value) {
+    fn save_session(&self, lane: zilch_ipc::Group, snapshot: &Value) {
         if let Some(path) = self.session_file.lock().unwrap().clone() {
-            let _ = session::save(&path, &self.cwd, snapshot);
+            let field = if lane == zilch_ipc::Group::Spec { "spec" } else { "snapshot" };
+            let _ = session::save_field(&path, &self.cwd, field, snapshot);
         }
     }
 }

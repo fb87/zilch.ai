@@ -32,19 +32,42 @@ pub fn latest(dir: &Path) -> Option<PathBuf> {
         .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
 }
 
-/// The snapshot stored in a session file.
+/// The code lane's snapshot stored in a session file.
 pub fn load(path: &Path) -> Option<Value> {
-    let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-    v.get("snapshot").cloned()
+    load_field(path, "snapshot")
 }
 
-/// Write atomically (temp file + rename), readable only by the user.
+/// The spec lane's snapshot, if the session had one.
+pub fn load_spec(path: &Path) -> Option<Value> {
+    load_field(path, "spec")
+}
+
+fn load_field(path: &Path, field: &str) -> Option<Value> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    v.get(field).filter(|x| !x.is_null()).cloned()
+}
+
+/// Save the code lane's snapshot (see `save_field`).
 pub fn save(path: &Path, cwd: &Path, snapshot: &Value) -> std::io::Result<()> {
+    save_field(path, cwd, "snapshot", snapshot)
+}
+
+/// Update one lane's snapshot in the session file ("snapshot" = code lane, "spec" = spec lane),
+/// keeping the other; written atomically (temp file + rename), readable only by the user.
+pub fn save_field(path: &Path, cwd: &Path, field: &str, snapshot: &Value) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-    let body = json!({ "version": 1, "cwd": cwd, "updated_ms": ms, "snapshot": snapshot });
+    let mut body: Value = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    body["version"] = json!(1);
+    body["cwd"] = json!(cwd);
+    body["updated_ms"] = json!(ms);
+    body[field] = snapshot.clone();
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec(&body).unwrap_or_default())?;
     #[cfg(unix)]
@@ -110,6 +133,10 @@ mod tests {
         save(&second, Path::new("/work/a"), &json!({"messages": ["two"]})).unwrap();
         assert_eq!(latest(&a), Some(second.clone()));
         assert_eq!(load(&second).unwrap()["messages"][0], "two");
+        save_field(&second, Path::new("/work/a"), "spec", &json!({"messages": ["s"]})).unwrap();
+        assert_eq!(load(&second).unwrap()["messages"][0], "two", "the code lane is kept");
+        assert_eq!(load_spec(&second).unwrap()["messages"][0], "s");
+        assert!(load_spec(&first).is_none());
         assert!(latest(&b).is_none(), "another workspace has its own sessions");
         let listed = list(&a);
         assert_eq!(listed.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["2", "1"], "newest first");

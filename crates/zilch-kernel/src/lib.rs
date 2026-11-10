@@ -115,8 +115,8 @@ pub trait Drivers: Send + Sync + 'static {
     fn save_plan(&self, _ticket: TicketId, _tasks: &[PlanTask]) {}
     /// A process is gone: drop whatever the drivers kept for it.
     fn release(&self, _pid: Pid) {}
-    /// Persist the main agent's snapshot (called each time it serves an order).
-    fn save_session(&self, _snapshot: &Value) {}
+    /// Persist a lane agent's snapshot (called each time it serves an order).
+    fn save_session(&self, _lane: Group, _snapshot: &Value) {}
 }
 
 /// The recipe book: builds the programs the kernel runs.
@@ -124,6 +124,10 @@ pub trait Recipes: Send + Sync + 'static {
     fn architect(&self, ticket: TicketId, order: &str) -> Box<dyn Agent>;
     /// `context`: what the Developer should know about the whole plan.
     fn developer(&self, ticket: TicketId, task: &PlanTask, context: &str) -> Box<dyn Agent>;
+    /// The spec lane's resident agent (None: this kitchen has no spec lane).
+    fn spec(&self, _ticket: TicketId, _order: &str) -> Option<Box<dyn Agent>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +184,8 @@ impl Default for KernelConfig {
 /// Commands from the CLI.
 pub enum Cmd {
     Order(String),
+    /// An order for a given lane (Group::Spec for the spec lane).
+    OrderTo(Group, String),
     /// Answer a `Question` (plan approval: "y" approves, "n" / "r" rejects, other text is feedback;
     /// an empty answer is ignored and the plan keeps waiting).
     Answer {
@@ -367,6 +373,8 @@ struct PlanRun {
 
 struct Ticket {
     root: Pid,
+    /// Which lane the order belongs to (Architecture = code lane, Spec = spec lane).
+    lane: Group,
     cancel: CancelToken,
     plan: Option<PlanRun>,
     served: bool,
@@ -454,10 +462,11 @@ pub struct Kernel {
     next_pid: Pid,
     next_ticket: TicketId,
     next_qid: u64,
-    /// The session's main agent (resident; spawned with the first order).
-    main: Option<Pid>,
-    /// Orders waiting for the main agent to finish its current one: (ticket, text).
-    pending_orders: VecDeque<(TicketId, String)>,
+    /// Each lane's resident agent (code: the main agent, spec: the spec agent), spawned with
+    /// the lane's first order.
+    mains: BTreeMap<Group, Pid>,
+    /// Orders waiting for their lane's agent to finish its current one: (ticket, lane, text).
+    pending_orders: VecDeque<(TicketId, Group, String)>,
     /// Parent of the main agent's token: cancelled only on shutdown.
     session_cancel: CancelToken,
     acbs: BTreeMap<Pid, Acb>,
@@ -543,7 +552,7 @@ impl Kernel {
             next_pid: 1,
             next_ticket: first_ticket,
             next_qid: 1,
-            main: None,
+            mains: BTreeMap::new(),
             pending_orders: VecDeque::new(),
             session_cancel: CancelToken::new(),
             acbs: BTreeMap::new(),
@@ -591,6 +600,9 @@ impl Kernel {
         match c {
             Cmd::Order(text) => {
                 self.open_ticket(text);
+            }
+            Cmd::OrderTo(lane, text) => {
+                self.open_ticket_in(lane, text);
             }
             Cmd::Answer { qid, text } => self.answer(qid, &text),
             Cmd::Kill(pid) => self.kill(pid, "killed by the user"),
@@ -664,60 +676,85 @@ impl Kernel {
         }
     }
 
-    /// A new order. The session's main agent gets it: spawned with it the first time, otherwise
-    /// queued and handed over as soon as the main agent is free (one context for everything).
+    /// A new order for the code lane (see `open_ticket_in`).
     fn open_ticket(&mut self, text: String) -> TicketId {
+        self.open_ticket_in(Group::Architecture, text)
+    }
+
+    /// A new order for a lane. The lane's resident agent gets it — the main agent for the code
+    /// lane, the spec agent for the spec lane — spawned with it the first time, otherwise queued
+    /// and handed over as soon as that agent is free (one context per lane).
+    fn open_ticket_in(&mut self, lane: Group, text: String) -> TicketId {
         let ticket = self.next_ticket;
         self.next_ticket += 1;
         let cancel = CancelToken::new();
-        self.bus.publish(KernelEvent::TicketOpened { ticket, text: text.clone() });
-        match self.main.filter(|m| self.acbs.get(m).is_some_and(|a| a.state.alive())) {
+        self.bus.publish(KernelEvent::TicketOpened { ticket, text: text.clone(), lane });
+        match self.mains.get(&lane).copied().filter(|m| self.acbs.get(m).is_some_and(|a| a.state.alive())) {
             Some(main) => {
-                self.tickets.insert(ticket, Ticket { root: main, cancel, plan: None, served: false });
-                self.pending_orders.push_back((ticket, text));
-                self.feed_main();
+                self.tickets.insert(ticket, Ticket { root: main, lane, cancel, plan: None, served: false });
+                self.pending_orders.push_back((ticket, lane, text));
+                self.feed_main(lane);
             }
             None => {
-                let agent = self.recipes.architect(ticket, &order_message(ticket, &text));
-                let caps = Caps { write: vec!["docs/**".into()], write_any: false, exec: false };
+                let message = order_message(ticket, &text);
+                let (agent, caps, title) = match lane {
+                    Group::Spec => match self.recipes.spec(ticket, &message) {
+                        Some(a) => (a, Caps { write: vec![], write_any: false, exec: false }, "spec agent"),
+                        None => {
+                            self.tickets.insert(ticket, Ticket { root: 0, lane, cancel, plan: None, served: false });
+                            self.end_ticket(ticket, false, "[this kitchen has no spec lane]".into());
+                            return ticket;
+                        }
+                    },
+                    _ => (
+                        self.recipes.architect(ticket, &message),
+                        Caps { write: vec!["docs/**".into()], write_any: false, exec: false },
+                        "main agent",
+                    ),
+                };
                 let session = self.session_cancel.child();
-                let main = self.spawn(agent, None, ticket, Group::Architecture, "main agent".into(), caps, session, 0);
-                self.tickets.insert(ticket, Ticket { root: main, cancel, plan: None, served: false });
-                self.main = Some(main);
+                let main = self.spawn(agent, None, ticket, lane, title.into(), caps, session, 0);
+                self.tickets.insert(ticket, Ticket { root: main, lane, cancel, plan: None, served: false });
+                self.mains.insert(lane, main);
             }
         }
         ticket
     }
 
-    /// Hand the next queued order to the main agent if it is waiting for one.
-    fn feed_main(&mut self) {
-        let Some(main) = self.main else { return };
+    /// Is `pid` a lane's resident agent?
+    fn is_main(&self, pid: Pid) -> bool {
+        self.mains.values().any(|m| *m == pid)
+    }
+
+    /// Hand the lane's next queued order to its resident agent if it is waiting for one.
+    fn feed_main(&mut self, lane: Group) {
+        let Some(main) = self.mains.get(&lane).copied() else { return };
         let idle = self.acbs.get(&main).is_some_and(|a| a.state == State::Blocked(Block::Recv) && a.parked_slot.is_some());
         if !idle {
             return;
         }
-        let Some((ticket, text)) = self.pending_orders.pop_front() else { return };
+        let Some(i) = self.pending_orders.iter().position(|(_, l, _)| *l == lane) else { return };
+        let (ticket, _, text) = self.pending_orders.remove(i).expect("found");
         if let Some(a) = self.acbs.get_mut(&main) {
             a.ticket = ticket;
         }
         self.wake_parked(main, SyscallResult::Message(Msg { from: CLI_PID, kind: MsgKind::Guest, body: order_message(ticket, &text) }));
     }
 
-    /// The main agent is waiting for the next order (its last one is served).
-    fn main_idle(&self) -> bool {
-        self.main
-            .and_then(|m| self.acbs.get(&m))
+    /// The lane's resident agent is waiting for the next order (its last one is served).
+    fn main_idle(&self, lane: Group) -> bool {
+        self.mains
+            .get(&lane)
+            .and_then(|m| self.acbs.get(m))
             .is_some_and(|a| a.state == State::Blocked(Block::Recv) && self.tickets.get(&a.ticket).is_none_or(|t| t.served))
     }
 
-    /// The guest cancelled an order: its subagents stop, the order ends unserved, and the main
-    /// agent (which keeps its context) is told to drop it.
+    /// The guest cancelled an order: its subagents stop, the order ends unserved, and the lane's
+    /// resident agent (which keeps its context) is told to drop it.
     fn cancel_order(&mut self, ticket: TicketId) {
-        if self.tickets.get(&ticket).is_none_or(|t| t.served) {
-            return;
-        }
-        self.pending_orders.retain(|(t, _)| *t != ticket);
-        if let Some(main) = self.main {
+        let Some(lane) = self.tickets.get(&ticket).filter(|t| !t.served).map(|t| t.lane) else { return };
+        self.pending_orders.retain(|(t, _, _)| *t != ticket);
+        if let Some(main) = self.mains.get(&lane).copied() {
             let working_on_it = self.acbs.get(&main).is_some_and(|a| a.ticket == ticket && a.state.alive());
             if working_on_it {
                 if let Some(a) = self.acbs.get_mut(&main) {
@@ -733,7 +770,7 @@ impl Kernel {
     }
 
     /// Close an order: stop its remaining subagents, publish the result, forget its processes
-    /// (the resident main agent stays).
+    /// (the resident agents stay).
     fn end_ticket(&mut self, ticket: TicketId, ok: bool, summary: String) {
         let Some(t) = self.tickets.get_mut(&ticket) else { return };
         if t.served {
@@ -741,34 +778,34 @@ impl Kernel {
         }
         t.served = true;
         t.cancel.cancel();
-        let main = self.main;
+        let mains: Vec<Pid> = self.mains.values().copied().collect();
         let children: Vec<Pid> =
-            self.acbs.values().filter(|c| c.ticket == ticket && Some(c.pid) != main && c.state.alive()).map(|c| c.pid).collect();
+            self.acbs.values().filter(|c| c.ticket == ticket && !mains.contains(&c.pid) && c.state.alive()).map(|c| c.pid).collect();
         for c in children {
             self.finish(c, ExitStatus::failed("[stopped: the order ended]\nSTATUS: failed"), State::Killed);
         }
         self.questions.retain(|_, tk| *tk != ticket);
         self.bus.publish(KernelEvent::TicketServed { ticket, ok, summary });
-        self.acbs.retain(|pid, a| a.ticket != ticket || Some(*pid) == main);
+        self.acbs.retain(|pid, a| a.ticket != ticket || mains.contains(pid));
     }
 
-    /// Main agent: the current order is done. Serve it, then sleep until the next order.
+    /// A lane's resident agent: the current order is done. Serve it, then sleep until the next.
     fn serve(&mut self, pid: Pid, batch: u64, idx: usize, summary: String) {
-        if Some(pid) != self.main {
-            return self.fill(pid, batch, idx, SyscallResult::Failed("only the main agent serves orders".into()));
-        }
+        let Some(lane) = self.mains.iter().find(|(_, m)| **m == pid).map(|(l, _)| *l) else {
+            return self.fill(pid, batch, idx, SyscallResult::Failed("only a lane's main agent serves orders".into()));
+        };
         let ticket = self.acbs.get(&pid).map(|a| a.ticket).unwrap_or_default();
         self.end_ticket(ticket, true, summary);
-        // Keep the session: the main agent's conversation, written off the kernel thread.
+        // Keep the session: the resident agent's conversation, written off the kernel thread.
         if let Some(snapshot) = self.acbs.get(&pid).and_then(|a| a.agent.as_ref()).and_then(|ag| ag.snapshot()) {
             let drivers = self.drivers.clone();
-            self.io.run(Box::new(move || drivers.save_session(&snapshot)));
+            self.io.run(Box::new(move || drivers.save_session(lane, &snapshot)));
         }
         if let Some(a) = self.acbs.get_mut(&pid) {
             a.parked_slot = Some(idx);
         }
         self.set_state(pid, State::Blocked(Block::Recv));
-        self.feed_main();
+        self.feed_main(lane);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1334,16 +1371,17 @@ impl Kernel {
         self.set_state(pid, state);
         self.bus.publish(KernelEvent::Exited { pid, ok: st.ok, report: st.report.clone() });
         self.drivers.release(pid);
-        if Some(pid) == self.main {
-            // The main agent itself ended (exit, kill, budget, crash): its current order ends with
-            // its last word; queued orders cannot be served by it. The next order starts a new one.
-            self.main = None;
+        if let Some(lane) = self.mains.iter().find(|(_, m)| **m == pid).map(|(l, _)| *l) {
+            // A lane's resident agent itself ended (exit, kill, budget, crash): its current order
+            // ends with its last word; its queued orders cannot be served by it. The lane's next
+            // order starts a new one.
+            self.mains.remove(&lane);
             self.end_ticket(ticket, st.ok, st.report);
             let rest: Vec<TicketId> = self.tickets.iter().filter(|(_, t)| !t.served && t.root == pid).map(|(id, _)| *id).collect();
             for t in rest {
                 self.end_ticket(t, false, "[the main agent ended before this order started]".into());
             }
-            self.pending_orders.clear();
+            self.pending_orders.retain(|(_, l, _)| *l != lane);
             self.acbs.remove(&pid);
             return;
         }
@@ -1375,9 +1413,9 @@ impl Kernel {
                 Some(_) => return Err(format!("process {pid} has already finished")),
                 None => return Err(format!("no process {pid} (see /ps)")),
             },
-            Target::Group(Group::Architecture) => match self.main {
-                Some(m) => vec![m],
-                None => return Err("no main agent yet: type an order to start one".into()),
+            Target::Group(g @ (Group::Architecture | Group::Spec)) => match self.mains.get(&g) {
+                Some(m) => vec![*m],
+                None => return Err(format!("no {} agent yet: type an order in that lane to start one", g.name())),
             },
             Target::Group(g) => {
                 let ticket = self.tickets.iter().filter(|(_, t)| !t.served).map(|(id, _)| *id).max();
@@ -1390,8 +1428,9 @@ impl Kernel {
             }
         };
         // The main agent waiting for its next order: the note is simply the next order.
-        if pids.len() == 1 && Some(pids[0]) == self.main && self.main_idle() {
-            let ticket = self.open_ticket(text.to_string());
+        let idle_lane = self.mains.iter().find(|(l, m)| pids.len() == 1 && **m == pids[0] && self.main_idle(**l)).map(|(l, _)| *l);
+        if let Some(lane) = idle_lane {
+            let ticket = self.open_ticket_in(lane, text.to_string());
             return Ok(format!("{}: it starts on it now (order #{ticket})", pids[0]));
         }
         let mut outcomes = Vec::new();
@@ -1427,7 +1466,7 @@ impl Kernel {
             self.bus.publish(KernelEvent::Told { pid, text: text.to_string(), how: how.into() });
             outcomes.push(format!("{pid}: {how}"));
             // The main agent hears everything said to its subagents.
-            if let Some(main) = self.main.filter(|m| *m != pid) {
+            if let Some(main) = self.mains.get(&Group::Architecture).copied().filter(|m| *m != pid && !self.is_main(pid)) {
                 if let Some(m) = self.acbs.get_mut(&main) {
                     m.notes.push(format!("[guest → subagent {pid}] {text}"));
                 }
