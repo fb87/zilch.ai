@@ -1,0 +1,30 @@
+[package]
+name = "zilch-drivers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "zilch OS drivers: LLM over blocking HTTP, file/search/git tools, sandboxed commands, config."
+
+[[bin]]
+name = "zilch-sandbox"
+path = "src/bin/zilch-sandbox.rs"
+
+[dependencies]
+zilch-ipc = { path = "../zilch-ipc" }
+zilch-kernel = { path = "../zilch-kernel" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq = "2.10"
+toml = "0.8"
+dirs = "5"
+ignore = "0.4"
+globset = "0.4"
+regex = "1"
+sha2 = "0.10"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/zilch-core", "crates/zilch-cli"]
+members = ["crates/zilch-core", "crates/zilch-cli", "crates/zilch-ipc", "crates/zilch-kernel", "crates/zilch-drivers", "crates/zilch-agents"]
 
 [workspace.package]
 version = "0.1.3"

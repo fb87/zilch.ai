@@ -1,0 +1,17 @@
+[package]
+name = "zilch-agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "zilch OS agents: the LLM-driven Architect and Developer programs."
+
+[dependencies]
+zilch-ipc = { path = "../zilch-ipc" }
+zilch-kernel = { path = "../zilch-kernel" }
+serde_json.workspace = true
+
+[dev-dependencies]
+zilch-drivers = { path = "../zilch-drivers" }
+tempfile = "3"
