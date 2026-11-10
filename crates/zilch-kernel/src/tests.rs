@@ -106,6 +106,7 @@ fn task(id: &str, deps: &[&str], paths: &[&str]) -> PlanTask {
         owned_paths: paths.iter().map(|s| s.to_string()).collect(),
         acceptance: vec![],
         priority: None,
+        worker: None,
     }
 }
 

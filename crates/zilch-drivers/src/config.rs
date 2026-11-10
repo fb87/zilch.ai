@@ -62,6 +62,16 @@ pub struct RoleCfg {
     /// USD per 1M input / output tokens (overrides discovered prices).
     pub price_in: Option<f64>,
     pub price_out: Option<f64>,
+    /// Prompt override: inline, or a file (relative to the config directory it was set in);
+    /// `prompt_mode` "append" (default: after the built-in prompt) or "replace".
+    pub system_prompt: Option<String>,
+    pub system_prompt_file: Option<PathBuf>,
+    pub prompt_mode: Option<String>,
+    /// Custom subagent profiles: their tools and a one-line description for the main agent.
+    pub tools: Option<Vec<String>>,
+    pub description: Option<String>,
+    /// In `agents/*.toml`: the profile's name (default: the file name).
+    pub name: Option<String>,
 }
 
 impl RoleCfg {
@@ -77,7 +87,58 @@ impl RoleCfg {
         merge_opt(&mut self.context_tokens, o.context_tokens);
         merge_opt(&mut self.price_in, o.price_in);
         merge_opt(&mut self.price_out, o.price_out);
+        if o.system_prompt.is_some() || o.system_prompt_file.is_some() {
+            self.system_prompt = o.system_prompt;
+            self.system_prompt_file = o.system_prompt_file;
+        }
+        merge_opt(&mut self.prompt_mode, o.prompt_mode);
+        merge_opt(&mut self.tools, o.tools);
+        merge_opt(&mut self.description, o.description);
+        merge_opt(&mut self.name, o.name);
     }
+
+    /// A relative prompt file is relative to the config directory it was set in.
+    fn absolutize(&mut self, dir: &Path) {
+        if let Some(p) = self.system_prompt_file.as_ref().filter(|p| p.is_relative()) {
+            self.system_prompt_file = Some(dir.join(p));
+        }
+    }
+
+    /// The prompt override this role sets, if any.
+    fn prompt_override(&self, role: &str) -> Result<Option<PromptOverride>> {
+        let text = match (&self.system_prompt, &self.system_prompt_file) {
+            (Some(t), _) => t.clone(),
+            (None, Some(p)) => std::fs::read_to_string(p).with_context(|| format!("[roles.{role}] system_prompt_file {}", p.display()))?,
+            (None, None) => return Ok(None),
+        };
+        let replace = match self.prompt_mode.as_deref().unwrap_or("append") {
+            "append" => false,
+            "replace" => true,
+            other => bail!("[roles.{role}] prompt_mode '{other}' (append | replace)"),
+        };
+        Ok(Some(PromptOverride { text, replace }))
+    }
+}
+
+/// A role's own prompt: after the built-in one, or instead of it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromptOverride {
+    pub text: String,
+    pub replace: bool,
+}
+
+/// A custom subagent profile (`[roles.<name>]` with any other name, or `agents/<name>.toml`):
+/// the main agent can give a plan task to it with the task's `worker` field.
+#[derive(Debug, Clone)]
+pub struct Profile {
+    pub name: String,
+    pub description: String,
+    pub binding: ModelBinding,
+    pub tools: Vec<String>,
+    pub prompt: Option<PromptOverride>,
+}
+
+impl RoleCfg {
     /// Unset fields taken from `under` (a lower-precedence role).
     fn over(mut self, under: &RoleCfg) -> RoleCfg {
         let mut base = under.clone();
@@ -156,6 +217,10 @@ pub struct Config {
     pub expensive_model_spend: f64,
     /// The spec lane's document directory (`spec_dir`, default `specs`).
     pub spec_dir: PathBuf,
+    /// Prompt overrides of the main agent, the subagents and the spec agent.
+    pub prompts: BTreeMap<Group, PromptOverride>,
+    /// Custom subagent profiles (any other `[roles.<name>]`).
+    pub profiles: Vec<Profile>,
     /// `approval`: "plan" (default: approve plans; commands run in the sandbox), "ask" (commands
     /// too), "auto" (nothing asks).
     pub approval: String,
@@ -191,6 +256,20 @@ impl Config {
         let mut fc = FileConfig::default();
         let mut sources = Vec::new();
         for dir in layer_dirs {
+            // Roles may also be files of their own: <dir>/agents/<name>.toml.
+            if let Ok(rd) = std::fs::read_dir(dir.join("agents")) {
+                let mut paths: Vec<PathBuf> =
+                    rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|e| e == "toml")).collect();
+                paths.sort();
+                for p in paths {
+                    let mut rc: RoleCfg =
+                        toml::from_str(&std::fs::read_to_string(&p)?).with_context(|| format!("parsing {}", p.display()))?;
+                    rc.absolutize(dir);
+                    let name = rc.name.clone().or_else(|| p.file_stem().map(|s| s.to_string_lossy().into_owned())).unwrap_or_default();
+                    fc.roles.entry(name).or_default().merge(rc);
+                    sources.push(p);
+                }
+            }
             let file = dir.join("config.toml");
             if !file.exists() {
                 continue;
@@ -200,7 +279,8 @@ impl Config {
             for (k, v) in layer.providers {
                 fc.providers.entry(k).or_default().merge(v);
             }
-            for (k, v) in layer.roles {
+            for (k, mut v) in layer.roles {
+                v.absolutize(dir);
                 fc.roles.entry(k).or_default().merge(v);
             }
             if let Some(d) = layer.defaults {
@@ -299,6 +379,32 @@ impl Config {
             .filter(|(r, _)| r.price_in.is_some() || r.price_out.is_some())
             .map(|(r, b)| (b.key(), r.price_in, r.price_out))
             .collect();
+        // Prompt overrides of the built-in groups, then custom subagent profiles: every other role,
+        // inheriting the subagents' model unless it sets its own.
+        let mut prompts = BTreeMap::new();
+        for (names, g) in [
+            (&["architect", "master", "main"][..], Group::Architecture),
+            (&["developer", "coder"][..], Group::Development),
+            (&["spec"][..], Group::Spec),
+        ] {
+            for n in names.iter().rev() {
+                if let Some(o) = fc.roles.get(*n).map(|r| r.prompt_override(n)).transpose()?.flatten() {
+                    prompts.insert(g, o);
+                }
+            }
+        }
+        let known = ["architect", "master", "main", "developer", "coder", "spec", "explorer"];
+        let mut profiles = Vec::new();
+        for (name, rc) in fc.roles.iter().filter(|(n, _)| !known.contains(&n.as_str())) {
+            let r = rc.clone().over(&developer);
+            profiles.push(Profile {
+                name: name.clone(),
+                description: rc.description.clone().unwrap_or_else(|| "custom subagent".into()),
+                binding: binding(&r, name)?,
+                tools: rc.tools.clone().unwrap_or_else(|| crate::DEVELOPER_TOOLS.iter().map(|s| s.to_string()).collect()),
+                prompt: rc.prompt_override(name)?,
+            });
+        }
         let mut group_tokens = BTreeMap::new();
         for (name, q) in fc.quotas.clone().unwrap_or_default() {
             let g = match name.as_str() {
@@ -320,6 +426,8 @@ impl Config {
             expensive_model_spend: fc.expensive_model_spend.unwrap_or(2.0).max(0.01),
             price_overrides,
             spec_dir: cwd.join(fc.spec_dir.clone().unwrap_or_else(|| "specs".into())),
+            prompts,
+            profiles,
             approval: match fc.approval.as_deref().unwrap_or("plan") {
                 a @ ("ask" | "plan" | "auto") => a.to_string(),
                 other => bail!("invalid approval '{other}' (ask | plan | auto)"),
@@ -412,6 +520,43 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_overrides_and_custom_profiles_come_from_roles_and_agent_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let z = dir.path().join(".zilch");
+        std::fs::create_dir_all(z.join("agents")).unwrap();
+        std::fs::write(z.join("main.md"), "You are terse.").unwrap();
+        std::fs::write(
+            z.join("config.toml"),
+            r#"
+[defaults]
+model = "base"
+[roles.master]
+system_prompt_file = "main.md"
+prompt_mode = "replace"
+[roles.coder]
+system_prompt = "Prefer small diffs."
+[roles.tester]
+description = "runs and writes tests"
+tools = ["read_file", "bash"]
+model = "fast"
+"#,
+        )
+        .unwrap();
+        std::fs::write(z.join("agents").join("reviewer.toml"), "description = \"reviews diffs\"\nsystem_prompt = \"Be strict.\"\n")
+            .unwrap();
+        let env: BTreeMap<String, String> = [("OPENAI_API_KEY".to_string(), "k".to_string())].into();
+        let c = Config::load_from(dir.path(), &[z], &env, &Overrides::default()).unwrap();
+        assert_eq!(c.prompts[&Group::Architecture], PromptOverride { text: "You are terse.".into(), replace: true });
+        assert_eq!(c.prompts[&Group::Development], PromptOverride { text: "Prefer small diffs.".into(), replace: false });
+        let names: Vec<&str> = c.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["reviewer", "tester"]);
+        let tester = &c.profiles[1];
+        assert_eq!((tester.binding.model.as_str(), tester.tools.clone()), ("fast", vec!["read_file".to_string(), "bash".to_string()]));
+        assert_eq!(c.profiles[0].binding.model, "base", "a profile without a model inherits the subagents' one");
+        assert_eq!(c.profiles[0].prompt.as_ref().unwrap().text, "Be strict.");
+    }
 
     #[test]
     fn reads_zilch_config_and_maps_roles_to_groups() {

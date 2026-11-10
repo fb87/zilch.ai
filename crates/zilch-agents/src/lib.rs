@@ -36,7 +36,8 @@ pub fn submit_plan_spec() -> ToolSpec {
             "depends_on":{"type":"array","items":{"type":"string"}},
             "owned_paths":{"type":"array","items":{"type":"string"},"description":"Files/globs this task may write (disjoint from parallel tasks)"},
             "acceptance":{"type":"array","items":{"type":"string"}},
-            "priority":{"type":"integer","description":"0 most urgent … 3 background (default 1)"}
+            "priority":{"type":"integer","description":"0 most urgent … 3 background (default 1)"},
+            "worker":{"type":"string","description":"A subagent profile from the environment section (default: developer)"}
         },"required":["id","title","task","owned_paths"]}}},"required":["tasks"]}),
     )
 }
@@ -285,6 +286,26 @@ impl Agent for LlmAgent {
     }
 }
 
+/// A custom subagent (from config): its own model, tools and prompt.
+#[derive(Clone)]
+pub struct SubagentProfile {
+    pub name: String,
+    pub description: String,
+    pub binding: ModelBinding,
+    pub tools: Vec<ToolSpec>,
+    /// (text, replace) — see `Book::prompts`.
+    pub prompt: Option<(String, bool)>,
+}
+
+/// The built-in prompt with an override applied: appended, or replacing it.
+fn with_override(base: &str, o: Option<&(String, bool)>) -> String {
+    match o {
+        Some((text, true)) => text.trim().to_string(),
+        Some((text, false)) => format!("{}\n\n{}", base.trim(), text.trim()),
+        None => base.trim().to_string(),
+    }
+}
+
 /// The recipe book the kernel builds processes from.
 pub struct Book {
     pub architect: SharedBinding,
@@ -302,6 +323,10 @@ pub struct Book {
     pub spec_tools: Vec<ToolSpec>,
     pub spec_dir: String,
     pub resume_spec: std::sync::Mutex<Option<Vec<Message>>>,
+    /// Prompt overrides per group: (text, replace the built-in prompt instead of appending).
+    pub prompts: std::collections::HashMap<Group, (String, bool)>,
+    /// Custom subagent profiles a plan task can name in `worker`.
+    pub profiles: Vec<SubagentProfile>,
     sessions: AtomicU64,
 }
 
@@ -326,6 +351,8 @@ impl Book {
             spec_tools: vec![],
             spec_dir: String::new(),
             resume_spec: std::sync::Mutex::new(None),
+            prompts: Default::default(),
+            profiles: vec![],
             sessions: AtomicU64::new(1),
         }
     }
@@ -353,15 +380,22 @@ impl Book {
 
     /// `/prompt`: the system prompt a group's agents get.
     pub fn system_prompt(&self, group: Group) -> String {
+        let main = with_override(MAIN_PROMPT, self.prompts.get(&Group::Architecture));
+        let profiles = if self.profiles.is_empty() {
+            String::new()
+        } else {
+            let list: String = self.profiles.iter().map(|p| format!("\n  - {}: {}", p.name, p.description)).collect();
+            format!("\nSubagent profiles a task can name in `worker` (default: developer):{list}")
+        };
         match group {
             Group::Architecture if !self.spec_dir.is_empty() => format!(
-                "{MAIN_PROMPT}\nThe spec lane keeps the agreed specification in {dir}: when {dir}/design.md and {dir}/plan.md exist, they are the design and plan to work from (read them; do not edit them).\n{}",
+                "{main}{profiles}\nThe spec lane keeps the agreed specification in {dir}: when {dir}/design.md and {dir}/plan.md exist, they are the design and plan to work from (read them; do not edit them).\n{}",
                 self.environment,
                 dir = self.spec_dir
             ),
-            Group::Architecture => format!("{MAIN_PROMPT}\n{}", self.environment),
-            Group::Spec => format!("{SPEC_PROMPT}\n- Spec directory: {}\n{}", self.spec_dir, self.environment),
-            _ => format!("{DEVELOPER_PROMPT}\n{}", self.environment),
+            Group::Architecture => format!("{main}{profiles}\n{}", self.environment),
+            Group::Spec => format!("{}\n- Spec directory: {}\n{}", with_override(SPEC_PROMPT, self.prompts.get(&Group::Spec)), self.spec_dir, self.environment),
+            _ => format!("{}\n{}", with_override(DEVELOPER_PROMPT, self.prompts.get(&Group::Development)), self.environment),
         }
     }
 
@@ -411,7 +445,18 @@ impl Recipes for Book {
     }
 
     fn developer(&self, ticket: TicketId, task: &PlanTask, context: &str) -> Box<dyn Agent> {
-        let system = format!("{DEVELOPER_PROMPT}\n{}", self.environment);
+        // A task naming a custom profile runs on that profile's model, tools and prompt.
+        if let Some(p) = task.worker.as_deref().and_then(|w| self.profiles.iter().find(|p| p.name == w)) {
+            let system = format!("{}\n{}", with_override(DEVELOPER_PROMPT, p.prompt.as_ref()), self.environment);
+            return Box::new(LlmAgent::new(
+                p.binding.clone(),
+                system,
+                developer_brief(task, context),
+                p.tools.clone(),
+                self.session(ticket, Group::Development),
+            ));
+        }
+        let system = self.system_prompt(Group::Development);
         Box::new(
             LlmAgent::new(
                 self.binding(Group::Development),

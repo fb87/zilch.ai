@@ -1674,7 +1674,10 @@ pub fn render_plan(tasks: &[PlanTask]) -> String {
         for id in wave {
             if let Some(t) = tasks.iter().find(|t| &t.id == id) {
                 let paths = if t.owned_paths.is_empty() { "any file".into() } else { t.owned_paths.join(", ") };
-                let prio = t.priority.filter(|p| *p != 1).map(|p| format!(" · priority {p}")).unwrap_or_default();
+                let mut prio = t.priority.filter(|p| *p != 1).map(|p| format!(" · priority {p}")).unwrap_or_default();
+                if let Some(w) = &t.worker {
+                    prio.push_str(&format!(" · {w}"));
+                }
                 s.push_str(&format!("  ☐ [{}] {}  ({paths}{prio})\n", t.id, t.title));
                 for a in &t.acceptance {
                     s.push_str(&format!("      ✓ {a}\n"));

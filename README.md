@@ -198,6 +198,13 @@ the sandbox without asking. `"ask"` (or `--approval ask`): every command also wa
 `a` (allow all for the rest of the session). `"auto"` (or `--yolo`, `--yes`): nothing asks. A lone
 `y`, `n` or `a` answers a question even if it arrived while you were typing at the order prompt.
 
+**Prompts and profiles.** A role can add to its built-in prompt or replace it: `system_prompt` or
+`system_prompt_file` (relative to its config directory) with `prompt_mode = "append" | "replace"`, on
+`[roles.master]` (main agent), `[roles.coder]` (subagents) or `[roles.spec]`. Any other role, in
+`config.toml` or as `agents/<name>.toml`, is a custom subagent profile with its own `model`, `tools`,
+prompt and `description`; the main agent sees the list and can give a plan task to one with the
+task's `worker` field (e.g. a `tester` with `tools = ["read_file", "bash"]`).
+
 **Sessions.** After every served order the main agent's conversation is saved under
 `<data dir>/zilch/os-sessions/` (one directory per workspace, files mode 0600). `zilch-os -c`
 continues the most recent session of the current directory: the main agent remembers it and order

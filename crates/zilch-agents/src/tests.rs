@@ -329,3 +329,43 @@ fn a_session_is_saved_when_an_order_is_served_and_continued_by_a_new_kernel() {
     // `-c`: a new kernel, the main agent starts from the saved conversation, numbering goes on.
     assert_eq!(run(2, Some(saved), "which word?"), (2, "the word was banana".into()));
 }
+
+#[test]
+fn prompt_overrides_apply_and_a_task_can_run_on_a_custom_profile() {
+    let b = |m: &str| ModelBinding { provider: "p".into(), model: m.into(), ..Default::default() };
+    let mut book = Book::new(b("main"), b("dev"), vec![], vec![], std::path::Path::new("/tmp"));
+    book.prompts.insert(Group::Development, ("Prefer small diffs.".into(), false));
+    book.prompts.insert(Group::Architecture, ("You are terse.".into(), true));
+    book.profiles.push(SubagentProfile {
+        name: "tester".into(),
+        description: "runs tests".into(),
+        binding: b("fast"),
+        tools: vec![],
+        prompt: Some(("Only tests.".into(), false)),
+    });
+    let main = book.system_prompt(Group::Architecture);
+    assert!(main.starts_with("You are terse.") && !main.contains("MAIN agent"), "replace drops the built-in prompt");
+    assert!(main.contains("- tester: runs tests"), "the main agent learns the profiles");
+    let dev = book.system_prompt(Group::Development);
+    assert!(dev.contains("DEVELOPER") && dev.contains("Prefer small diffs."), "append keeps the built-in prompt");
+    // A task naming the profile asks its model, with its prompt.
+    let mut task = PlanTask {
+        id: "T1".into(),
+        title: "t".into(),
+        task: "test it".into(),
+        depends_on: vec![],
+        owned_paths: vec![],
+        acceptance: vec![],
+        priority: None,
+        worker: Some("tester".into()),
+    };
+    let view = AcbView { pid: 2, ticket: 1, group: Group::Development, steps: 0, notes: vec![] };
+    let StepResult::Syscalls(c) = book.developer(1, &task, "").step(&view, vec![]) else { panic!() };
+    let Syscall::Complete(req) = &c[0] else { panic!() };
+    assert_eq!(req.binding.model, "fast");
+    assert!(req.messages[0].text().contains("Only tests."));
+    task.worker = None;
+    let StepResult::Syscalls(c) = book.developer(1, &task, "").step(&view, vec![]) else { panic!() };
+    let Syscall::Complete(req) = &c[0] else { panic!() };
+    assert_eq!(req.binding.model, "dev", "no worker: the default subagent");
+}

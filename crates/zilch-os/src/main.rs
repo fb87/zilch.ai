@@ -499,6 +499,20 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
     if let Some(t) = cfg.main_context_tokens {
         book.main_context_tokens = t;
     }
+    // Prompt overrides and custom subagent profiles from the roles.
+    for (g, o) in &cfg.prompts {
+        book.prompts.insert(*g, (o.text.clone(), o.replace));
+    }
+    for p in &cfg.profiles {
+        let tools: Vec<&str> = p.tools.iter().map(String::as_str).collect();
+        book.profiles.push(zilch_agents::SubagentProfile {
+            name: p.name.clone(),
+            description: p.description.clone(),
+            binding: p.binding.clone(),
+            tools: drivers.specs(&tools),
+            prompt: p.prompt.as_ref().map(|o| (o.text.clone(), o.replace)),
+        });
+    }
     let mut first_ticket = 1;
     if let Some((path, msgs)) = &resumed {
         let orders: Vec<&str> = msgs.iter().map(|m| m.text()).filter(|t| t.starts_with("Order #")).collect();

@@ -138,6 +138,9 @@ pub struct PlanTask {
     /// Scheduling priority: 0 most urgent … 3 background (default 1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<u8>,
+    /// A custom subagent profile to run the task on (default: the developer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
 }
 
 /// What an agent asks the kernel to do. A step may issue several; they run in parallel and the
