@@ -293,7 +293,13 @@ fn ps(k: &KernelHandle) -> String {
         })
         .collect();
     let tokens = if groups.is_empty() { "0".to_string() } else { groups.join(", ") };
-    let header = format!("workers {}/{} busy · ready queues {:?} · tokens {tokens}", st.busy_workers, st.workers, st.queued);
+    // What is happening (calls in flight, busy processes) first; the kernel internals after.
+    let queued: usize = st.queued.iter().sum();
+    let ready = if queued > 0 { format!(" · ready for a step {queued} {:?}", st.queued) } else { String::new() };
+    let header = format!(
+        "in flight: {} model call(s), {} command(s), {} tool call(s) · processes {} busy, {} waiting · step workers {}/{}{ready} · tokens {tokens}",
+        st.model_calls, st.commands, st.tool_calls, st.busy, st.waiting, st.busy_workers, st.workers
+    );
     let rows = k.ps();
     if rows.is_empty() {
         return format!("{header}\nNo processes (place an order).");

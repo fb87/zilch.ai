@@ -739,3 +739,24 @@ fn a_plan_is_approved_only_by_an_explicit_yes() {
     let (ok, summary) = run.served();
     assert!(ok && summary.contains("[T1] T1 — Done"), "{summary}");
 }
+
+#[test]
+fn stats_show_calls_in_flight_even_when_no_step_worker_is_busy() {
+    let drivers = Arc::new(FakeDrivers::default());
+    let dev: DevScript = Arc::new(|_| Box::new(Scripted(0, |_, _, _| StepResult::Syscalls(vec![tool("hang", json!({}))]))));
+    let mut run = Run::new(cfg(), drivers, Book { tasks: vec![task("T1", &[], &["a"]), task("T2", &[], &["b"])], dev });
+    run.k.send(Cmd::Order("x".into()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let st = loop {
+        let st = run.k.stats();
+        if st.tool_calls == 2 || Instant::now() > deadline {
+            break st;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!((st.tool_calls, st.model_calls, st.commands), (2, 0, 0), "{st:?}");
+    assert_eq!((st.busy, st.waiting), (2, 1), "two subagents busy, the main agent waits on them: {st:?}");
+    assert_eq!(st.busy_workers, 0, "step workers are free while calls run on the driver pools");
+    run.k.send(Cmd::KillTicket(1));
+    run.served();
+}

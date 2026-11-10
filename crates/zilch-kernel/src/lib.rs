@@ -224,6 +224,14 @@ pub struct Stats {
     pub queued: Vec<usize>,
     /// Tokens used per group, with its quota if one is set.
     pub groups: Vec<(Group, u64, Option<u64>)>,
+    /// Calls in flight right now: model calls, commands (bash), other tool calls.
+    pub model_calls: usize,
+    pub commands: usize,
+    pub tool_calls: usize,
+    /// Live processes: busy (stepping or waiting on their calls) and waiting (on a message,
+    /// their subagents, the guest, or — for an idle main agent — the next order).
+    pub busy: usize,
+    pub waiting: usize,
 }
 
 // ───────────────────────────── process table ─────────────────────────────
@@ -619,7 +627,28 @@ impl Kernel {
                 }
                 groups.sort();
                 let workers = self.cfg.workers.max(1);
+                let (mut model_calls, mut commands, mut tool_calls) = (0, 0, 0);
+                for a in self.acbs.values() {
+                    for (f, done) in a.inflight.iter().zip(a.pending.iter()) {
+                        if done.is_some() {
+                            continue;
+                        }
+                        match (f.completion, f.class) {
+                            (true, _) => model_calls += 1,
+                            (false, PoolClass::Exec) => commands += 1,
+                            (false, _) if f.tool.is_some() => tool_calls += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                let live: Vec<&Acb> = self.acbs.values().filter(|a| a.state.alive()).collect();
+                let busy = live.iter().filter(|a| matches!(a.state, State::Ready | State::Running | State::Blocked(Block::Io))).count();
                 let _ = reply.send(Stats {
+                    model_calls,
+                    commands,
+                    tool_calls,
+                    busy,
+                    waiting: live.len() - busy,
                     tick: self.tick,
                     workers,
                     busy_workers: workers - self.idle_workers,

@@ -193,7 +193,7 @@ process that stops making progress is interrupted, then restarted or killed. Whe
 of an order waits for a message nobody can send, the youngest one is woken with an error.
 Tasks can carry a `priority` (0 most urgent … 3 background), and `[quotas]` caps the tokens of a
 group (`developer = 2000000`), like a cgroup. `/ps` shows the process table under a `top`-style
-header: busy workers, ready queues, tokens per group.
+header: calls in flight (model calls, commands, tool calls), busy and waiting processes, step workers, tokens per group.
 
 `zilch-os` reads the same config files as `zilch`,
 mapping `[roles.master]` (or `[roles.architect]`) to the main agent and `[roles.coder]` (or
