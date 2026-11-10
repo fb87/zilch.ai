@@ -419,6 +419,12 @@ pub struct Kernel {
     next_pid: Pid,
     next_ticket: TicketId,
     next_qid: u64,
+    /// The session's main agent (resident; spawned with the first order).
+    main: Option<Pid>,
+    /// Orders waiting for the main agent to finish its current one: (ticket, text).
+    pending_orders: VecDeque<(TicketId, String)>,
+    /// Parent of the main agent's token: cancelled only on shutdown.
+    session_cancel: CancelToken,
     acbs: BTreeMap<Pid, Acb>,
     queues: [VecDeque<Pid>; QUEUES],
     idle_workers: usize,
@@ -501,6 +507,9 @@ impl Kernel {
             next_pid: 1,
             next_ticket: 1,
             next_qid: 1,
+            main: None,
+            pending_orders: VecDeque::new(),
+            session_cancel: CancelToken::new(),
             acbs: BTreeMap::new(),
             queues: Default::default(),
             tickets: BTreeMap::new(),
@@ -528,6 +537,7 @@ impl Kernel {
             self.dispatch();
         }
         // Shutting down: stop everything in flight.
+        self.session_cancel.cancel();
         for t in self.tickets.values() {
             t.cancel.cancel();
         }
@@ -537,17 +547,15 @@ impl Kernel {
 
     fn command(&mut self, c: Cmd) {
         match c {
-            Cmd::Order(text) => self.open_ticket(text),
+            Cmd::Order(text) => {
+                self.open_ticket(text);
+            }
             Cmd::Answer { qid, text } => self.answer(qid, &text),
             Cmd::Kill(pid) => self.kill(pid, "killed by the user"),
             Cmd::Tell { target, text, reply } => {
                 let _ = reply.send(self.tell(target, &text));
             }
-            Cmd::KillTicket(t) => {
-                if let Some(root) = self.tickets.get(&t).map(|t| t.root) {
-                    self.kill(root, "order cancelled by the user");
-                }
-            }
+            Cmd::KillTicket(t) => self.cancel_order(t),
             Cmd::Ps(reply) => {
                 let rows = self
                     .acbs
@@ -593,16 +601,106 @@ impl Kernel {
         }
     }
 
-    fn open_ticket(&mut self, text: String) {
+    /// A new order. The session's main agent gets it: spawned with it the first time, otherwise
+    /// queued and handed over as soon as the main agent is free (one context for everything).
+    fn open_ticket(&mut self, text: String) -> TicketId {
         let ticket = self.next_ticket;
         self.next_ticket += 1;
         let cancel = CancelToken::new();
         self.bus.publish(KernelEvent::TicketOpened { ticket, text: text.clone() });
-        let agent = self.recipes.architect(ticket, &text);
-        let caps = Caps { write: vec!["docs/**".into()], write_any: false, exec: false };
-        let title: String = text.lines().next().unwrap_or("").chars().take(60).collect();
-        let root = self.spawn(agent, None, ticket, Group::Architecture, title, caps, cancel.child(), 0);
-        self.tickets.insert(ticket, Ticket { root, cancel, plan: None, served: false });
+        match self.main.filter(|m| self.acbs.get(m).is_some_and(|a| a.state.alive())) {
+            Some(main) => {
+                self.tickets.insert(ticket, Ticket { root: main, cancel, plan: None, served: false });
+                self.pending_orders.push_back((ticket, text));
+                self.feed_main();
+            }
+            None => {
+                let agent = self.recipes.architect(ticket, &order_message(ticket, &text));
+                let caps = Caps { write: vec!["docs/**".into()], write_any: false, exec: false };
+                let session = self.session_cancel.child();
+                let main = self.spawn(agent, None, ticket, Group::Architecture, "main agent".into(), caps, session, 0);
+                self.tickets.insert(ticket, Ticket { root: main, cancel, plan: None, served: false });
+                self.main = Some(main);
+            }
+        }
+        ticket
+    }
+
+    /// Hand the next queued order to the main agent if it is waiting for one.
+    fn feed_main(&mut self) {
+        let Some(main) = self.main else { return };
+        let idle = self.acbs.get(&main).is_some_and(|a| a.state == State::Blocked(Block::Recv) && a.parked_slot.is_some());
+        if !idle {
+            return;
+        }
+        let Some((ticket, text)) = self.pending_orders.pop_front() else { return };
+        if let Some(a) = self.acbs.get_mut(&main) {
+            a.ticket = ticket;
+        }
+        self.wake_parked(main, SyscallResult::Message(Msg { from: CLI_PID, kind: MsgKind::Guest, body: order_message(ticket, &text) }));
+    }
+
+    /// The main agent is waiting for the next order (its last one is served).
+    fn main_idle(&self) -> bool {
+        self.main
+            .and_then(|m| self.acbs.get(&m))
+            .is_some_and(|a| a.state == State::Blocked(Block::Recv) && self.tickets.get(&a.ticket).is_none_or(|t| t.served))
+    }
+
+    /// The guest cancelled an order: its subagents stop, the order ends unserved, and the main
+    /// agent (which keeps its context) is told to drop it.
+    fn cancel_order(&mut self, ticket: TicketId) {
+        if self.tickets.get(&ticket).is_none_or(|t| t.served) {
+            return;
+        }
+        self.pending_orders.retain(|(t, _)| *t != ticket);
+        if let Some(main) = self.main {
+            let working_on_it = self.acbs.get(&main).is_some_and(|a| a.ticket == ticket && a.state.alive());
+            if working_on_it {
+                if let Some(a) = self.acbs.get_mut(&main) {
+                    a.batch_cancel.cancel(); // in-flight calls come back as cancelled
+                    a.notes.push(format!("[guest] I cancelled order #{ticket}. Stop working on it and confirm in one line."));
+                }
+                if matches!(self.acbs.get(&main).map(|a| a.state), Some(State::Blocked(Block::Question | Block::Child))) {
+                    self.wake_parked(main, SyscallResult::Output("The guest cancelled this order.".into()));
+                }
+            }
+        }
+        self.end_ticket(ticket, false, format!("[order #{ticket} cancelled by the guest]"));
+    }
+
+    /// Close an order: stop its remaining subagents, publish the result, forget its processes
+    /// (the resident main agent stays).
+    fn end_ticket(&mut self, ticket: TicketId, ok: bool, summary: String) {
+        let Some(t) = self.tickets.get_mut(&ticket) else { return };
+        if t.served {
+            return;
+        }
+        t.served = true;
+        t.cancel.cancel();
+        let main = self.main;
+        let children: Vec<Pid> =
+            self.acbs.values().filter(|c| c.ticket == ticket && Some(c.pid) != main && c.state.alive()).map(|c| c.pid).collect();
+        for c in children {
+            self.finish(c, ExitStatus::failed("[stopped: the order ended]\nSTATUS: failed"), State::Killed);
+        }
+        self.questions.retain(|_, tk| *tk != ticket);
+        self.bus.publish(KernelEvent::TicketServed { ticket, ok, summary });
+        self.acbs.retain(|pid, a| a.ticket != ticket || Some(*pid) == main);
+    }
+
+    /// Main agent: the current order is done. Serve it, then sleep until the next order.
+    fn serve(&mut self, pid: Pid, batch: u64, idx: usize, summary: String) {
+        if Some(pid) != self.main {
+            return self.fill(pid, batch, idx, SyscallResult::Failed("only the main agent serves orders".into()));
+        }
+        let ticket = self.acbs.get(&pid).map(|a| a.ticket).unwrap_or_default();
+        self.end_ticket(ticket, true, summary);
+        if let Some(a) = self.acbs.get_mut(&pid) {
+            a.parked_slot = Some(idx);
+        }
+        self.set_state(pid, State::Blocked(Block::Recv));
+        self.feed_main();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -793,12 +891,17 @@ impl Kernel {
             (a.batch, a.batch_cancel.clone(), a.ticket)
         };
         self.set_state(pid, State::Blocked(Block::Io));
-        let exclusive = n > 1 && calls.iter().any(|c| matches!(c, Syscall::Recv | Syscall::SubmitPlan { .. }));
+        let exclusive = n > 1 && calls.iter().any(|c| matches!(c, Syscall::Recv | Syscall::SubmitPlan { .. } | Syscall::Serve { .. }));
         for (idx, call) in calls.into_iter().enumerate() {
             self.bus.publish(KernelEvent::SyscallIssued { pid, idx, summary: call.summary() });
             match call {
-                Syscall::Recv | Syscall::SubmitPlan { .. } if exclusive => {
-                    self.fill(pid, batch, idx, SyscallResult::Failed("recv and submit_plan must be the only call in their step".into()));
+                Syscall::Recv | Syscall::SubmitPlan { .. } | Syscall::Serve { .. } if exclusive => {
+                    self.fill(
+                        pid,
+                        batch,
+                        idx,
+                        SyscallResult::Failed("recv, submit_plan and serve must be the only call in their step".into()),
+                    );
                 }
                 Syscall::Send { to, kind, body } => {
                     let r = self.send_msg(pid, to, kind, body);
@@ -817,6 +920,7 @@ impl Kernel {
                     }
                 }
                 Syscall::SubmitPlan { tasks } => self.submit_plan(pid, batch, idx, tasks),
+                Syscall::Serve { summary } => self.serve(pid, batch, idx, summary),
                 call @ (Syscall::Complete(_) | Syscall::Tool { .. }) => {
                     if let Syscall::Tool { name, args, .. } = &call {
                         let access = self.drivers.classify(name, args);
@@ -1025,7 +1129,15 @@ impl Kernel {
             None => return,
         };
         if !is_root {
-            return self.fill(pid, batch, idx, SyscallResult::Failed("only the order's architect may submit a plan".into()));
+            return self.fill(pid, batch, idx, SyscallResult::Failed("only the main agent may submit a plan".into()));
+        }
+        if self.tickets.get(&ticket).is_none_or(|t| t.served) {
+            return self.fill(
+                pid,
+                batch,
+                idx,
+                SyscallResult::Failed("this order was cancelled or already served; there is nothing to plan for".into()),
+            );
         }
         if self.tickets.get(&ticket).and_then(|t| t.plan.as_ref()).is_some_and(|p| p.approved) {
             return self.fill(pid, batch, idx, SyscallResult::Failed("this order's plan was already approved and run".into()));
@@ -1140,20 +1252,21 @@ impl Kernel {
         self.set_state(pid, state);
         self.bus.publish(KernelEvent::Exited { pid, ok: st.ok, report: st.report.clone() });
         self.drivers.release(pid);
-        let Some(t) = self.tickets.get_mut(&ticket) else { return };
-        if t.root == pid {
-            // The order is finished (served, failed or cancelled): stop whatever still runs for it.
-            t.served = true;
-            t.cancel.cancel();
-            let children: Vec<Pid> =
-                self.acbs.values().filter(|c| c.ticket == ticket && c.pid != pid && c.state.alive()).map(|c| c.pid).collect();
-            for c in children {
-                self.finish(c, ExitStatus::failed("[stopped: the order ended]\nSTATUS: failed"), State::Killed);
+        if Some(pid) == self.main {
+            // The main agent itself ended (exit, kill, budget, crash): its current order ends with
+            // its last word; queued orders cannot be served by it. The next order starts a new one.
+            self.main = None;
+            self.end_ticket(ticket, st.ok, st.report);
+            let rest: Vec<TicketId> = self.tickets.iter().filter(|(_, t)| !t.served && t.root == pid).map(|(id, _)| *id).collect();
+            for t in rest {
+                self.end_ticket(t, false, "[the main agent ended before this order started]".into());
             }
-            self.questions.retain(|_, tk| *tk != ticket);
-            self.bus.publish(KernelEvent::TicketServed { ticket, ok: st.ok, summary: st.report });
-            self.acbs.retain(|_, a| a.ticket != ticket);
-        } else if group == Group::Development {
+            self.pending_orders.clear();
+            self.acbs.remove(&pid);
+            return;
+        }
+        let Some(t) = self.tickets.get_mut(&ticket) else { return };
+        if group == Group::Development {
             if let Some(p) = t.plan.as_mut() {
                 if let Some(run) = p.runs.iter_mut().find(|r| r.pid == Some(pid)) {
                     run.status = if st.ok && report_ok(&st.report) { TaskStatus::Done } else { TaskStatus::Failed };
@@ -1180,6 +1293,10 @@ impl Kernel {
                 Some(_) => return Err(format!("process {pid} has already finished")),
                 None => return Err(format!("no process {pid} (see /ps)")),
             },
+            Target::Group(Group::Architecture) => match self.main {
+                Some(m) => vec![m],
+                None => return Err("no main agent yet: type an order to start one".into()),
+            },
             Target::Group(g) => {
                 let ticket = self.tickets.iter().filter(|(_, t)| !t.served).map(|(id, _)| *id).max();
                 let pids: Vec<Pid> =
@@ -1190,6 +1307,11 @@ impl Kernel {
                 pids
             }
         };
+        // The main agent waiting for its next order: the note is simply the next order.
+        if pids.len() == 1 && Some(pids[0]) == self.main && self.main_idle() {
+            let ticket = self.open_ticket(text.to_string());
+            return Ok(format!("{}: it starts on it now (order #{ticket})", pids[0]));
+        }
         let mut outcomes = Vec::new();
         for pid in pids {
             let a = self.acbs.get_mut(&pid).expect("checked");
@@ -1222,6 +1344,12 @@ impl Kernel {
             };
             self.bus.publish(KernelEvent::Told { pid, text: text.to_string(), how: how.into() });
             outcomes.push(format!("{pid}: {how}"));
+            // The main agent hears everything said to its subagents.
+            if let Some(main) = self.main.filter(|m| *m != pid) {
+                if let Some(m) = self.acbs.get_mut(&main) {
+                    m.notes.push(format!("[guest → subagent {pid}] {text}"));
+                }
+            }
         }
         Ok(outcomes.join("; "))
     }
@@ -1367,3 +1495,8 @@ fn digest(p: &PlanRun) -> String {
 
 #[cfg(test)]
 mod tests;
+
+/// How an order reaches the main agent.
+pub fn order_message(ticket: TicketId, text: &str) -> String {
+    format!("Order #{ticket}: {text}")
+}

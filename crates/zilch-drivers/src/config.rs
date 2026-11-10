@@ -256,7 +256,7 @@ impl Config {
         let mut group_tokens = BTreeMap::new();
         for (name, q) in fc.quotas.clone().unwrap_or_default() {
             let g = match name.as_str() {
-                "architect" | "architecture" => Group::Architecture,
+                "main" | "architect" | "architecture" => Group::Architecture,
                 "developer" | "development" => Group::Development,
                 "reviewer" | "review" => Group::Review,
                 other => bail!("unknown group '{other}' in [quotas] (architect, developer, reviewer)"),

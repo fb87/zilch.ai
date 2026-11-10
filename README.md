@@ -155,15 +155,25 @@ crates/zilch-ipc      pids, messages, mailboxes (send never blocks), syscalls, k
 crates/zilch-kernel   process table, scheduler driven by a timer tick, syscall dispatch to driver pools,
                       capabilities, plan DAG firing, supervisor (loops, hung processes), budgets
 crates/zilch-drivers  LLM over blocking HTTP (and a scripted fake), file/search/git tools, sandboxed bash, config
-crates/zilch-agents   one LLM-driven program; the Architect and Developer are recipes (prompt + tools)
+crates/zilch-agents   one LLM-driven program; the resident main agent and the subagents are recipes (prompt + tools)
 crates/zilch-os       `zilch-os` binary: orders, plan approval, /ps, /kill, /cancel
 ```
 
-An order goes to an **Architect** process. It explores the code, writes `docs/requirements.md` and
-`docs/design.md`, and calls `submit_plan`. You approve the plan. The kernel then starts one
-**Developer** process per task, running independent tasks in parallel. Each Developer can write
-only its task's `owned_paths`; the Architect can write only `docs/`. When every task is done, the
-Architect checks the result and the order is served.
+**One main agent, many subagents.** The main agent is a single process that lives for the whole
+session. Every order goes to it, and so does every subagent report and every note you send, so it
+keeps the context: a follow-up order can refer to an earlier one. For each order it explores the
+code, updates `docs/requirements.md` and `docs/design.md`, and calls `submit_plan`. You approve
+the plan. The kernel then starts one **subagent** per task, running independent tasks in
+parallel. Each subagent starts with a fresh context holding only its brief, and can write only its
+task's `owned_paths`. The main agent can write only `docs/`. When every task is done, the main
+agent checks the result and replies; that serves the order, and it waits for the next one. Orders
+typed while it is busy are queued. Cancelling an order (Ctrl-C, `/cancel`) stops its subagents but
+keeps the main agent and its context.
+
+`@3 text` sends more input to process 3, `@developer text` to every live subagent of the newest
+order, and `@main text` to the main agent (when it is idle, that is simply the next order).
+Nothing in flight is cancelled: the note is read before the process's next model call. Notes to
+subagents are copied to the main agent.
 
 LLM calls and tool calls are both syscalls, so step workers never wait on the network. Every
 syscall result goes to the event log, which is the data a replay needs. The supervisor compares
@@ -177,7 +187,8 @@ group (`developer = 2000000`), like a cgroup. `/ps` shows the process table unde
 header: busy workers, ready queues, tokens per group.
 
 `zilch-os` reads the same config files as `zilch`,
-mapping `[roles.master]` to the Architect and `[roles.coder]` to the Developer.
+mapping `[roles.master]` (or `[roles.architect]`) to the main agent and `[roles.coder]` (or
+`[roles.developer]`) to the subagents.
 
 ```sh
 zilch-os --model beam-free              # REPL: type an order, Enter approves the plan

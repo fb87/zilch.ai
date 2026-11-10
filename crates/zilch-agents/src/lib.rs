@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use zilch_ipc::{ChatRequest, ExitStatus, Group, Message, ModelBinding, PlanTask, Syscall, SyscallResult, TicketId, ToolCall, ToolSpec};
 use zilch_kernel::{AcbView, Agent, Recipes, StepResult};
 
-pub const ARCHITECT_PROMPT: &str = include_str!("../prompts/architect.md");
+pub const MAIN_PROMPT: &str = include_str!("../prompts/main.md");
 pub const DEVELOPER_PROMPT: &str = include_str!("../prompts/developer.md");
 
 /// The Architect's extra tool: hand the plan to the kernel.
@@ -38,6 +38,8 @@ enum Phase {
     Start,
     AwaitCompletion,
     AwaitTools,
+    /// Resident only: served the last order, waiting for the next one.
+    AwaitInput,
 }
 
 /// A model-driven process.
@@ -56,6 +58,10 @@ pub struct LlmAgent {
     calls: Vec<ToolCall>,
     /// For each call: `Some(text)` if answered locally (invalid arguments), else it was issued.
     local: Vec<Option<String>>,
+    /// Resident (the main agent): a final answer serves the order and waits for the next one
+    /// instead of exiting, and a failed model call is retried once instead of ending it.
+    resident: bool,
+    failures: u32,
 }
 
 impl LlmAgent {
@@ -71,7 +77,15 @@ impl LlmAgent {
             phase: Phase::Start,
             calls: vec![],
             local: vec![],
+            resident: false,
+            failures: 0,
         }
+    }
+
+    /// Make this the resident main agent (see `resident`).
+    pub fn resident(mut self) -> Self {
+        self.resident = true;
+        self
     }
 
     fn request(&self) -> Syscall {
@@ -144,7 +158,11 @@ impl Agent for LlmAgent {
                     let calls = message.tool_calls.clone();
                     let text = message.text().to_string();
                     self.messages.push(message);
-                    if calls.is_empty() && view.notes.is_empty() {
+                    self.failures = 0;
+                    if calls.is_empty() && view.notes.is_empty() && self.resident {
+                        self.phase = Phase::AwaitInput;
+                        Some(StepResult::Syscalls(vec![Syscall::Serve { summary: text }]))
+                    } else if calls.is_empty() && view.notes.is_empty() {
                         Some(StepResult::Exit(ExitStatus::ok(text)))
                     } else if calls.is_empty() {
                         None // new input arrived (guest note, nudge): read it and answer again
@@ -152,11 +170,33 @@ impl Agent for LlmAgent {
                         Some(self.dispatch(calls))
                     }
                 }
+                Some(other) if self.resident => {
+                    // Keep the session alive: retry once, then report the failure and wait.
+                    self.failures += 1;
+                    if self.failures < 2 {
+                        None
+                    } else {
+                        self.failures = 0;
+                        self.phase = Phase::AwaitInput;
+                        Some(StepResult::Syscalls(vec![Syscall::Serve { summary: format!("[the model call failed: {}]", other.text()) }]))
+                    }
+                }
                 Some(other) => {
                     Some(StepResult::Exit(ExitStatus::failed(format!("[the model call failed: {}]\nSTATUS: failed", other.text()))))
                 }
                 None => Some(StepResult::Exit(ExitStatus::failed("[the model call returned nothing]\nSTATUS: failed"))),
             },
+            Phase::AwaitInput => {
+                // The next order (or a note) from the guest.
+                for r in wake {
+                    let text = match r {
+                        SyscallResult::Message(m) => m.body,
+                        other => other.text(),
+                    };
+                    self.messages.push(Message::user(text));
+                }
+                None
+            }
             Phase::AwaitTools => {
                 let mut issued = wake.into_iter();
                 for (call, local) in self.calls.iter().zip(std::mem::take(&mut self.local)) {
@@ -210,14 +250,17 @@ impl Book {
 
 impl Recipes for Book {
     fn architect(&self, ticket: TicketId, order: &str) -> Box<dyn Agent> {
-        let system = format!("{ARCHITECT_PROMPT}\n{}", self.environment);
-        Box::new(LlmAgent::new(
-            self.architect.clone(),
-            system,
-            order.to_string(),
-            self.architect_tools.clone(),
-            self.session(ticket, Group::Architecture),
-        ))
+        let system = format!("{MAIN_PROMPT}\n{}", self.environment);
+        Box::new(
+            LlmAgent::new(
+                self.architect.clone(),
+                system,
+                order.to_string(),
+                self.architect_tools.clone(),
+                self.session(ticket, Group::Architecture),
+            )
+            .resident(),
+        )
     }
 
     fn developer(&self, ticket: TicketId, task: &PlanTask, context: &str) -> Box<dyn Agent> {

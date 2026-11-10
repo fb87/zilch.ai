@@ -25,9 +25,10 @@ pub const CLI_PID: Pid = 0;
 /// Stations of the kitchen; each has its own default capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Group {
-    /// Head chef: requirements, design, plan. Writes docs only.
+    /// The main agent (head chef): one per session, keeps the whole conversation; analyses each
+    /// order, writes requirements/design/plan (docs only) and hands tasks to subagents.
     Architecture,
-    /// Line cooks: implement one task each, inside its owned paths.
+    /// Subagents (line cooks): one per task, fresh isolated context, write only owned paths.
     Development,
     /// Expediter at the pass (milestone 4).
     Review,
@@ -36,7 +37,7 @@ pub enum Group {
 impl Group {
     pub fn name(self) -> &'static str {
         match self {
-            Group::Architecture => "architect",
+            Group::Architecture => "main",
             Group::Development => "developer",
             Group::Review => "reviewer",
         }
@@ -107,7 +108,7 @@ impl Target {
             return Some(Target::Pid(pid));
         }
         match s.to_ascii_lowercase().trim_end_matches('s') {
-            "architect" => Some(Target::Group(Group::Architecture)),
+            "main" | "architect" => Some(Target::Group(Group::Architecture)),
             "developer" | "dev" => Some(Target::Group(Group::Development)),
             "reviewer" => Some(Target::Group(Group::Review)),
             _ => None,
@@ -150,6 +151,9 @@ pub enum Syscall {
     /// Architect only: hand the plan to the kernel. Blocks until the guest approved it and every
     /// task finished (or the guest rejected it); the result is the digest of all task reports.
     SubmitPlan { tasks: Vec<PlanTask> },
+    /// Main agent only: this order is done — give `summary` to the guest, then sleep until the
+    /// next order (the result is that order, as a message).
+    Serve { summary: String },
 }
 
 impl Syscall {
@@ -168,6 +172,7 @@ impl Syscall {
             Syscall::Send { to, kind, .. } => format!("send {kind:?} → {to}"),
             Syscall::Recv => "recv".into(),
             Syscall::SubmitPlan { tasks } => format!("submit_plan ({} tasks)", tasks.len()),
+            Syscall::Serve { .. } => "serve".into(),
         }
     }
 }

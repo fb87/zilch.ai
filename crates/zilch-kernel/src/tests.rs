@@ -552,3 +552,138 @@ fn a_group_message_reaches_every_live_member_of_the_newest_order() {
     run.k.send(Cmd::KillTicket(1));
     run.served();
 }
+
+/// A resident main agent: "plan …" orders go through submit_plan, anything else is served at
+/// once. It records every input and note it sees, in order.
+struct Main {
+    phase: u8,
+    seen: Arc<Mutex<Vec<String>>>,
+    tasks: Vec<PlanTask>,
+}
+
+impl Agent for Main {
+    fn step(&mut self, view: &AcbView, wake: Vec<SyscallResult>) -> StepResult {
+        let mut seen = self.seen.lock().unwrap();
+        seen.extend(view.notes.iter().cloned());
+        for w in &wake {
+            seen.push(w.text());
+        }
+        let last = wake.last().map(SyscallResult::text).unwrap_or_default();
+        drop(seen);
+        match self.phase {
+            // A new order (the first one comes as the program's input, later ones as messages).
+            0 | 2 if last.contains("plan") || (self.phase == 0 && wake.is_empty()) => {
+                self.phase = 1;
+                StepResult::Syscalls(vec![Syscall::SubmitPlan { tasks: self.tasks.clone() }])
+            }
+            1 => {
+                self.phase = 2;
+                StepResult::Syscalls(vec![Syscall::Serve { summary: format!("served: {}", last.lines().next().unwrap_or("")) }])
+            }
+            _ => {
+                self.phase = 2;
+                StepResult::Syscalls(vec![Syscall::Serve { summary: format!("answered: {last}") }])
+            }
+        }
+    }
+}
+
+struct MainBook {
+    seen: Arc<Mutex<Vec<String>>>,
+    tasks: Vec<PlanTask>,
+    dev: DevScript,
+    mains: Arc<AtomicUsize>,
+}
+
+impl Recipes for MainBook {
+    fn architect(&self, _: TicketId, order: &str) -> Box<dyn Agent> {
+        self.mains.fetch_add(1, Ordering::SeqCst);
+        self.seen.lock().unwrap().push(order.to_string());
+        Box::new(Main { phase: 0, seen: self.seen.clone(), tasks: self.tasks.clone() })
+    }
+    fn developer(&self, _: TicketId, t: &PlanTask, _: &str) -> Box<dyn Agent> {
+        (self.dev)(t)
+    }
+}
+
+fn main_run(dev: DevScript) -> (Run, Arc<Mutex<Vec<String>>>, Arc<AtomicUsize>) {
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let mains = Arc::new(AtomicUsize::new(0));
+    let book = MainBook { seen: seen.clone(), tasks: vec![task("T1", &[], &["a"])], dev, mains: mains.clone() };
+    let bus = Arc::new(EventBus::new());
+    let events = bus.subscribe(10_000);
+    let k = start(cfg(), Arc::new(FakeDrivers::default()), Arc::new(book), bus);
+    (Run { k, events, seen: vec![] }, seen, mains)
+}
+
+fn served_ticket(run: &mut Run) -> (TicketId, bool, String) {
+    match run.wait(|e| matches!(e, KernelEvent::TicketServed { .. })) {
+        KernelEvent::TicketServed { ticket, ok, summary } => (ticket, ok, summary),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn one_main_agent_serves_every_order_in_one_context_and_queues_new_ones() {
+    let (mut run, seen, mains) = main_run(worker());
+    run.k.send(Cmd::Order("plan the first thing".into()));
+    // A second order while the first is still running: it waits for the main agent.
+    run.k.send(Cmd::Order("what did you do?".into()));
+    let (t1, ok1, s1) = served_ticket(&mut run);
+    assert_eq!((t1, ok1), (1, true));
+    assert!(s1.starts_with("served: All tasks finished"), "{s1}");
+    let (t2, _, s2) = served_ticket(&mut run);
+    assert_eq!(t2, 2);
+    assert_eq!(s2, "answered: [message from 0 (Guest)]\nOrder #2: what did you do?");
+    assert_eq!(mains.load(Ordering::SeqCst), 1, "one main agent for the whole session");
+    let ps = run.k.ps();
+    assert!(ps.iter().any(|p| p.pid == 1 && p.state == "blocked(recv)"), "it waits for the next order: {ps:?}");
+    assert!(!ps.iter().any(|p| p.pid == 2), "finished subagents are gone");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen[0], "Order #1: plan the first thing");
+}
+
+#[test]
+fn cancelling_an_order_stops_its_subagents_but_keeps_the_main_agent() {
+    use zilch_ipc::Target;
+    let dev: DevScript = Arc::new(|_| Box::new(Scripted(0, |_, _, _| StepResult::Syscalls(vec![tool("hang", json!({}))]))));
+    let (mut run, seen, mains) = main_run(dev);
+    run.k.send(Cmd::Order("plan something long".into()));
+    run.wait(|e| matches!(e, KernelEvent::SyscallIssued { pid: 2, .. }));
+    // A note to the subagent is also heard by the main agent.
+    run.k.tell(Target::Pid(2), "hurry up").unwrap();
+    run.k.send(Cmd::KillTicket(1));
+    let (t, ok, summary) = served_ticket(&mut run);
+    assert_eq!((t, ok), (1, false));
+    assert!(summary.contains("cancelled by the guest"), "{summary}");
+    assert!(run.seen.iter().any(|e| matches!(e, KernelEvent::Exited { pid: 2, ok: false, .. })), "the subagent was stopped");
+    // The main agent is still there, and an @main note while it is idle becomes the next order.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !run.k.ps().iter().any(|p| p.pid == 1 && p.state == "blocked(recv)") {
+        assert!(Instant::now() < deadline, "main agent did not go idle");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let how = run.k.tell(Target::Group(Group::Architecture), "status?").unwrap();
+    assert!(how.contains("order #2"), "{how}");
+    let (t2, _, s2) = served_ticket(&mut run);
+    assert_eq!(t2, 2);
+    assert!(s2.contains("Order #2: status?"), "{s2}");
+    assert_eq!(mains.load(Ordering::SeqCst), 1);
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().any(|n| n == "[guest → subagent 2] hurry up"), "{seen:?}");
+    assert!(seen.iter().any(|n| n.contains("I cancelled order #1")), "{seen:?}");
+}
+
+#[test]
+fn a_killed_main_agent_is_replaced_by_a_new_one_on_the_next_order() {
+    let (mut run, _seen, mains) = main_run(worker());
+    run.k.send(Cmd::Order("hello".into()));
+    let (_, _, s) = served_ticket(&mut run);
+    assert!(s.starts_with("served:") || s.starts_with("answered:"), "{s}");
+    run.k.send(Cmd::Kill(1));
+    run.wait(|e| matches!(e, KernelEvent::Exited { pid: 1, .. }));
+    run.k.send(Cmd::Order("plan again".into()));
+    let (t, ok, _) = served_ticket(&mut run);
+    assert_eq!((t, ok), (2, true));
+    assert_eq!(mains.load(Ordering::SeqCst), 2, "a fresh main agent for the next order");
+}

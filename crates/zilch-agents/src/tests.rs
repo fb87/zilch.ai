@@ -44,7 +44,14 @@ fn an_order_is_planned_approved_cooked_in_parallel_and_served() {
         let system = req.messages[0].text().to_string();
         let first_user = req.messages.iter().find(|m| m.role == Role::User).map(|m| m.text().to_string()).unwrap_or_default();
         let usage = LlmEvent::Usage(Usage { prompt_tokens: 100, completion_tokens: 10 });
-        if system.contains("ARCHITECT") {
+        if system.contains("MAIN agent") {
+            // A follow-up order: it must still have the first order in its context.
+            let last_user = req.messages.last().filter(|m| m.role == Role::User).map(|m| m.text().to_string()).unwrap_or_default();
+            if last_user.starts_with("Order #2") {
+                let remembers = req.messages.iter().any(|m| m.text().contains("Summary: a, b and c were written."));
+                let reply = if remembers { "Earlier I had a, b and c written." } else { "I do not know." };
+                return vec![LlmEvent::TextDelta(reply.into()), usage];
+            }
             return match last_tool_result(req) {
                 None => vec![
                     call(0, "write_file", json!({"path":"docs/requirements.md","content":"- a, b and c exist\n"})),
@@ -110,6 +117,18 @@ fn an_order_is_planned_approved_cooked_in_parallel_and_served() {
         }
     };
     assert!(ok && summary.contains("Summary: a, b and c were written."), "{summary}");
+    // A follow-up order goes to the same main agent, which remembers the first one.
+    k.send(Cmd::Order("what did you do before?".into()));
+    let follow_up = loop {
+        let env = events.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("second order served");
+        if let KernelEvent::TicketServed { ticket: 2, summary, .. } = &env.event {
+            break summary.clone();
+        }
+        if let KernelEvent::Spawned { group: Group::Architecture, pid, .. } = &env.event {
+            panic!("a second main agent ({pid}) was spawned");
+        }
+    };
+    assert_eq!(follow_up, "Earlier I had a, b and c written.");
     let read = |p: &str| std::fs::read_to_string(ws.join(p)).unwrap_or_default();
     assert_eq!(
         (read("a.txt"), read("b.txt"), read("c.txt")),
@@ -128,8 +147,9 @@ fn an_order_is_planned_approved_cooked_in_parallel_and_served() {
     // The JSONL log has every syscall result (replay data) and no streamed text.
     let text = String::from_utf8(log_buf.0.lock().unwrap().clone()).unwrap();
     let lines: Vec<serde_json::Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    let done: Vec<&serde_json::Value> = lines.iter().filter(|l| l["type"] == "SyscallDone").collect();
-    let issued = lines.iter().filter(|l| l["type"] == "SyscallIssued").count();
+    let done: Vec<&serde_json::Value> = lines.iter().filter(|l| l["type"] == "SyscallDone" && l["summary"] != "serve").collect();
+    // (The main agent's last call, `serve`, stays open: it is waiting for the next order.)
+    let issued = lines.iter().filter(|l| l["type"] == "SyscallIssued" && l["summary"] != "serve").count();
     assert_eq!(done.len(), issued, "every issued syscall has its result logged");
     assert!(done.iter().any(|l| l["result"]["Completion"]["message"]["content"].as_str().is_some_and(|c| c.contains("STATUS: done"))));
     assert!(!lines.iter().any(|l| l["type"] == "TextDelta"));
@@ -197,4 +217,26 @@ fn a_note_arriving_with_the_final_reply_is_read_instead_of_exiting() {
     let Syscall::Complete(req) = &calls[0] else { panic!() };
     assert_eq!(req.messages.last().unwrap().text(), "[guest] also add a test");
     assert!(matches!(a.step(&view, vec![done()]), StepResult::Exit(_)), "without new input the final reply ends it");
+}
+
+#[test]
+fn the_resident_main_agent_serves_waits_and_survives_a_failed_call() {
+    let mut a = LlmAgent::new(ModelBinding::default(), "s".into(), "Order #1: hi".into(), vec![], "x".into()).resident();
+    let view = AcbView { pid: 1, ticket: 1, group: Group::Architecture, steps: 0, notes: vec![] };
+    a.step(&view, vec![]);
+    let reply = |t: &str| SyscallResult::Completion { message: Message::assistant(t), usage: Usage::default(), cut: false };
+    let StepResult::Syscalls(c) = a.step(&view, vec![reply("Hello!")]) else { panic!("a resident agent does not exit") };
+    assert!(matches!(&c[0], Syscall::Serve { summary } if summary == "Hello!"));
+    // The next order arrives as a message and becomes the next user turn, after the history.
+    let order = SyscallResult::Message(zilch_ipc::Msg { from: 0, kind: zilch_ipc::MsgKind::Guest, body: "Order #2: and now?".into() });
+    let StepResult::Syscalls(c) = a.step(&view, vec![order]) else { panic!() };
+    let Syscall::Complete(req) = &c[0] else { panic!() };
+    let texts: Vec<&str> = req.messages.iter().map(|m| m.text()).collect();
+    assert_eq!(texts[1..], ["Order #1: hi", "Hello!", "Order #2: and now?"]);
+    // A failed call is retried once, then reported to the guest, and the agent keeps waiting.
+    let failed = || SyscallResult::Failed("provider returned 503".into());
+    assert!(matches!(a.step(&view, vec![failed()]), StepResult::Syscalls(c) if matches!(c[0], Syscall::Complete(_))));
+    assert!(
+        matches!(a.step(&view, vec![failed()]), StepResult::Syscalls(c) if matches!(&c[0], Syscall::Serve { summary } if summary.contains("503")))
+    );
 }

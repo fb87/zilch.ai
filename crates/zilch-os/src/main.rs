@@ -132,7 +132,8 @@ impl View {
             KernelEvent::Exited { pid, .. } => {
                 live.remove(pid);
             }
-            KernelEvent::TicketServed { ticket, .. } => live.retain(|_, l| l.ticket != *ticket),
+            // The resident main agent outlives every order.
+            KernelEvent::TicketServed { ticket, .. } => live.retain(|_, l| l.ticket != *ticket || l.group == Group::Architecture),
             _ => {}
         }
     }
@@ -157,7 +158,8 @@ impl View {
         }
         let live = self.live.lock().unwrap();
         let busy: Vec<(&Pid, &Live)> = live.iter().filter(|(_, l)| l.state == "running" || l.state == "blocked(io)").collect();
-        let waiting = live.len() - busy.len();
+        // The main agent waiting for the next order is idle, not "waiting" on anything.
+        let waiting = live.values().filter(|l| !(l.group == Group::Architecture && l.state == "blocked(recv)")).count() - busy.len();
         if busy.is_empty() {
             let rest = if waiting > 0 { format!("{waiting} waiting") } else { "idle".into() };
             return (format!("{note}{d}{rest}{r}"), false);
@@ -168,7 +170,7 @@ impl View {
             .iter()
             .map(|(pid, l)| {
                 let (what, secs) = l.doing.as_ref().map(|(w, t)| (w.as_str(), t.elapsed().as_secs())).unwrap_or(("thinking", 0));
-                let who = if l.group == Group::Architecture { "architect".to_string() } else { format!("{pid}") };
+                let who = if l.group == Group::Architecture { "main".to_string() } else { format!("{pid}") };
                 format!("{who} {d}{what} · {secs}s{r}")
             })
             .collect();
@@ -189,7 +191,7 @@ impl View {
             KernelEvent::Spawned { pid, group, title, .. } => {
                 self.procs.lock().unwrap().insert(*pid, (*group, title.clone()));
                 match group {
-                    Group::Architecture => format!("  {d}+ {pid} architect{r}"),
+                    Group::Architecture => format!("  {d}+ {pid} main agent{r}"),
                     _ => format!("  {cy}+{r} {pid} {} {b}{title}{r}", group.name()),
                 }
             }
@@ -311,7 +313,8 @@ fn ps(k: &KernelHandle) -> String {
 const HELP: &str = "\
 Type an order to place it. While a plan waits for you: Enter approves, n rejects, anything else is feedback.
 @<pid> text  more input for one process (read before its next model call)
-@architect text / @developer text   the same for every live process of that group
+@main text   more input for the main agent (when it is idle, this is simply the next order)
+@developer text   the same for every live subagent of the newest order
 /ps          the process table (pid, group, state, what it is doing)
 /kill <pid>  stop one process (its task fails; dependents are blocked)
 /cancel      cancel the newest open order
@@ -380,7 +383,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
     let (d, r) = (view.c(DIM), view.c(RESET));
     let (_, sandbox) = zilch_drivers::tools::sandbox::status(cfg.policy.bash_sandbox, cfg.policy.bash.network);
     let banner = format!(
-        "{}zilch-os {}{} {d}· architect {} · developer {} · {} workers{r}\n{d}commands: {sandbox}{r}{}",
+        "{}zilch-os {}{} {d}· main {} · subagents {} · {} workers{r}\n{d}commands: {sandbox}{r}{}",
         view.c(BOLD),
         env!("CARGO_PKG_VERSION"),
         r,
