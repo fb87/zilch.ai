@@ -55,6 +55,44 @@ pub fn save(path: &Path, cwd: &Path, snapshot: &Value) -> std::io::Result<()> {
     std::fs::rename(tmp, path)
 }
 
+/// One saved session, for listings.
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub path: PathBuf,
+    pub id: String,
+    pub updated_ms: u64,
+    /// The orders of the session ("Order #N: …" texts), oldest first.
+    pub orders: Vec<String>,
+}
+
+/// Every session of a workspace, newest first.
+pub fn list(dir: &Path) -> Vec<Entry> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
+    let mut out: Vec<Entry> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter_map(|path| {
+            let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+            let orders = v["snapshot"]["messages"]
+                .as_array()
+                .map(|ms| {
+                    ms.iter()
+                        .filter(|m| m["role"] == "user")
+                        .filter_map(|m| m["content"].as_str())
+                        .filter(|t| t.starts_with("Order #"))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let id = path.file_stem()?.to_string_lossy().into_owned();
+            Some(Entry { id, updated_ms: v["updated_ms"].as_u64().unwrap_or(0), orders, path })
+        })
+        .collect();
+    out.sort_by_key(|e| std::cmp::Reverse(e.updated_ms));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +111,8 @@ mod tests {
         assert_eq!(latest(&a), Some(second.clone()));
         assert_eq!(load(&second).unwrap()["messages"][0], "two");
         assert!(latest(&b).is_none(), "another workspace has its own sessions");
+        let listed = list(&a);
+        assert_eq!(listed.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["2", "1"], "newest first");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

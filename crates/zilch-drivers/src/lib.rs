@@ -32,7 +32,7 @@ pub struct DriverSet {
     hashes: Mutex<HashMap<Pid, ReadHashes>>,
     backends: HashMap<String, Arc<dyn Backend>>,
     /// Where the main agent's conversation is saved (None = no sessions).
-    session_file: Option<PathBuf>,
+    session_file: Mutex<Option<PathBuf>>,
     /// Prices, spend and the dollar cap.
     meter: Arc<CostMeter>,
     /// Session token cap: (limit, used).
@@ -48,7 +48,7 @@ impl DriverSet {
             locks: FileLocks::default(),
             hashes: Mutex::default(),
             backends,
-            session_file: None,
+            session_file: Mutex::new(None),
             meter: Arc::new(CostMeter::new(None)),
             token_cap: None,
         }
@@ -73,9 +73,14 @@ impl DriverSet {
     }
 
     /// Save the main agent's conversation to this file after every served order.
-    pub fn with_session_file(mut self, path: PathBuf) -> Self {
-        self.session_file = Some(path);
+    pub fn with_session_file(self, path: PathBuf) -> Self {
+        *self.session_file.lock().unwrap() = Some(path);
         self
+    }
+
+    /// Save from now on to this file instead (/clear starts a new session).
+    pub fn set_session_file(&self, path: Option<PathBuf>) {
+        *self.session_file.lock().unwrap() = path;
     }
 
     pub fn specs(&self, names: &[&str]) -> Vec<ToolSpec> {
@@ -166,8 +171,8 @@ impl Drivers for DriverSet {
     }
 
     fn save_session(&self, snapshot: &Value) {
-        if let Some(path) = &self.session_file {
-            let _ = session::save(path, &self.cwd, snapshot);
+        if let Some(path) = self.session_file.lock().unwrap().clone() {
+            let _ = session::save(&path, &self.cwd, snapshot);
         }
     }
 }

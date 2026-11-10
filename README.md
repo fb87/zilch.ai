@@ -184,7 +184,9 @@ pulses in the status row until `/ack` or until you switch back. Also `/about`, `
 **Sessions.** After every served order the main agent's conversation is saved under
 `<data dir>/zilch/os-sessions/` (one directory per workspace, files mode 0600). `zilch-os -c`
 continues the most recent session of the current directory: the main agent remembers it and order
-numbers carry on. `--no-session` saves nothing. Work on an order that was not served yet is not
+numbers carry on. `--sessions` lists this directory's sessions, `--resume <id>` continues a specific
+one; in the REPL `/sessions` lists them, `/recap` shows this session's orders and last answer, and
+`/clear` starts a fresh session (the old one stays resumable). `--no-session` saves nothing. Work on an order that was not served yet is not
 saved; a continued session starts from the last served order. Plans need an explicit `y`.
 
 `@3 text` sends more input to process 3, `@developer text` to every live subagent of the newest

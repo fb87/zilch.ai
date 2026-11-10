@@ -55,6 +55,12 @@ struct Cli {
     /// Do not save this session.
     #[arg(long)]
     no_session: bool,
+    /// Continue a specific session of this directory (ids from --sessions).
+    #[arg(long, value_name = "ID")]
+    resume: Option<String>,
+    /// List the saved sessions of this directory and exit.
+    #[arg(long)]
+    sessions: bool,
     /// Show every model call and syscall result.
     #[arg(short, long)]
     verbose: bool,
@@ -85,6 +91,8 @@ struct View {
     costs: Arc<costs::Costs>,
     /// The last served answer, for /redraw.
     last_summary: Mutex<Option<String>>,
+    /// This session's orders for /recap: (number, text, answer once served).
+    orders: Mutex<Vec<(TicketId, String, Option<String>)>>,
 }
 
 /// What the status row knows about one process.
@@ -210,6 +218,7 @@ impl View {
         Some(match ev {
             KernelEvent::TicketOpened { ticket, text } => {
                 self.open.lock().unwrap().insert(*ticket);
+                self.orders.lock().unwrap().push((*ticket, text.clone(), None));
                 format!("{cy}● order #{ticket}{r} {}", first(text, 100))
             }
             KernelEvent::Spawned { pid, group, title, .. } => {
@@ -245,6 +254,9 @@ impl View {
             KernelEvent::TicketServed { ticket, ok, summary } => {
                 self.open.lock().unwrap().remove(ticket);
                 *self.last_summary.lock().unwrap() = Some(summary.clone());
+                if let Some(o) = self.orders.lock().unwrap().iter_mut().find(|o| o.0 == *ticket) {
+                    o.2 = Some(if *ok { summary.clone() } else { format!("(not served) {summary}") });
+                }
                 self.questions.lock().unwrap().retain(|(_, t)| t != ticket);
                 let width = terminal_width().saturating_sub(2).max(20);
                 let body = markdown::Markdown::new(self.color).with_indent(2).text(summary.trim(), width);
@@ -354,6 +366,9 @@ Type an order to place it. While a plan waits for you: y approves, n rejects, an
 /model <main|developer> <model> [provider]   switch for this session (`default` switches back)
 /ack         silence the high-cost model warning until its next step
 /prompt [main|developer]   the system prompt
+/sessions    this directory's saved sessions (--resume <id> continues one)
+/recap       this session's orders and the last answer
+/clear       start a fresh session (new main agent, empty context; the old one stays resumable)
 /about       version, repository, workspace, session file, config files
 /redraw      clear the screen and re-render the last answer at the current width
 /help        this help
@@ -402,7 +417,20 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
     let mut session_note = String::new();
     let mut session_path: Option<PathBuf> = None;
     if let Some(dir) = &sessions {
-        let earlier = cli.r#continue.then(|| zilch_drivers::session::latest(dir)).flatten();
+        if cli.sessions {
+            println!("{}", sessions_list(dir, None));
+            return Ok(0);
+        }
+        let earlier = match &cli.resume {
+            Some(id) => {
+                let p = dir.join(format!("{id}.json"));
+                if !p.exists() {
+                    anyhow::bail!("no session '{id}' in this directory (see zilch-os --sessions)");
+                }
+                Some(p)
+            }
+            None => cli.r#continue.then(|| zilch_drivers::session::latest(dir)).flatten(),
+        };
         let loaded = earlier.as_ref().and_then(|p| zilch_drivers::session::load(p)).and_then(|v| zilch_agents::snapshot_messages(&v));
         let path = match (earlier, loaded) {
             (Some(p), Some(msgs)) => {
@@ -410,7 +438,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 p
             }
             _ => {
-                if cli.r#continue {
+                if cli.r#continue || cli.resume.is_some() {
                     session_note = "no earlier session in this directory; starting a new one".into();
                 }
                 zilch_drivers::session::new_path(dir)
@@ -470,7 +498,16 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             cfg.expensive_model_spend,
         )),
         last_summary: Mutex::default(),
+        orders: Mutex::default(),
     });
+    // A continued session's earlier orders count for /recap.
+    if let Some((_, msgs)) = &resumed {
+        let mut orders = view.orders.lock().unwrap();
+        for t in msgs.iter().map(|m| m.text()).filter(|t| t.starts_with("Order #")) {
+            let (num, text) = t[7..].split_once(": ").unwrap_or(("0", t));
+            orders.push((num.parse().unwrap_or(0), text.to_string(), Some("(earlier session)".into())));
+        }
+    }
     let (d, r) = (view.c(DIM), view.c(RESET));
     let (_, sandbox) = zilch_drivers::tools::sandbox::status(cfg.policy.bash_sandbox, cfg.policy.bash.network);
     let banner = format!(
@@ -484,7 +521,8 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         log.as_ref().map(|(p, _)| format!("\n{d}event log: {}{r}", p.display())).unwrap_or_default()
     );
     let banner = if session_note.is_empty() { banner } else { format!("{banner}\n{}{session_note}{r}", view.c(CYAN)) };
-    let kernel = zilch_kernel::start(kcfg, Arc::new(drivers), book.clone(), bus);
+    let drivers = Arc::new(drivers);
+    let kernel = zilch_kernel::start(kcfg, drivers.clone(), book.clone(), bus);
 
     if let Some(order) = &cli.prompt {
         eprintln!("{banner}");
@@ -645,6 +683,28 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 None => println!("No open order."),
             },
             "/usage" => println!("{}", view.costs.report()),
+            "/sessions" => match &sessions {
+                Some(dir) => println!("{}", sessions_list(dir, session_path.as_ref())),
+                None => println!("Sessions are off (--no-session)."),
+            },
+            "/recap" => println!("{}", recap(&view, session_path.as_ref())),
+            "/clear" => {
+                // A fresh session: the main agent (and any order it is on) stops; the next order
+                // starts a new one with an empty context, saved to a new session file.
+                let main = view.live.lock().unwrap().iter().find(|(_, l)| l.group == Group::Architecture).map(|(p, _)| *p);
+                if let Some(pid) = main {
+                    kernel.send(Cmd::Kill(pid));
+                }
+                let old = session_path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned());
+                session_path = sessions.as_ref().map(|d| zilch_drivers::session::new_path(d));
+                drivers.set_session_file(session_path.clone());
+                view.orders.lock().unwrap().clear();
+                *view.last_summary.lock().unwrap() = None;
+                // A resumed conversation not yet handed to a main agent must not reach the new one.
+                *book.resume.lock().unwrap() = None;
+                let resume = old.map(|id| format!(" (the previous one stays resumable: --resume {id})")).unwrap_or_default();
+                println!("Fresh session: the next order starts a new main agent with an empty context{resume}.");
+            }
             "/models" => println!("{}", models_list(&book, &meter, &configured)),
             "/model" => println!("{}", model_cmd(arg, &book, &meter, &providers, &configured)),
             "/ack" => {
@@ -780,4 +840,56 @@ fn about(cwd: &std::path::Path, sources: &[PathBuf], session: Option<&PathBuf>) 
         lines.push(format!("{}{}", if i == 0 { "  config      " } else { "              " }, s.display()));
     }
     lines.join("\n")
+}
+
+/// How long ago a millisecond timestamp was, roughly.
+fn ago(ms: u64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let mins = now.saturating_sub(ms) / 60_000;
+    match mins {
+        0 => "just now".into(),
+        m if m < 60 => format!("{m} min ago"),
+        m if m < 48 * 60 => format!("{} h ago", m / 60),
+        m => format!("{} days ago", m / (24 * 60)),
+    }
+}
+
+/// --sessions and /sessions: this directory's saved sessions, newest first.
+fn sessions_list(dir: &std::path::Path, current: Option<&PathBuf>) -> String {
+    let list = zilch_drivers::session::list(dir);
+    if list.is_empty() {
+        return "No saved sessions in this directory.".into();
+    }
+    let mut s = String::new();
+    for e in list {
+        let mark = if Some(&e.path) == current { "▸" } else { " " };
+        let last: String = e.orders.last().map(|t| t.split_once(": ").map(|x| x.1).unwrap_or(t)).unwrap_or("").chars().take(60).collect();
+        s.push_str(&format!("{mark} {}  {:<12} {:>3} order(s)  {last}\n", e.id, ago(e.updated_ms), e.orders.len()));
+    }
+    s.push_str("continue one with: zilch-os --resume <id>   (or -c for the newest)");
+    s
+}
+
+/// /recap: this session's orders and the last answer.
+fn recap(view: &View, session: Option<&PathBuf>) -> String {
+    let orders = view.orders.lock().unwrap();
+    let id = session.and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "(not saved)".into());
+    if orders.is_empty() {
+        return format!("Session {id}: no orders yet.");
+    }
+    let mut s = format!("Session {id}: {} order(s)\n", orders.len());
+    for (n, text, answer) in orders.iter() {
+        let status = match answer {
+            None => "open".to_string(),
+            Some(a) if a.starts_with("(earlier session)") => "earlier session".to_string(),
+            Some(a) => a.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").chars().take(70).collect(),
+        };
+        let text: String = text.chars().take(60).collect();
+        s.push_str(&format!("  #{n} {text}  → {status}\n"));
+    }
+    if let Some(last) = view.last_summary.lock().unwrap().as_ref() {
+        let width = terminal_width().saturating_sub(2).max(20);
+        s.push_str(&format!("\nLast answer:\n{}", markdown::Markdown::new(view.color).with_indent(2).text(last.trim(), width)));
+    }
+    s.trim_end().to_string()
 }
