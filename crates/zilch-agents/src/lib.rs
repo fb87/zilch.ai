@@ -13,6 +13,11 @@ use zilch_kernel::{AcbView, Agent, Recipes, StepResult};
 
 pub mod compact;
 
+use std::sync::{Arc, RwLock};
+
+/// A model binding several agents follow (one per group); `/model` changes it.
+pub type SharedBinding = Arc<RwLock<ModelBinding>>;
+
 pub const MAIN_PROMPT: &str = include_str!("../prompts/main.md");
 pub const DEVELOPER_PROMPT: &str = include_str!("../prompts/developer.md");
 
@@ -48,7 +53,8 @@ enum Phase {
 
 /// A model-driven process.
 pub struct LlmAgent {
-    binding: ModelBinding,
+    /// Shared with the recipe book, so `/model` applies from the next call.
+    binding: SharedBinding,
     system: String,
     /// The task as first given (a restart starts from it again).
     task: String,
@@ -75,7 +81,7 @@ pub struct LlmAgent {
 impl LlmAgent {
     pub fn new(binding: ModelBinding, system: String, input: String, tools: Vec<ToolSpec>, session: String) -> Self {
         Self {
-            binding,
+            binding: Arc::new(RwLock::new(binding)),
             system,
             task: input.clone(),
             input,
@@ -92,6 +98,12 @@ impl LlmAgent {
         }
     }
 
+    /// Use (and follow) a binding shared with the recipe book.
+    pub fn with_shared_binding(mut self, b: SharedBinding) -> Self {
+        self.binding = b;
+        self
+    }
+
     /// Make this the resident main agent (see `resident`).
     pub fn resident(mut self) -> Self {
         self.resident = true;
@@ -103,7 +115,7 @@ impl LlmAgent {
         messages.push(Message::system(&self.system));
         messages.extend(self.messages.iter().cloned());
         Syscall::Complete(ChatRequest {
-            binding: self.binding.clone(),
+            binding: self.binding.read().unwrap().clone(),
             messages,
             tools: self.tools.clone(),
             session: Some(self.session.clone()),
@@ -113,8 +125,14 @@ impl LlmAgent {
     /// Ask the model, compacting the history first if it outgrew the budget.
     fn ask(&mut self) -> StepResult {
         if !std::mem::take(&mut self.just_compacted) {
-            let plan =
-                compact::prepare(&self.binding, Some(self.session.clone()), &self.system, &self.tools, &mut self.messages, self.budget);
+            let plan = compact::prepare(
+                &self.binding.read().unwrap().clone(),
+                Some(self.session.clone()),
+                &self.system,
+                &self.tools,
+                &mut self.messages,
+                self.budget,
+            );
             if let compact::Plan::Summarize { cut, request } = plan {
                 self.phase = Phase::Compacting(cut);
                 return StepResult::Syscalls(vec![Syscall::Complete(*request)]);
@@ -268,8 +286,8 @@ impl Agent for LlmAgent {
 
 /// The recipe book the kernel builds processes from.
 pub struct Book {
-    pub architect: ModelBinding,
-    pub developer: ModelBinding,
+    pub architect: SharedBinding,
+    pub developer: SharedBinding,
     pub architect_tools: Vec<ToolSpec>,
     pub developer_tools: Vec<ToolSpec>,
     /// Environment section shared by every prompt (workspace, OS, date, AGENTS.md).
@@ -292,8 +310,8 @@ impl Book {
     ) -> Self {
         architect_tools.push(submit_plan_spec());
         Self {
-            architect,
-            developer,
+            architect: Arc::new(RwLock::new(architect)),
+            developer: Arc::new(RwLock::new(developer)),
             architect_tools,
             developer_tools,
             environment: environment(cwd),
@@ -301,6 +319,26 @@ impl Book {
             resume: std::sync::Mutex::new(None),
             sessions: AtomicU64::new(1),
         }
+    }
+
+    /// The model a group uses now.
+    pub fn binding(&self, group: Group) -> ModelBinding {
+        match group {
+            Group::Architecture => self.architect.read().unwrap().clone(),
+            _ => self.developer.read().unwrap().clone(),
+        }
+    }
+
+    /// `/model`: switch a group's model; its agents use it from their next model call.
+    pub fn set_binding(&self, group: Group, b: ModelBinding) {
+        let slot = if group == Group::Architecture { &self.architect } else { &self.developer };
+        *slot.write().unwrap() = b;
+    }
+
+    /// `/prompt`: the system prompt a group's agents get.
+    pub fn system_prompt(&self, group: Group) -> String {
+        let base = if group == Group::Architecture { MAIN_PROMPT } else { DEVELOPER_PROMPT };
+        format!("{base}\n{}", self.environment)
     }
 
     fn session(&self, ticket: TicketId, group: Group) -> String {
@@ -315,12 +353,13 @@ impl Recipes for Book {
         let system = format!("{MAIN_PROMPT}\n{}", self.environment);
         Box::new(
             LlmAgent::new(
-                self.architect.clone(),
+                self.binding(Group::Architecture),
                 system,
                 order.to_string(),
                 self.architect_tools.clone(),
                 self.session(ticket, Group::Architecture),
             )
+            .with_shared_binding(self.architect.clone())
             .resident()
             // The main agent hears everything all session: compact early so it stays fast.
             .with_budget(self.main_context_tokens)
@@ -330,13 +369,16 @@ impl Recipes for Book {
 
     fn developer(&self, ticket: TicketId, task: &PlanTask, context: &str) -> Box<dyn Agent> {
         let system = format!("{DEVELOPER_PROMPT}\n{}", self.environment);
-        Box::new(LlmAgent::new(
-            self.developer.clone(),
-            system,
-            developer_brief(task, context),
-            self.developer_tools.clone(),
-            self.session(ticket, Group::Development),
-        ))
+        Box::new(
+            LlmAgent::new(
+                self.binding(Group::Development),
+                system,
+                developer_brief(task, context),
+                self.developer_tools.clone(),
+                self.session(ticket, Group::Development),
+            )
+            .with_shared_binding(self.developer.clone()),
+        )
     }
 }
 

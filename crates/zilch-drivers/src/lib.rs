@@ -7,6 +7,7 @@ pub mod llm;
 pub mod session;
 pub mod tools;
 
+use llm::catalog::CostMeter;
 use llm::Backend;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -32,6 +33,10 @@ pub struct DriverSet {
     backends: HashMap<String, Arc<dyn Backend>>,
     /// Where the main agent's conversation is saved (None = no sessions).
     session_file: Option<PathBuf>,
+    /// Prices, spend and the dollar cap.
+    meter: Arc<CostMeter>,
+    /// Session token cap: (limit, used).
+    token_cap: Option<(u64, std::sync::atomic::AtomicU64)>,
 }
 
 impl DriverSet {
@@ -44,7 +49,27 @@ impl DriverSet {
             hashes: Mutex::default(),
             backends,
             session_file: None,
+            meter: Arc::new(CostMeter::new(None)),
+            token_cap: None,
         }
+    }
+
+    /// Prices and the session caps (checked before each model call).
+    pub fn with_costs(mut self, meter: Arc<CostMeter>, max_session_tokens: Option<u64>) -> Self {
+        self.meter = meter;
+        self.token_cap = max_session_tokens.map(|l| (l, std::sync::atomic::AtomicU64::new(0)));
+        self
+    }
+
+    pub fn meter(&self) -> Arc<CostMeter> {
+        self.meter.clone()
+    }
+
+    /// Providers this driver set can call.
+    pub fn providers(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.backends.keys().cloned().collect();
+        v.sort();
+        v
     }
 
     /// Save the main agent's conversation to this file after every served order.
@@ -83,11 +108,35 @@ impl Drivers for DriverSet {
                 let Some(backend) = self.backends.get(&req.binding.provider) else {
                     return SyscallResult::Failed(format!("unknown provider '{}'", req.binding.provider));
                 };
+                // Session caps: refuse to send a request that would go over them.
+                let key = req.binding.key();
+                let estimate = (serde_json::to_string(&req.messages).map(|s| s.len()).unwrap_or(0) / 4) as u64;
+                if let Some((limit, used)) = &self.token_cap {
+                    let used = used.load(std::sync::atomic::Ordering::Relaxed);
+                    if used + estimate > *limit {
+                        return SyscallResult::Failed(format!(
+                            "session token cap reached ({used} used + ~{estimate} for this request > {limit}); raise max_session_tokens to continue"
+                        ));
+                    }
+                }
+                if self.meter.would_exceed(&key, estimate) {
+                    return SyscallResult::Failed(format!(
+                        "session cost cap of ${:.4} would be exceeded (spent ${:.4}); raise max_session_cost to continue",
+                        self.meter.limit_usd.unwrap_or(0.0),
+                        self.meter.spent()
+                    ));
+                }
                 let (pid, bus) = (ctx.pid, ctx.bus);
                 match llm::complete(backend.as_ref(), &req, ctx.cancel, &*ctx.alive, |t| {
                     bus.publish(KernelEvent::TextDelta { pid, text: t.to_string() })
                 }) {
-                    Ok((message, usage, cut)) => SyscallResult::Completion { message, usage, cut },
+                    Ok((message, usage, cut)) => {
+                        self.meter.record(&key, &usage);
+                        if let Some((_, used)) = &self.token_cap {
+                            used.fetch_add(usage.prompt_tokens + usage.completion_tokens, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        SyscallResult::Completion { message, usage, cut }
+                    }
                     Err(e) => SyscallResult::Failed(format!("{e:#}")),
                 }
             }

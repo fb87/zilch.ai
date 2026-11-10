@@ -2,6 +2,7 @@
 //! what the kitchen does as it happens, relays the plan for approval, and serves the result.
 //! It never waits on the agents: the kernel runs on its own threads and reports on the event bus.
 
+mod costs;
 #[allow(dead_code)] // ported whole from zilch-cli; streaming parts come later
 mod markdown;
 mod status;
@@ -80,6 +81,10 @@ struct View {
     /// A short message shown in the status row for a few seconds.
     note: Mutex<Option<(String, Instant)>>,
     started: Instant,
+    /// Usage, prices, the high-cost warning.
+    costs: Arc<costs::Costs>,
+    /// The last served answer, for /redraw.
+    last_summary: Mutex<Option<String>>,
 }
 
 /// What the status row knows about one process.
@@ -111,6 +116,11 @@ impl View {
 
     /// Keep the status row's picture of live processes up to date.
     fn track(&self, ev: &KernelEvent) {
+        if let KernelEvent::Usage { pid, model, prompt_tokens, completion_tokens } = ev {
+            let main = self.procs.lock().unwrap().get(pid).is_some_and(|(g, _)| *g == Group::Architecture);
+            let who = if main { "main" } else { "subagents" };
+            self.costs.record(who, model, zilch_ipc::Usage { prompt_tokens: *prompt_tokens, completion_tokens: *completion_tokens });
+        }
         let mut live = self.live.lock().unwrap();
         match ev {
             KernelEvent::Spawned { pid, ticket, group, .. } => {
@@ -154,7 +164,15 @@ impl View {
         let (b, d, r, y, cy) = (self.c(BOLD), self.c(DIM), self.c(RESET), self.c(YELLOW), self.c(CYAN));
         let note =
             self.note.lock().unwrap().as_ref().filter(|(_, at)| at.elapsed() < Duration::from_secs(3)).map(|(m, _)| format!("{y}{m}{r}  "));
-        let note = note.unwrap_or_default();
+        let mut note = note.unwrap_or_default();
+        // The high-cost model warning pulses like a heartbeat (highlighted 1 s, plain 1 s).
+        if let Some(seg) = self.costs.status_segment() {
+            let on = (self.started.elapsed().as_millis() / 1000).is_multiple_of(2);
+            let style = if on { format!("{b}{}", self.c("\x1b[7m")) } else { y.to_string() };
+            note = format!("{style} {seg} {r}  {note}");
+        }
+        let spent = self.costs.meter.spent();
+        let spent = if spent > 0.0 { format!("  {d}· ${spent:.4}{r}") } else { String::new() };
         if let Some((_, ticket)) = self.question() {
             let rev = self.c("\x1b[7m");
             return (
@@ -168,7 +186,7 @@ impl View {
         let waiting = live.values().filter(|l| !(l.group == Group::Architecture && l.state == "blocked(recv)")).count() - busy.len();
         if busy.is_empty() {
             let rest = if waiting > 0 { format!("{waiting} waiting") } else { "idle".into() };
-            return (format!("{note}{d}{rest}{r}"), false);
+            return (format!("{note}{d}{rest}{r}{spent}"), false);
         }
         const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let frame = FRAMES[(self.started.elapsed().as_millis() / 100) as usize % FRAMES.len()];
@@ -181,7 +199,7 @@ impl View {
             })
             .collect();
         let more = if waiting > 0 { format!("  {d}│ {waiting} waiting{r}") } else { String::new() };
-        (format!("{note}{cy}{frame}{r} {} working: {}{more}", busy.len(), cells.join(&format!("{d}  │  {r}"))), true)
+        (format!("{note}{cy}{frame}{r} {} working: {}{more}{spent}", busy.len(), cells.join(&format!("{d}  │  {r}"))), true)
     }
 
     fn render(&self, ev: &KernelEvent) -> Option<String> {
@@ -226,6 +244,7 @@ impl View {
             }
             KernelEvent::TicketServed { ticket, ok, summary } => {
                 self.open.lock().unwrap().remove(ticket);
+                *self.last_summary.lock().unwrap() = Some(summary.clone());
                 self.questions.lock().unwrap().retain(|(_, t)| t != ticket);
                 let width = terminal_width().saturating_sub(2).max(20);
                 let body = markdown::Markdown::new(self.color).with_indent(2).text(summary.trim(), width);
@@ -330,6 +349,13 @@ Type an order to place it. While a plan waits for you: y approves, n rejects, an
 /ps          the process table (pid, group, state, what it is doing)
 /kill <pid>  stop one process (its task fails; dependents are blocked)
 /cancel      cancel the newest open order
+/usage       tokens and USD per agent and model, session total
+/models      the model of the main agent and the subagents
+/model <main|developer> <model> [provider]   switch for this session (`default` switches back)
+/ack         silence the high-cost model warning until its next step
+/prompt [main|developer]   the system prompt
+/about       version, repository, workspace, session file, config files
+/redraw      clear the screen and re-render the last answer at the current width
 /help        this help
 /exit        quit (Ctrl-D)
 Ctrl-C cancels the newest open order.";
@@ -361,13 +387,20 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
     let ov =
         Overrides { model: cli.model.clone(), architect_model: cli.architect_model.clone(), developer_model: cli.developer_model.clone() };
     let cfg = Config::load(&cwd, &ov)?;
-    let mut drivers = DriverSet::new(&cwd, cfg.policy.clone(), cfg.backends());
+    // Prices and context sizes from the providers (best effort, a few seconds at most), the
+    // session caps, and a client for every usable provider (so /model can switch).
+    let meter = Arc::new(zilch_drivers::llm::catalog::CostMeter::new(cfg.max_session_cost));
+    *meter.catalog.write().unwrap() = cfg.discover_catalog();
+    let mut drivers = DriverSet::new(&cwd, cfg.policy.clone(), cfg.backends()).with_costs(meter.clone(), cfg.max_session_tokens);
+    let providers = drivers.providers();
+    let configured = (cfg.architect.clone(), cfg.developer.clone());
     // Sessions: the main agent's conversation is saved after every served order; -c continues the
     // most recent one of this directory.
     let sessions =
         (!cli.no_session).then(zilch_drivers::session::default_root).flatten().map(|r| zilch_drivers::session::dir_for(&r, &cwd));
     let mut resumed: Option<(PathBuf, Vec<zilch_ipc::Message>)> = None;
     let mut session_note = String::new();
+    let mut session_path: Option<PathBuf> = None;
     if let Some(dir) = &sessions {
         let earlier = cli.r#continue.then(|| zilch_drivers::session::latest(dir)).flatten();
         let loaded = earlier.as_ref().and_then(|p| zilch_drivers::session::load(p)).and_then(|v| zilch_agents::snapshot_messages(&v));
@@ -383,6 +416,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 zilch_drivers::session::new_path(dir)
             }
         };
+        session_path = Some(path.clone());
         drivers = drivers.with_session_file(path);
     }
     let mut book =
@@ -399,6 +433,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         session_note = format!("↺ continuing session {id}: {} order(s), last: {last}", orders.len());
         *book.resume.lock().unwrap() = Some(msgs.clone());
     }
+    let book = Arc::new(book);
     let bus = Arc::new(EventBus::new());
     let log = open_log(&cli);
     if let Some((_, file)) = &log {
@@ -427,6 +462,14 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         live: Mutex::default(),
         note: Mutex::default(),
         started: Instant::now(),
+        costs: Arc::new(costs::Costs::new(
+            meter.clone(),
+            book.clone(),
+            cfg.expensive_model_price,
+            cfg.expensive_model_minutes,
+            cfg.expensive_model_spend,
+        )),
+        last_summary: Mutex::default(),
     });
     let (d, r) = (view.c(DIM), view.c(RESET));
     let (_, sandbox) = zilch_drivers::tools::sandbox::status(cfg.policy.bash_sandbox, cfg.policy.bash.network);
@@ -441,16 +484,20 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         log.as_ref().map(|(p, _)| format!("\n{d}event log: {}{r}", p.display())).unwrap_or_default()
     );
     let banner = if session_note.is_empty() { banner } else { format!("{banner}\n{}{session_note}{r}", view.c(CYAN)) };
-    let kernel = zilch_kernel::start(kcfg, Arc::new(drivers), Arc::new(book), bus);
+    let kernel = zilch_kernel::start(kcfg, Arc::new(drivers), book.clone(), bus);
 
     if let Some(order) = &cli.prompt {
         eprintln!("{banner}");
         kernel.send(Cmd::Order(order.clone()));
         let stdin = std::io::stdin();
         for env in events.iter() {
+            view.track(&env.event);
             if let Some(s) = view.render(&env.event) {
                 println!("{s}");
                 let _ = std::io::stdout().flush();
+            }
+            for a in view.costs.announcements() {
+                println!("{}{a}{}", view.c(YELLOW), view.c(RESET));
             }
             match &env.event {
                 KernelEvent::Question { qid, .. } if !cli.yes => {
@@ -500,6 +547,9 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 if rustyline::ExternalPrinter::print(&mut printer, format!("{s}\n")).is_err() {
                     break;
                 }
+            }
+            for a in v.costs.announcements() {
+                let _ = rustyline::ExternalPrinter::print(&mut printer, format!("{}{a}{}\n", v.c(YELLOW), v.c(RESET)));
             }
         }
     })?;
@@ -594,6 +644,38 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 Some(t) => kernel.send(Cmd::KillTicket(t)),
                 None => println!("No open order."),
             },
+            "/usage" => println!("{}", view.costs.report()),
+            "/models" => println!("{}", models_list(&book, &meter, &configured)),
+            "/model" => println!("{}", model_cmd(arg, &book, &meter, &providers, &configured)),
+            "/ack" => {
+                let msg = if view.costs.ack() == 0 {
+                    "no high-cost model warning to acknowledge"
+                } else {
+                    "high-cost model warning silenced until its next step"
+                };
+                match &bar {
+                    Some(_) => view.note(msg),
+                    None => println!("({msg})"),
+                }
+            }
+            "/prompt" => {
+                let group = if arg.starts_with("dev") { Group::Development } else { Group::Architecture };
+                println!("{}", book.system_prompt(group));
+            }
+            "/about" => println!("{}", about(&cwd, &cfg.sources, session_path.as_ref())),
+            "/redraw" => {
+                if color {
+                    print!("\x1b[H\x1b[2J");
+                }
+                match view.last_summary.lock().unwrap().clone() {
+                    Some(s) => {
+                        let width = terminal_width().saturating_sub(2).max(20);
+                        println!("{}── last answer, redrawn at {width} columns ──{}", view.c(DIM), view.c(RESET));
+                        println!("{}", markdown::Markdown::new(color).with_indent(2).text(s.trim(), width));
+                    }
+                    None => println!("(no answer yet)"),
+                }
+            }
             c if c.starts_with('/') => println!("Unknown command {c}. /help lists them."),
             _ => kernel.send(Cmd::Order(input.to_string())),
         }
@@ -608,4 +690,94 @@ fn bump(d: &str) -> String {
         Some((head, n)) => format!("{head} +{} more", n + 1),
         None => d.to_string(),
     }
+}
+
+/// A model with its price, for /models and /model.
+fn priced(meter: &zilch_drivers::llm::catalog::CostMeter, b: &zilch_ipc::ModelBinding) -> String {
+    match meter.info(&b.key()) {
+        Some(zilch_drivers::llm::catalog::ModelInfo { input_per_mtok: Some(i), output_per_mtok: Some(o), .. }) => {
+            format!("{} (${i}/${o} per 1M tokens in/out)", b.key())
+        }
+        _ => b.key(),
+    }
+}
+
+/// /models: what each group uses now (and what it was configured with, if switched).
+fn models_list(
+    book: &Book,
+    meter: &zilch_drivers::llm::catalog::CostMeter,
+    configured: &(zilch_ipc::ModelBinding, zilch_ipc::ModelBinding),
+) -> String {
+    [("main", Group::Architecture, &configured.0), ("developer", Group::Development, &configured.1)]
+        .iter()
+        .map(|(name, g, conf)| {
+            let now = book.binding(*g);
+            let note = if &now != *conf { format!("  (switched; configured: {})", conf.key()) } else { String::new() };
+            format!("{name:<10} {}{note}", priced(meter, &now))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// /model <main|developer> <model> [provider] — or `default` to switch back.
+fn model_cmd(
+    arg: &str,
+    book: &Book,
+    meter: &zilch_drivers::llm::catalog::CostMeter,
+    providers: &[String],
+    configured: &(zilch_ipc::ModelBinding, zilch_ipc::ModelBinding),
+) -> String {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    let (who, model, provider) = match parts.as_slice() {
+        [] => return models_list(book, meter, configured),
+        [w, m] => (*w, *m, None),
+        [w, m, p] => (*w, *m, Some(*p)),
+        _ => return "usage: /model <main|developer> <model> [provider]   ·   /model <main|developer> default".into(),
+    };
+    let (group, conf) = match zilch_ipc::Target::parse(who) {
+        Some(zilch_ipc::Target::Group(Group::Architecture)) => (Group::Architecture, &configured.0),
+        Some(zilch_ipc::Target::Group(Group::Development)) => (Group::Development, &configured.1),
+        _ => return format!("unknown group '{who}' (main, developer)"),
+    };
+    if model == "default" {
+        book.set_binding(group, conf.clone());
+        return format!("{who} → {} (configured model)", conf.key());
+    }
+    let mut b = book.binding(group);
+    if let Some(p) = provider {
+        if !providers.iter().any(|x| x == p) {
+            return format!("unknown or unusable provider '{p}' (usable: {})", providers.join(", "));
+        }
+        b.provider = p.to_string();
+    }
+    b.model = model.to_string();
+    // A model the provider does not list would fail with a 400 in the middle of a task.
+    let prefix = format!("{}/", b.provider);
+    let listed: Vec<String> = meter.catalog.read().unwrap().keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
+    if !listed.is_empty() && !listed.contains(&b.key()) {
+        return format!("'{model}' is not in provider '{}''s model list", b.provider);
+    }
+    let shown = priced(meter, &b);
+    book.set_binding(group, b);
+    format!("{who} → {shown}, from its next model call")
+}
+
+/// /about: version, project, where things are.
+fn about(cwd: &std::path::Path, sources: &[PathBuf], session: Option<&PathBuf>) -> String {
+    let mut lines = vec![
+        format!("zilch-os {} — {}", env!("CARGO_PKG_VERSION"), env!("CARGO_PKG_DESCRIPTION")),
+        format!("  repository  {}", env!("CARGO_PKG_REPOSITORY")),
+        format!("  author      {}", env!("CARGO_PKG_AUTHORS").replace(':', ", ")),
+        format!("  license     {}", env!("CARGO_PKG_LICENSE")),
+        format!("  platform    {}/{}", std::env::consts::OS, std::env::consts::ARCH),
+        format!("  workspace   {}", cwd.display()),
+        format!("  session     {}", session.map_or("not saved (--no-session)".into(), |p| p.display().to_string())),
+    ];
+    if sources.is_empty() {
+        lines.push("  config      built-in defaults + environment (no config file found)".into());
+    }
+    for (i, s) in sources.iter().enumerate() {
+        lines.push(format!("{}{}", if i == 0 { "  config      " } else { "              " }, s.display()));
+    }
+    lines.join("\n")
 }

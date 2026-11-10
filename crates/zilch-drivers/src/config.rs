@@ -27,6 +27,8 @@ pub struct ProviderCfg {
     pub session_header: Option<String>,
     pub idle_timeout_secs: Option<u64>,
     pub protocol: Option<Protocol>,
+    /// Fetch prices and context sizes from `{base_url}/models` at startup (default true).
+    pub discover: Option<bool>,
 }
 
 impl ProviderCfg {
@@ -39,6 +41,7 @@ impl ProviderCfg {
         merge_opt(&mut self.session_header, o.session_header);
         merge_opt(&mut self.idle_timeout_secs, o.idle_timeout_secs);
         merge_opt(&mut self.protocol, o.protocol);
+        merge_opt(&mut self.discover, o.discover);
     }
     fn key(&self, env: &BTreeMap<String, String>) -> Option<String> {
         self.api_key.clone().or_else(|| self.api_key_env.as_ref().and_then(|v| env.get(v).cloned())).filter(|k| !k.is_empty())
@@ -56,6 +59,9 @@ pub struct RoleCfg {
     pub extra: Option<Map<String, Value>>,
     pub max_steps: Option<usize>,
     pub context_tokens: Option<usize>,
+    /// USD per 1M input / output tokens (overrides discovered prices).
+    pub price_in: Option<f64>,
+    pub price_out: Option<f64>,
 }
 
 impl RoleCfg {
@@ -69,6 +75,8 @@ impl RoleCfg {
         merge_opt(&mut self.extra, o.extra);
         merge_opt(&mut self.max_steps, o.max_steps);
         merge_opt(&mut self.context_tokens, o.context_tokens);
+        merge_opt(&mut self.price_in, o.price_in);
+        merge_opt(&mut self.price_out, o.price_out);
     }
     /// Unset fields taken from `under` (a lower-precedence role).
     fn over(mut self, under: &RoleCfg) -> RoleCfg {
@@ -97,6 +105,11 @@ struct FileConfig {
     max_task_tokens: Option<u64>,
     /// Token quota per group: `[quotas] architect = 200000, developer = 2000000`.
     quotas: Option<BTreeMap<String, u64>>,
+    max_session_tokens: Option<u64>,
+    max_session_cost: Option<f64>,
+    expensive_model_price: Option<f64>,
+    expensive_model_minutes: Option<u64>,
+    expensive_model_spend: Option<f64>,
 }
 
 fn merge_opt<T>(dst: &mut Option<T>, src: Option<T>) {
@@ -131,6 +144,16 @@ pub struct Config {
     pub group_tokens: BTreeMap<Group, u64>,
     /// Context budget of the main agent (`context_tokens` on its role); None = built-in default.
     pub main_context_tokens: Option<usize>,
+    /// Session-wide caps, checked before each model call (None = unlimited).
+    pub max_session_tokens: Option<u64>,
+    pub max_session_cost: Option<f64>,
+    /// High-cost model warning: output price (USD/1M) from which a model is high-cost (0 = off),
+    /// and after how many minutes of use or USD spent it is flagged (and again every as many).
+    pub expensive_model_price: f64,
+    pub expensive_model_minutes: u64,
+    pub expensive_model_spend: f64,
+    /// Price overrides from the roles: (model key, input, output) USD per 1M tokens.
+    price_overrides: Vec<(String, Option<f64>, Option<f64>)>,
     env: BTreeMap<String, String>,
 }
 
@@ -186,6 +209,11 @@ impl Config {
             merge_opt(&mut fc.max_workers, layer.max_workers);
             merge_opt(&mut fc.loop_limit, layer.loop_limit);
             merge_opt(&mut fc.max_task_tokens, layer.max_task_tokens);
+            merge_opt(&mut fc.max_session_tokens, layer.max_session_tokens);
+            merge_opt(&mut fc.max_session_cost, layer.max_session_cost);
+            merge_opt(&mut fc.expensive_model_price, layer.expensive_model_price);
+            merge_opt(&mut fc.expensive_model_minutes, layer.expensive_model_minutes);
+            merge_opt(&mut fc.expensive_model_spend, layer.expensive_model_spend);
             if let Some(q) = layer.quotas {
                 fc.quotas.get_or_insert_with(BTreeMap::new).extend(q);
             }
@@ -257,6 +285,11 @@ impl Config {
         // Every provider key is a secret for commands, whatever its variable is called.
         policy.secret_env = fc.providers.values().filter_map(|p| p.api_key_env.clone()).collect();
         let io_threads = fc.providers.values().map(|p| p.max_concurrent.unwrap_or(8)).sum::<usize>().clamp(8, 64) + 8;
+        let price_overrides: Vec<(String, Option<f64>, Option<f64>)> = [(&architect, &architect_b), (&developer, &developer_b)]
+            .iter()
+            .filter(|(r, _)| r.price_in.is_some() || r.price_out.is_some())
+            .map(|(r, b)| (b.key(), r.price_in, r.price_out))
+            .collect();
         let mut group_tokens = BTreeMap::new();
         for (name, q) in fc.quotas.clone().unwrap_or_default() {
             let g = match name.as_str() {
@@ -271,6 +304,12 @@ impl Config {
             cwd: cwd.to_path_buf(),
             group_tokens,
             main_context_tokens: architect.context_tokens,
+            max_session_tokens: fc.max_session_tokens,
+            max_session_cost: fc.max_session_cost,
+            expensive_model_price: fc.expensive_model_price.unwrap_or(10.0).max(0.0),
+            expensive_model_minutes: fc.expensive_model_minutes.unwrap_or(30).max(1),
+            expensive_model_spend: fc.expensive_model_spend.unwrap_or(2.0).max(0.01),
+            price_overrides,
             sources,
             providers: fc.providers,
             architect: architect_b,
@@ -302,20 +341,57 @@ impl Config {
     /// One HTTP client per provider used by a group.
     pub fn backends(&self) -> HashMap<String, Arc<dyn Backend>> {
         let mut out: HashMap<String, Arc<dyn Backend>> = HashMap::new();
-        for b in [&self.architect, &self.developer] {
-            if out.contains_key(&b.provider) {
-                continue;
-            }
-            let p = &self.providers[&b.provider];
-            let client =
-                HttpClient::new(&b.provider, p.base_url.clone().unwrap_or_default(), p.key(&self.env), p.max_concurrent.unwrap_or(8))
-                    .with_headers(p.headers.clone().unwrap_or_default().into_iter().collect())
-                    .with_session_header(p.session_header.clone())
-                    .with_protocol(p.protocol.unwrap_or_default())
-                    .with_idle_timeout(Duration::from_secs(p.idle_timeout_secs.unwrap_or(180)));
-            out.insert(b.provider.clone(), Arc::new(client));
+        // Every usable provider, so /model can switch to any of them.
+        for name in self.usable_providers() {
+            let p = &self.providers[&name];
+            let client = HttpClient::new(&name, p.base_url.clone().unwrap_or_default(), p.key(&self.env), p.max_concurrent.unwrap_or(8))
+                .with_headers(p.headers.clone().unwrap_or_default().into_iter().collect())
+                .with_session_header(p.session_header.clone())
+                .with_protocol(p.protocol.unwrap_or_default())
+                .with_idle_timeout(Duration::from_secs(p.idle_timeout_secs.unwrap_or(180)));
+            out.insert(name.clone(), Arc::new(client));
         }
         out
+    }
+}
+
+impl Config {
+    /// Prices and context sizes: each configured provider's `/models` list (fetched in parallel,
+    /// 5 s timeout, skipped with `discover = false` or without a key), then the role overrides.
+    pub fn discover_catalog(&self) -> std::collections::HashMap<String, crate::llm::catalog::ModelInfo> {
+        use crate::llm::catalog::{fetch_models, ModelInfo};
+        let jobs: Vec<_> = self
+            .providers
+            .iter()
+            .filter(|(_, p)| p.discover != Some(false) && p.protocol != Some(Protocol::Anthropic))
+            .filter_map(|(name, p)| {
+                let key = p.key(&self.env);
+                if p.api_key_env.is_some() && key.is_none() {
+                    return None;
+                }
+                let (name, base) = (name.clone(), p.base_url.clone().unwrap_or_default());
+                let headers: Vec<(String, String)> = p.headers.clone().unwrap_or_default().into_iter().collect();
+                Some(std::thread::spawn(move || (name, fetch_models(&base, key.as_deref(), &headers))))
+            })
+            .collect();
+        let mut cat = std::collections::HashMap::new();
+        for j in jobs {
+            if let Ok((provider, models)) = j.join() {
+                for (id, info) in models {
+                    cat.insert(format!("{provider}/{id}"), info);
+                }
+            }
+        }
+        for (key, i, o) in &self.price_overrides {
+            let base = cat.get(key).copied().unwrap_or_default();
+            cat.insert(key.clone(), base.merged(ModelInfo { context: None, input_per_mtok: *i, output_per_mtok: *o }));
+        }
+        cat
+    }
+
+    /// Providers that can be used (configured, with their key when one is required).
+    pub fn usable_providers(&self) -> Vec<String> {
+        self.providers.iter().filter(|(_, p)| p.api_key_env.is_none() || p.key(&self.env).is_some()).map(|(n, _)| n.clone()).collect()
     }
 }
 

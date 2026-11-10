@@ -160,7 +160,7 @@ impl Syscall {
     /// Short label for the process table and the event stream.
     pub fn summary(&self) -> String {
         match self {
-            Syscall::Complete(r) => format!("llm {}", r.binding.model),
+            Syscall::Complete(r) => format!("llm {}", r.binding.key()),
             Syscall::Tool { name, args, .. } => {
                 let detail = ["path", "command", "pattern"]
                     .iter()

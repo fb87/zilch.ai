@@ -173,6 +173,14 @@ Its context is compacted when it reaches 75% of `context_tokens` on its role (de
 old tool output is shortened first, then older turns are summarized by the model, so a long session
 does not keep getting slower. Subagents start fresh per task, so they stay small anyway.
 
+**Costs and models.** At startup zilch-os reads each provider's model list (prices, context
+sizes); `price_in` / `price_out` on a role override them. `/usage` shows tokens and USD per agent and
+model, the status row the session's spend. `max_session_tokens` and `max_session_cost` stop model
+calls before they would exceed the cap. `/model main|developer <model> [provider]` switches a group
+for the session (`default` switches back), `/models` shows both. A model with an output price of at
+least `expensive_model_price` (default 10 USD/1M) that has been in use for 30 minutes or cost $2
+pulses in the status row until `/ack` or until you switch back. Also `/about`, `/redraw`, `/prompt`.
+
 **Sessions.** After every served order the main agent's conversation is saved under
 `<data dir>/zilch/os-sessions/` (one directory per workspace, files mode 0600). `zilch-os -c`
 continues the most recent session of the current directory: the main agent remembers it and order
