@@ -146,7 +146,8 @@ pub struct KernelConfig {
     pub hang_ticks: u64,
     /// Supervisor loop limit (see `supervisor`); 0 = off.
     pub loop_limit: usize,
-    /// Per-process step budget.
+    /// Model calls a process may make per task (a resident agent: per order), like zilch's
+    /// max_steps; raw kernel steps are capped at 4× this as a safety net.
     pub max_steps: u32,
     /// Per-process token budget (None = unlimited).
     pub max_tokens: Option<u64>,
@@ -320,6 +321,8 @@ struct InFlight {
     class: PoolClass,
     /// For tool calls: (name, raw arguments) for loop fingerprints.
     tool: Option<(String, String)>,
+    /// The call writes a file (counts as progress when it succeeds).
+    write: bool,
     completion: bool,
 }
 
@@ -350,6 +353,20 @@ struct Acb {
     parked_slot: Option<usize>,
     // Accounting.
     steps: u32,
+    /// Model calls and kernel steps of the current task (a resident agent: of the current order).
+    calls: u32,
+    order_steps: u32,
+    /// The agent was told its budget is used up and must wrap up (it then has a short grace).
+    budget_warned: bool,
+    /// Model calls granted beyond the base budget because the task was still making progress.
+    granted: u32,
+    /// Progress since the last budget check: tool results new to this task, successful writes, and
+    /// the model calls the window started at.
+    fresh: u32,
+    writes: u32,
+    window_start: u32,
+    /// Fingerprints (call + normalized result) of this task's tool results.
+    seen: std::collections::HashSet<u64>,
     tokens: u64,
     born: u64,
     ready_since: u64,
@@ -782,6 +799,15 @@ impl Kernel {
         let (ticket, _, text) = self.pending_orders.remove(i).expect("found");
         if let Some(a) = self.acbs.get_mut(&main) {
             a.ticket = ticket;
+            // A resident agent's budget is per order.
+            a.calls = 0;
+            a.order_steps = 0;
+            a.budget_warned = false;
+            a.granted = 0;
+            a.fresh = 0;
+            a.writes = 0;
+            a.seen.clear();
+            a.window_start = 0;
         }
         self.wake_parked(main, SyscallResult::Message(Msg { from: CLI_PID, kind: MsgKind::Guest, body: order_message(ticket, &text) }));
     }
@@ -890,6 +916,14 @@ impl Kernel {
                 outstanding: 0,
                 parked_slot: None,
                 steps: 0,
+                calls: 0,
+                order_steps: 0,
+                budget_warned: false,
+                granted: 0,
+                fresh: 0,
+                writes: 0,
+                seen: Default::default(),
+                window_start: 0,
                 tokens: 0,
                 born: self.tick,
                 ready_since: self.tick,
@@ -971,9 +1005,53 @@ impl Kernel {
     }
 
     fn within_budget(&mut self, pid: Pid) -> bool {
+        // Out of model calls: first ask the agent to wrap up and report (its work is kept and the
+        // main agent can continue from the report — cheaper than killing it and redoing the task);
+        // stop it only if it is still going after a short grace.
+        let max = self.cfg.max_steps;
+        let grace = (max / 4).max(5);
+        let ceiling = max.saturating_mul(3);
+        // At the budget, a task still making progress (a successful write, or new tool results it
+        // had not seen) gets more calls, up to 3× the budget; one that is only going round in circles
+        // is asked to wrap up.
+        if let Some(a) = self.acbs.get_mut(&pid).filter(|a| a.calls >= max + a.granted && !a.budget_warned) {
+            let limit = max + a.granted;
+            // Progress: a successful write, or at least one new result per three model calls.
+            let window = a.calls.saturating_sub(a.window_start).max(1);
+            if (a.writes > 0 || a.fresh.saturating_mul(3) >= window) && limit < ceiling {
+                a.granted = (a.granted + (max / 2).max(1)).min(ceiling - max);
+                let (new_limit, writes, fresh) = (max + a.granted, a.writes, a.fresh);
+                a.writes = 0;
+                a.fresh = 0;
+                a.window_start = a.calls;
+                self.bus.publish(KernelEvent::Signal {
+                    pid,
+                    signal: Signal::Warn,
+                    reason: format!(
+                        "still making progress ({writes} write(s), {fresh} new result(s)) — budget extended to {new_limit} model calls"
+                    ),
+                });
+                return true;
+            }
+        }
+        if let Some(a) = self.acbs.get_mut(&pid).filter(|a| a.calls >= max + a.granted && !a.budget_warned) {
+            a.budget_warned = true;
+            let max = max + a.granted;
+            a.notes.push(format!(
+                "[supervisor] This task has used its budget of {max} model calls. Finish now: stop exploring, report what is done and what is left, and end with STATUS: done or STATUS: failed. You have at most {grace} more model calls."
+            ));
+            self.bus.publish(KernelEvent::Signal {
+                pid,
+                signal: Signal::Warn,
+                reason: format!("used its budget of {max} model calls — asked to wrap up ({grace} more)"),
+            });
+        }
         let Some(a) = self.acbs.get(&pid) else { return false };
-        let reason = if a.steps >= self.cfg.max_steps {
-            Some(format!("step budget exhausted ({} steps)", self.cfg.max_steps))
+        let limit = max + a.granted + grace;
+        let reason = if a.calls >= limit {
+            Some(format!("model-call budget exhausted ({limit} calls for this task, wrap-up included; raise max_steps)"))
+        } else if a.order_steps >= (max + a.granted).saturating_mul(4) {
+            Some(format!("step budget exhausted ({} steps for this task)", (max + a.granted).saturating_mul(4)))
         } else {
             let used = self.group_used.get(&a.group).copied().unwrap_or(0);
             self.cfg.max_tokens.filter(|m| a.tokens >= *m).map(|m| format!("token budget exhausted ({} of {m} tokens)", a.tokens)).or_else(
@@ -1003,6 +1081,7 @@ impl Kernel {
             return; // killed while its step ran
         }
         a.steps += 1;
+        a.order_steps += 1;
         a.last_progress = tick;
         a.agent = agent;
         match result {
@@ -1023,6 +1102,7 @@ impl Kernel {
             a.batch += 1;
             a.batch_cancel = a.cancel.child();
             a.batch_interrupted = false;
+            a.calls += calls.iter().filter(|c| matches!(c, Syscall::Complete(_))).count() as u32;
             a.pending = vec![None; n];
             a.outstanding = n;
             a.parked_slot = None;
@@ -1035,16 +1115,23 @@ impl Kernel {
                         Syscall::Tool { name, args, .. } => Some((name.clone(), args.to_string())),
                         _ => None,
                     },
+                    write: matches!(c, Syscall::Tool { name, args, .. } if matches!(self.drivers.classify(name, args), Access::Write(_)))
+                        || matches!(c, Syscall::Tool { name, .. } if name == "write_doc" || name == "edit_doc"),
                     completion: matches!(c, Syscall::Complete(_)),
                 })
                 .collect();
             (a.batch, a.batch_cancel.clone(), a.ticket)
         };
         self.set_state(pid, State::Blocked(Block::Io));
-        let exclusive = n > 1
-            && calls
-                .iter()
-                .any(|c| matches!(c, Syscall::Recv | Syscall::SubmitPlan { .. } | Syscall::Serve { .. } | Syscall::Explore { .. }));
+        // Calls that park the agent use its one parked slot: at most one per step. recv and serve
+        // also change what the agent waits for, so they come alone; submit_plan and explore may share
+        // a step with ordinary tool calls.
+        let parking = calls
+            .iter()
+            .filter(|c| matches!(c, Syscall::Recv | Syscall::SubmitPlan { .. } | Syscall::Serve { .. } | Syscall::Explore { .. }))
+            .count();
+        let alone_needed = calls.iter().any(|c| matches!(c, Syscall::Recv | Syscall::Serve { .. }));
+        let exclusive = parking > 1 || (alone_needed && n > 1);
         for (idx, call) in calls.into_iter().enumerate() {
             self.bus.publish(KernelEvent::SyscallIssued { pid, idx, summary: call.summary() });
             match call {
@@ -1053,7 +1140,10 @@ impl Kernel {
                         pid,
                         batch,
                         idx,
-                        SyscallResult::Failed("recv, submit_plan, serve and explore must be the only call in their step".into()),
+                        SyscallResult::Failed(
+                            "only one of recv / serve / submit_plan / explore per step (recv and serve alone); call it again by itself"
+                                .into(),
+                        ),
                     );
                 }
                 Syscall::Send { to, kind, body } => {
@@ -1243,6 +1333,22 @@ impl Kernel {
             }
         } else {
             let texts: Vec<String> = results.iter().map(SyscallResult::text).collect();
+            // Progress for the budget: successful writes, and tool results this task has not seen.
+            for ((f, r), text) in inflight.iter().zip(&results).zip(&texts) {
+                if let (Some((name, args)), true) = (&f.tool, r.ok()) {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    // New information = a new result (different arguments with the same answer are not).
+                    let _ = args;
+                    (name, supervisor::normalize_output(text)).hash(&mut h);
+                    if a.seen.insert(h.finish()) {
+                        a.fresh += 1;
+                    }
+                    if f.write {
+                        a.writes += 1;
+                    }
+                }
+            }
             let records: Vec<CallRecord> = inflight
                 .iter()
                 .zip(&texts)
@@ -1403,8 +1509,14 @@ impl Kernel {
                 SyscallResult::Failed("this order was cancelled or already served; there is nothing to plan for".into()),
             );
         }
-        if self.tickets.get(&ticket).and_then(|t| t.plan.as_ref()).is_some_and(|p| p.approved) {
-            return self.fill(pid, batch, idx, SyscallResult::Failed("this order's plan was already approved and run".into()));
+        // A follow-up plan (fixes after checking the results) is fine once the previous one finished.
+        let running = self
+            .tickets
+            .get(&ticket)
+            .and_then(|t| t.plan.as_ref())
+            .is_some_and(|p| p.approved && p.runs.iter().any(|r| !r.status.is_terminal()));
+        if running {
+            return self.fill(pid, batch, idx, SyscallResult::Failed("this order's plan is still running; wait for its results".into()));
         }
         if let Err(e) = plan::validate(&tasks) {
             return self.fill(pid, batch, idx, SyscallResult::Failed(format!("invalid plan: {e}. Fix it and submit again.")));

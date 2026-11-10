@@ -298,13 +298,35 @@ fn recv_parks_without_a_worker_and_send_wakes_it() {
 }
 
 #[test]
-fn budgets_stop_a_process() {
-    let drivers = Arc::new(FakeDrivers::default());
-    let dev: DevScript = Arc::new(|_| Box::new(Scripted(0, |n, _, _| StepResult::Syscalls(vec![tool("x", json!({"n": n}))]))));
-    let mut run = Run::new(KernelConfig { max_steps: 5, ..cfg() }, drivers, Book { tasks: vec![task("T1", &[], &["a"])], dev });
+fn budgets_count_model_calls_with_a_step_cap_as_a_safety_net() {
+    // The budget counts model calls (like zilch's max_steps): a model call then a tool call per
+    // round trip, so 5 calls = 10 steps; it stops on the 6th call, not after 5 steps.
+    let dev: DevScript = Arc::new(|_| {
+        Box::new(Scripted(0, |n, _, _| match n % 2 {
+            1 => StepResult::Syscalls(vec![llm_call()]),
+            _ => StepResult::Syscalls(vec![tool("x", json!({"n": n}))]),
+        }))
+    });
+    let k = KernelConfig { max_steps: 5, loop_limit: 0, ..cfg() };
+    let mut run = Run::new(k.clone(), Arc::new(FakeDrivers::default()), Book { tasks: vec![task("T1", &[], &["a"])], dev });
     run.k.send(Cmd::Order("x".into()));
     let (_, summary) = run.served();
-    assert!(summary.contains("step budget exhausted (5 steps)") && summary.contains("Failed"), "{summary}");
+    // It ignores the wrap-up note, so it is stopped after the grace (5 more calls).
+    assert!(summary.contains("model-call budget exhausted (10 calls for this task, wrap-up included"), "{summary}");
+    let calls =
+        run.seen.iter().filter(|e| matches!(e, KernelEvent::SyscallIssued { pid: 2, summary, .. } if summary.starts_with("llm"))).count();
+    assert_eq!(calls, 10);
+    assert!(run
+        .seen
+        .iter()
+        .any(|e| matches!(e, KernelEvent::Signal { pid: 2, signal: Signal::Warn, reason } if reason.contains("asked to wrap up"))));
+
+    // Without model calls, raw steps are still capped (4× the budget).
+    let dev: DevScript = Arc::new(|_| Box::new(Scripted(0, |n, _, _| StepResult::Syscalls(vec![tool("x", json!({"n": n}))]))));
+    let mut run = Run::new(k, Arc::new(FakeDrivers::default()), Book { tasks: vec![task("T1", &[], &["a"])], dev });
+    run.k.send(Cmd::Order("x".into()));
+    let (_, summary) = run.served();
+    assert!(summary.contains("step budget exhausted (20 steps for this task)"), "{summary}");
 }
 
 #[test]
@@ -882,4 +904,130 @@ fn explorers_answer_questions_in_parallel_and_report_together() {
     let spans = drivers.spans.lock().unwrap().clone();
     assert_eq!(spans.len(), 2, "one explorer per non-empty question");
     assert!(spans[0].1 < spans[1].2 && spans[1].1 < spans[0].2, "the explorers ran at the same time");
+}
+
+#[test]
+fn a_resident_agents_budget_is_per_order_and_a_finished_plan_can_be_followed_by_another() {
+    // A main agent that plans twice in one order (the second plan fixes what the first left), then
+    // serves; it takes more steps over three orders than one order's budget allows.
+    struct Twice;
+    impl Agent for Twice {
+        fn step(&mut self, _: &AcbView, wake: Vec<SyscallResult>) -> StepResult {
+            // With submit_plan and a tool call in one step, the plan's result comes first.
+            let last = wake.first().map(SyscallResult::text).unwrap_or_default();
+            if wake.is_empty() || last.contains("Order #") {
+                return StepResult::Syscalls(vec![Syscall::SubmitPlan { tasks: vec![task("T1", &[], &["a"])] }, tool("x", json!({}))]);
+            }
+            if last.starts_with("All tasks finished") && !last.contains("second") {
+                return StepResult::Syscalls(vec![Syscall::SubmitPlan { tasks: vec![task("second", &[], &["b"])] }]);
+            }
+            StepResult::Syscalls(vec![Syscall::Serve { summary: format!("served after: {}", last.lines().next().unwrap_or("")) }])
+        }
+    }
+    struct B;
+    impl Recipes for B {
+        fn architect(&self, _: TicketId, _: &str) -> Box<dyn Agent> {
+            Box::new(Twice)
+        }
+        fn developer(&self, _: TicketId, _: &PlanTask, _: &str) -> Box<dyn Agent> {
+            worker()(&task("w", &[], &[]))
+        }
+    }
+    let bus = Arc::new(EventBus::new());
+    let events = bus.subscribe(10_000);
+    let k = start(KernelConfig { max_steps: 3, loop_limit: 0, ..cfg() }, Arc::new(FakeDrivers::default()), Arc::new(B), bus);
+    let mut run = Run { k, events, seen: vec![] };
+    for n in 1..=3 {
+        run.k.send(Cmd::Order(format!("order {n}")));
+        let (t, ok, s) = served_ticket(&mut run);
+        assert_eq!(t, n);
+        assert!(ok, "order {n}: {s}");
+    }
+    // Two plans per order, both approved and run; submit_plan shared a step with a tool call.
+    assert_eq!(run.seen.iter().filter(|e| matches!(e, KernelEvent::Question { .. })).count(), 6);
+    assert!(!run.seen.iter().any(|e| matches!(e, KernelEvent::Exited { pid: 1, .. })), "the main agent was never stopped");
+}
+
+#[test]
+fn an_agent_out_of_budget_is_asked_to_wrap_up_and_keeps_its_work() {
+    // It works with model calls until the supervisor's wrap-up note arrives, then reports.
+    let dev: DevScript = Arc::new(|_| {
+        Box::new(Scripted(0, |n, _, view: &AcbView| {
+            if view.notes.iter().any(|x| x.contains("used its budget")) {
+                return StepResult::Exit(ExitStatus::ok("did parts 1-3; part 4 is left\nSTATUS: failed"));
+            }
+            match n % 2 {
+                1 => StepResult::Syscalls(vec![llm_call()]),
+                _ => StepResult::Syscalls(vec![tool("x", json!({"n": n}))]),
+            }
+        }))
+    });
+    let mut run = Run::new(
+        KernelConfig { max_steps: 5, loop_limit: 0, ..cfg() },
+        Arc::new(FakeDrivers::default()),
+        Book { tasks: vec![task("T1", &[], &["a"])], dev },
+    );
+    run.k.send(Cmd::Order("x".into()));
+    let (_, summary) = run.served();
+    assert!(summary.contains("did parts 1-3; part 4 is left"), "the report is kept for the main agent: {summary}");
+    assert!(!summary.contains("budget exhausted"), "it was not killed: {summary}");
+    assert!(!run.seen.iter().any(|e| matches!(e, KernelEvent::Signal { signal: Signal::Kill, .. })));
+}
+
+#[test]
+fn a_task_still_making_progress_gets_more_budget_one_going_in_circles_does_not() {
+    // Progressing: every tool call reads something new (its result changes), for 12 model calls,
+    // then it reports. Budget 5: extended at 5 (+2) and again at 7, 9, 11 … up to 3× = 15.
+    let progressing: DevScript = Arc::new(|_| {
+        Box::new(Scripted(0, |n, _, _| match (n, n % 2) {
+            (25.., _) => StepResult::Exit(ExitStatus::ok("all done\nSTATUS: done")),
+            (_, 1) => StepResult::Syscalls(vec![llm_call()]),
+            _ => StepResult::Syscalls(vec![tool("x", json!({"n": n}))]),
+        }))
+    });
+    struct Fresh;
+    impl Drivers for Fresh {
+        fn classify(&self, _: &str, _: &Value) -> Access {
+            Access::Read
+        }
+        fn run(&self, _: &DriverCtx, call: Syscall) -> SyscallResult {
+            match call {
+                // Each read finds something different: new information, i.e. progress.
+                Syscall::Tool { args, .. } => SyscallResult::Output(format!("content {}", args["n"])),
+                _ => SyscallResult::Completion { message: zilch_ipc::Message::assistant("hmm"), usage: Default::default(), cut: false },
+            }
+        }
+    }
+    let bus = Arc::new(EventBus::new());
+    let events = bus.subscribe(10_000);
+    let k = start(
+        KernelConfig { max_steps: 5, loop_limit: 0, ..cfg() },
+        Arc::new(Fresh),
+        Arc::new(Book { tasks: vec![task("T1", &[], &["a"])], dev: progressing }),
+        bus,
+    );
+    let mut run = Run { k, events, seen: vec![] };
+    run.k.send(Cmd::Order("x".into()));
+    let (_, summary) = run.served();
+    assert!(summary.contains("all done") && summary.contains("Done"), "a productive task is not cut off: {summary}");
+    let extended =
+        run.seen.iter().filter(|e| matches!(e, KernelEvent::Signal { reason, .. } if reason.contains("budget extended"))).count();
+    assert!(extended >= 3, "extended several times: {extended}");
+
+    // In circles: the same read with the same result every time — no progress, so no extension.
+    let circles: DevScript = Arc::new(|_| {
+        Box::new(Scripted(0, |n, _, _| match n % 2 {
+            1 => StepResult::Syscalls(vec![llm_call()]),
+            _ => StepResult::Syscalls(vec![tool("same", json!({}))]),
+        }))
+    });
+    let mut run = Run::new(
+        KernelConfig { max_steps: 5, loop_limit: 0, ..cfg() },
+        Arc::new(FakeDrivers::default()),
+        Book { tasks: vec![task("T1", &[], &["a"])], dev: circles },
+    );
+    run.k.send(Cmd::Order("x".into()));
+    let (_, summary) = run.served();
+    assert!(!run.seen.iter().any(|e| matches!(e, KernelEvent::Signal { reason, .. } if reason.contains("budget extended"))), "{summary}");
+    assert!(summary.contains("model-call budget exhausted (10 calls"), "wrap-up note, then stopped after the grace: {summary}");
 }
