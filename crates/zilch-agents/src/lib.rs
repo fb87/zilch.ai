@@ -21,6 +21,18 @@ pub type SharedBinding = Arc<RwLock<ModelBinding>>;
 pub const MAIN_PROMPT: &str = include_str!("../prompts/main.md");
 pub const DEVELOPER_PROMPT: &str = include_str!("../prompts/developer.md");
 pub const SPEC_PROMPT: &str = include_str!("../prompts/spec.md");
+pub const EXPLORER_PROMPT: &str = include_str!("../prompts/explorer.md");
+
+/// The main agent's fan-out tool: questions answered by read-only explorers in parallel.
+pub fn explore_spec() -> ToolSpec {
+    ToolSpec::new(
+        "explore",
+        "Investigate several questions at once: each goes to its own read-only explorer and they run in parallel. \
+         Returns every explorer's report. Use it for broad investigations (where is X handled, how does Y work) \
+         instead of reading many files yourself; ask precise, independent questions (at most 8).",
+        json!({"type":"object","properties":{"questions":{"type":"array","items":{"type":"string"}}},"required":["questions"]}),
+    )
+}
 
 /// The Architect's extra tool: hand the plan to the kernel.
 pub fn submit_plan_spec() -> ToolSpec {
@@ -171,7 +183,12 @@ impl LlmAgent {
                         ))
                     }
                 };
-                if c.function.name == "submit_plan" {
+                if c.function.name == "explore" {
+                    match serde_json::from_value::<Vec<String>>(args.get("questions").cloned().unwrap_or(Value::Null)) {
+                        Ok(questions) => syscalls.push(Syscall::Explore { questions }),
+                        Err(e) => return Some(format!("Error: explore needs `questions`, a list of strings: {e}")),
+                    }
+                } else if c.function.name == "submit_plan" {
                     match serde_json::from_value::<Vec<PlanTask>>(args.get("tasks").cloned().unwrap_or(Value::Null)) {
                         Ok(tasks) => syscalls.push(Syscall::SubmitPlan { tasks }),
                         Err(e) => return Some(format!("Error: invalid plan: {e}. Each task needs id, title, task and owned_paths.")),
@@ -327,6 +344,8 @@ pub struct Book {
     pub prompts: std::collections::HashMap<Group, (String, bool)>,
     /// Custom subagent profiles a plan task can name in `worker`.
     pub profiles: Vec<SubagentProfile>,
+    /// Read-only tools for explorers (empty = no explorers).
+    pub explorer_tools: Vec<ToolSpec>,
     sessions: AtomicU64,
 }
 
@@ -340,6 +359,7 @@ impl Book {
         cwd: &Path,
     ) -> Self {
         architect_tools.push(submit_plan_spec());
+        architect_tools.push(explore_spec());
         Self {
             architect: Arc::new(RwLock::new(architect)),
             developer: Arc::new(RwLock::new(developer)),
@@ -353,6 +373,7 @@ impl Book {
             resume_spec: std::sync::Mutex::new(None),
             prompts: Default::default(),
             profiles: vec![],
+            explorer_tools: vec![],
             sessions: AtomicU64::new(1),
         }
     }
@@ -423,6 +444,23 @@ impl Recipes for Book {
             .with_budget(self.main_context_tokens)
             .with_history(self.resume.lock().unwrap().take().unwrap_or_default()),
         )
+    }
+
+    fn explorer(&self, ticket: TicketId, question: &str) -> Option<Box<dyn Agent>> {
+        if self.explorer_tools.is_empty() {
+            return None;
+        }
+        let system = format!("{EXPLORER_PROMPT}\n{}", self.environment);
+        Some(Box::new(
+            LlmAgent::new(
+                self.binding(Group::Development),
+                system,
+                question.to_string(),
+                self.explorer_tools.clone(),
+                self.session(ticket, Group::Development),
+            )
+            .with_shared_binding(self.developer.clone()),
+        ))
     }
 
     fn spec(&self, ticket: TicketId, order: &str) -> Option<Box<dyn Agent>> {

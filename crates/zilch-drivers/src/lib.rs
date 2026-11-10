@@ -22,6 +22,8 @@ pub const ARCHITECT_TOOLS: &[&str] = &["read_file", "write_file", "edit_file", "
 pub const DEVELOPER_TOOLS: &[&str] = &["read_file", "write_file", "edit_file", "glob", "grep", "git", "bash"];
 /// The spec lane: read the code, write only the documents of the spec directory.
 pub const SPEC_TOOLS: &[&str] = &["read_file", "glob", "grep", "git", "write_doc", "edit_doc", "release_spec"];
+/// Explorers: read-only.
+pub const EXPLORER_TOOLS: &[&str] = &["read_file", "glob", "grep", "git"];
 
 /// Per-process content hashes of files read (stale-edit detection).
 type ReadHashes = Arc<Mutex<HashMap<PathBuf, String>>>;

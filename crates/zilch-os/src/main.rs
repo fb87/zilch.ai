@@ -499,6 +499,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
     if let Some(t) = cfg.main_context_tokens {
         book.main_context_tokens = t;
     }
+    book.explorer_tools = drivers.specs(zilch_drivers::EXPLORER_TOOLS);
     // Prompt overrides and custom subagent profiles from the roles.
     for (g, o) in &cfg.prompts {
         book.prompts.insert(*g, (o.text.clone(), o.replace));

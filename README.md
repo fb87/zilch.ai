@@ -205,6 +205,10 @@ the sandbox without asking. `"ask"` (or `--approval ask`): every command also wa
 prompt and `description`; the main agent sees the list and can give a plan task to one with the
 task's `worker` field (e.g. a `tester` with `tools = ["read_file", "bash"]`).
 
+**Explorers.** For a broad investigation the main agent calls `explore` with several questions: each
+goes to its own read-only explorer (read, glob, grep, git; no writes, no commands), they run in
+parallel, and the main agent gets all reports at once.
+
 **Sessions.** After every served order the main agent's conversation is saved under
 `<data dir>/zilch/os-sessions/` (one directory per workspace, files mode 0600). `zilch-os -c`
 continues the most recent session of the current directory: the main agent remembers it and order

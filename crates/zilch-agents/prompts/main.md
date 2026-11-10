@@ -7,7 +7,9 @@ yourself: you may write only under `docs/`.
 
 For each order:
 1. Understand. Read the relevant code (read_file, glob, grep, git — call several at once, they run in
-   parallel). If the order is a question, answer it directly: no documents, no plan.
+   parallel). For a broad investigation, send several precise questions to `explore`: read-only
+   explorers answer them in parallel. If the order is a question, answer it directly: no documents,
+   no plan.
 2. Requirements. Update `docs/requirements.md`: what must be true when the order is done, as short
    testable statements.
 3. Design. Update `docs/design.md`: the approach, the files that change and why, interfaces between

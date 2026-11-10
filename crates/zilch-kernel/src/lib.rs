@@ -124,6 +124,10 @@ pub trait Recipes: Send + Sync + 'static {
     fn architect(&self, ticket: TicketId, order: &str) -> Box<dyn Agent>;
     /// `context`: what the Developer should know about the whole plan.
     fn developer(&self, ticket: TicketId, task: &PlanTask, context: &str) -> Box<dyn Agent>;
+    /// A read-only explorer that answers one question (None: no explorers).
+    fn explorer(&self, _ticket: TicketId, _question: &str) -> Option<Box<dyn Agent>> {
+        None
+    }
     /// The spec lane's resident agent (None: this kitchen has no spec lane).
     fn spec(&self, _ticket: TicketId, _order: &str) -> Option<Box<dyn Agent>> {
         None
@@ -383,6 +387,9 @@ struct Ticket {
     served: bool,
 }
 
+/// An exploration in progress: (the asker's batch, its parked slot, the questions, the reports).
+type Exploration = (u64, usize, Vec<String>, Vec<Option<String>>);
+
 /// A question waiting for the guest.
 enum Pending {
     /// The plan of this order.
@@ -488,6 +495,10 @@ pub struct Kernel {
     pending_orders: VecDeque<(TicketId, Group, String)>,
     /// Parent of the main agent's token: cancelled only on shutdown.
     session_cancel: CancelToken,
+    /// Explorations in progress: explorer pid → (the agent that asked, which question).
+    explorers: BTreeMap<Pid, (Pid, usize)>,
+    /// Per asking agent: (its batch, its parked slot, the questions, the reports so far).
+    explorations: BTreeMap<Pid, Exploration>,
     acbs: BTreeMap<Pid, Acb>,
     queues: [VecDeque<Pid>; QUEUES],
     idle_workers: usize,
@@ -588,6 +599,8 @@ impl Kernel {
             mains: BTreeMap::new(),
             pending_orders: VecDeque::new(),
             session_cancel: CancelToken::new(),
+            explorers: BTreeMap::new(),
+            explorations: BTreeMap::new(),
             acbs: BTreeMap::new(),
             queues: Default::default(),
             tickets: BTreeMap::new(),
@@ -1029,16 +1042,19 @@ impl Kernel {
             (a.batch, a.batch_cancel.clone(), a.ticket)
         };
         self.set_state(pid, State::Blocked(Block::Io));
-        let exclusive = n > 1 && calls.iter().any(|c| matches!(c, Syscall::Recv | Syscall::SubmitPlan { .. } | Syscall::Serve { .. }));
+        let exclusive = n > 1
+            && calls
+                .iter()
+                .any(|c| matches!(c, Syscall::Recv | Syscall::SubmitPlan { .. } | Syscall::Serve { .. } | Syscall::Explore { .. }));
         for (idx, call) in calls.into_iter().enumerate() {
             self.bus.publish(KernelEvent::SyscallIssued { pid, idx, summary: call.summary() });
             match call {
-                Syscall::Recv | Syscall::SubmitPlan { .. } | Syscall::Serve { .. } if exclusive => {
+                Syscall::Recv | Syscall::SubmitPlan { .. } | Syscall::Serve { .. } | Syscall::Explore { .. } if exclusive => {
                     self.fill(
                         pid,
                         batch,
                         idx,
-                        SyscallResult::Failed("recv, submit_plan and serve must be the only call in their step".into()),
+                        SyscallResult::Failed("recv, submit_plan, serve and explore must be the only call in their step".into()),
                     );
                 }
                 Syscall::Send { to, kind, body } => {
@@ -1059,6 +1075,7 @@ impl Kernel {
                 }
                 Syscall::SubmitPlan { tasks } => self.submit_plan(pid, batch, idx, tasks),
                 Syscall::Serve { summary } => self.serve(pid, batch, idx, summary),
+                Syscall::Explore { questions } => self.explore(pid, batch, idx, questions),
                 call @ (Syscall::Complete(_) | Syscall::Tool { .. }) => {
                     if let Syscall::Tool { name, args, .. } = &call {
                         let access = self.drivers.classify(name, args);
@@ -1314,6 +1331,61 @@ impl Kernel {
         true
     }
 
+    // ── explorations ──
+
+    /// A lane's main agent asks questions: one read-only explorer each, in parallel; the agent waits
+    /// (blocked on its children) and gets all reports at once.
+    fn explore(&mut self, pid: Pid, batch: u64, idx: usize, questions: Vec<String>) {
+        if !self.is_main(pid) {
+            return self.fill(pid, batch, idx, SyscallResult::Failed("only a main agent may send explorers".into()));
+        }
+        let questions: Vec<String> = questions.into_iter().map(|q| q.trim().to_string()).filter(|q| !q.is_empty()).take(8).collect();
+        if questions.is_empty() {
+            return self.fill(pid, batch, idx, SyscallResult::Failed("no questions to explore".into()));
+        }
+        let ticket = self.acbs.get(&pid).map(|a| a.ticket).unwrap_or_default();
+        let cancel = self.tickets.get(&ticket).map(|t| t.cancel.child()).unwrap_or_default();
+        let mut spawned = Vec::new();
+        for (i, q) in questions.iter().enumerate() {
+            let Some(agent) = self.recipes.explorer(ticket, q) else {
+                return self.fill(pid, batch, idx, SyscallResult::Failed("this kitchen has no explorers".into()));
+            };
+            let caps = Caps { write: vec![], write_any: false, exec: false };
+            let title = format!("explore: {}", q.chars().take(50).collect::<String>());
+            let e = self.spawn(agent, Some(pid), ticket, Group::Development, title, caps, cancel.child(), 0);
+            spawned.push((e, i));
+        }
+        for (e, i) in spawned {
+            self.explorers.insert(e, (pid, i));
+        }
+        let n = questions.len();
+        self.explorations.insert(pid, (batch, idx, questions, vec![None; n]));
+        if let Some(a) = self.acbs.get_mut(&pid) {
+            a.parked_slot = Some(idx);
+        }
+        self.set_state(pid, State::Blocked(Block::Child));
+    }
+
+    /// An explorer ended: keep its report; when it was the last one, wake the agent that asked.
+    fn explorer_done(&mut self, pid: Pid, report: &str) {
+        let Some((asker, i)) = self.explorers.remove(&pid) else { return };
+        let Some((batch, _, _, reports)) = self.explorations.get_mut(&asker) else { return };
+        let batch = *batch;
+        reports[i] = Some(report.trim().to_string());
+        if reports.iter().any(Option::is_none) {
+            return;
+        }
+        let (_, _, questions, reports) = self.explorations.remove(&asker).expect("present");
+        let mut digest = String::from("All explorers reported.\n");
+        for (q, r) in questions.iter().zip(reports) {
+            let r: String = r.unwrap_or_default().chars().take(6000).collect();
+            digest.push_str(&format!("\n### {q}\n{r}\n"));
+        }
+        if self.acbs.get(&asker).is_some_and(|a| a.batch == batch) {
+            self.wake_parked(asker, SyscallResult::Output(digest));
+        }
+    }
+
     // ── plans ──
 
     fn submit_plan(&mut self, pid: Pid, batch: u64, idx: usize, tasks: Vec<PlanTask>) {
@@ -1455,6 +1527,7 @@ impl Kernel {
         self.set_state(pid, state);
         self.bus.publish(KernelEvent::Exited { pid, ok: st.ok, report: st.report.clone() });
         self.drivers.release(pid);
+        self.explorer_done(pid, &st.report);
         if let Some(lane) = self.mains.iter().find(|(_, m)| **m == pid).map(|(l, _)| *l) {
             // A lane's resident agent itself ended (exit, kill, budget, crash): its current order
             // ends with its last word; its queued orders cannot be served by it. The lane's next

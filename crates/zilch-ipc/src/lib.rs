@@ -161,6 +161,9 @@ pub enum Syscall {
     /// Main agent only: this order is done — give `summary` to the guest, then sleep until the
     /// next order (the result is that order, as a message).
     Serve { summary: String },
+    /// A lane's main agent: investigate these questions with read-only explorers, one per question,
+    /// in parallel; the result holds every explorer's report.
+    Explore { questions: Vec<String> },
 }
 
 impl Syscall {
@@ -180,6 +183,7 @@ impl Syscall {
             Syscall::Recv => "recv".into(),
             Syscall::SubmitPlan { tasks } => format!("submit_plan ({} tasks)", tasks.len()),
             Syscall::Serve { .. } => "serve".into(),
+            Syscall::Explore { questions } => format!("explore ({} question(s))", questions.len()),
         }
     }
 }

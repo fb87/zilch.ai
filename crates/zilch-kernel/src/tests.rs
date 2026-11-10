@@ -842,3 +842,44 @@ fn with_approval_ask_commands_wait_for_the_guest() {
     assert!(r[0].contains("did not allow"), "{r:?}");
     assert_eq!((r[1].as_str(), r[2].as_str()), ("ok", "ok"));
 }
+
+#[test]
+fn explorers_answer_questions_in_parallel_and_report_together() {
+    let drivers = Arc::new(FakeDrivers::default());
+    struct Explorers;
+    impl Recipes for Explorers {
+        fn architect(&self, _: TicketId, _: &str) -> Box<dyn Agent> {
+            Box::new(Scripted(0, |n, wake, _| match n {
+                1 => StepResult::Syscalls(vec![Syscall::Explore {
+                    questions: vec!["where is X?".into(), "how does Y work?".into(), "  ".into()],
+                }]),
+                _ => StepResult::Exit(ExitStatus::ok(wake[0].text())),
+            }))
+        }
+        fn developer(&self, _: TicketId, _: &PlanTask, _: &str) -> Box<dyn Agent> {
+            unreachable!("no plan here")
+        }
+        fn explorer(&self, _: TicketId, q: &str) -> Option<Box<dyn Agent>> {
+            let q = q.to_string();
+            Some(Box::new(Scripted(0, move |n, _, _| match n {
+                1 => StepResult::Syscalls(vec![tool("work", json!({}))]),
+                _ => StepResult::Exit(ExitStatus::ok(format!("answer to {q}"))),
+            })))
+        }
+    }
+    let bus = Arc::new(EventBus::new());
+    let events = bus.subscribe(10_000);
+    let k = start(cfg(), drivers.clone(), Arc::new(Explorers), bus);
+    let mut run = Run { k, events, seen: vec![] };
+    run.k.send(Cmd::Order("investigate".into()));
+    let (ok, summary) = run.served();
+    assert!(ok, "{summary}");
+    assert!(summary.starts_with("All explorers reported."), "{summary}");
+    assert!(
+        summary.contains("### where is X?\nanswer to where is X?") && summary.contains("### how does Y work?\nanswer to how does Y work?"),
+        "{summary}"
+    );
+    let spans = drivers.spans.lock().unwrap().clone();
+    assert_eq!(spans.len(), 2, "one explorer per non-empty question");
+    assert!(spans[0].1 < spans[1].2 && spans[1].1 < spans[0].2, "the explorers ran at the same time");
+}
