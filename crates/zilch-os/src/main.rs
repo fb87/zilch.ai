@@ -471,6 +471,8 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             Err(e) => return Err(e.into()),
         };
         let input = line.trim();
+        // The order may have ended (cancelled, killed) after this prompt was drawn.
+        let asked = asked.filter(|(_, t)| view.open.lock().unwrap().contains(t));
         if let (Some((qid, _)), false) = (asked, input.starts_with('/')) {
             view.questions.lock().unwrap().retain(|(q, _)| *q != qid);
             kernel.send(Cmd::Answer { qid, text: input.to_string() });
