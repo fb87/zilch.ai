@@ -325,3 +325,33 @@ mod read_tests {
         assert!(all.contains("  1601\tpub fn f1599() {}"));
     }
 }
+
+#[cfg(test)]
+mod repeat_tests {
+    use super::*;
+    use crate::agent::{ApprovalGate, ApprovalMode, AutoApprove, EventSink};
+    use crate::team::file_locks::FileLocks;
+    use crate::tools::search::GrepTool;
+    use crate::tools::CancelCell;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn an_identical_grep_with_the_same_result_is_not_sent_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (0..30).map(|i| format!("fn item_{i}() {{}} // needle\n")).collect();
+        std::fs::write(dir.path().join("a.rs"), &body).unwrap();
+        let gate = Arc::new(ApprovalGate::new(ApprovalMode::Auto, Arc::new(AutoApprove)));
+        let c = ToolCtx::new("t", dir.path().to_path_buf(), gate, EventSink::null(), CancelCell::default(), FileLocks::default());
+        let first = GrepTool.call(json!({"pattern":"needle"}), &c).await.unwrap();
+        assert!(first.contains("a.rs:1:"));
+        let again = GrepTool.call(json!({"pattern":"needle"}), &c).await.unwrap();
+        assert!(again.starts_with("[same result as your earlier identical grep"), "{again}");
+        // Different arguments, or a changed result, are sent for real.
+        assert!(GrepTool.call(json!({"pattern":"needle","case_insensitive":true}), &c).await.unwrap().contains("a.rs:1:"));
+        std::fs::write(dir.path().join("a.rs"), format!("{body}fn extra() {{}} // needle\n")).unwrap();
+        assert!(GrepTool.call(json!({"pattern":"needle"}), &c).await.unwrap().contains("a.rs:31:"));
+        // Short results are always sent (a note would not be shorter).
+        assert_eq!(GrepTool.call(json!({"pattern":"nothing_here"}), &c).await.unwrap(), "No matches");
+        assert_eq!(GrepTool.call(json!({"pattern":"nothing_here"}), &c).await.unwrap(), "No matches");
+    }
+}

@@ -100,6 +100,26 @@ pub struct ToolCtx {
     pub repo_map: Option<Arc<Mutex<crate::repomap::RepoMap>>>,
 }
 
+/// For a tool whose output depends only on its arguments and the files (grep, glob): a short note
+/// when this exact call returned exactly this output before and that output is still in the agent's
+/// context, so it is not sent twice. Shares `ToolCtx::shown` (under a key no real path can have), so it
+/// is forgotten at the same moments: compaction, reset, a rolled-back turn.
+pub fn repeat_note(ctx: &ToolCtx, tool: &str, args: &Value, output: &str) -> Option<String> {
+    if output.len() < 200 {
+        return None; // a note would not be shorter
+    }
+    let key = PathBuf::from(format!("\u{0}{tool}\u{0}{args}"));
+    let hash = sha256(output.as_bytes());
+    let mut shown = ctx.shown.lock().unwrap();
+    if shown.get(&key).is_some_and(|(h, _)| *h == hash) {
+        return Some(format!(
+            "[same result as your earlier identical {tool} call, still above in this conversation: nothing changed. Use that output.]"
+        ));
+    }
+    shown.insert(key, (hash, vec![]));
+    None
+}
+
 /// A file's content hash and the line ranges of it an agent has been shown.
 pub type ShownRanges = (String, Vec<(usize, usize)>);
 
@@ -331,6 +351,7 @@ pub fn worker_tools() -> ToolRegistry {
     r.register(Arc::new(search::GlobTool));
     r.register(Arc::new(search::GrepTool));
     r.register(Arc::new(repomap_tool::RepoMapTool));
+    r.register(Arc::new(repomap_tool::FindDefinition));
     r.register(Arc::new(git::GitTool));
     r.register(Arc::new(bash::Bash));
     r

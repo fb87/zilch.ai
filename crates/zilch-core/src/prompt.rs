@@ -85,7 +85,7 @@ pub fn build(profile: &Profile, env: &PromptEnv) -> String {
 
     if let Some(map) = env.repo_overview {
         parts.push(format!(
-            "## Repository map (taken at session start)\nEvery source directory with its purpose, and each documented file. Start here instead of searching; `repo_map` with a directory or file lists its definitions with line numbers (always current).\n{}",
+            "## Repository map (taken at session start)\nEvery source directory with its purpose and size, and each documented file. Trust it for WHERE code lives: go to the directories and files it names instead of searching the whole tree; `repo_map` on a directory or file lists its definitions with line numbers (always current); `find_definition` finds where a named function or type is defined; grep within those directories for text and usages. Search the whole tree only when the map does not cover the topic. Read the actual lines before relying on details: this overview is a snapshot.\n{}",
             map.trim_end()
         ));
     }

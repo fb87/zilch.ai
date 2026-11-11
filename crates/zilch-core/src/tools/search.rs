@@ -63,6 +63,7 @@ impl Tool for GlobTool {
             Ok(out)
         })
         .await?
+        .map(|s: String| super::repeat_note(ctx, "glob", &args, &s).unwrap_or(s))
     }
 }
 
@@ -140,5 +141,6 @@ impl Tool for GrepTool {
             Ok(s)
         })
         .await?
+        .map(|s: String| super::repeat_note(ctx, "grep", &args, &s).unwrap_or(s))
     }
 }

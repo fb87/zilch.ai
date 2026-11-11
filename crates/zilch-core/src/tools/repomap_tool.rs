@@ -58,3 +58,60 @@ impl Tool for RepoMapTool {
         .map_err(Into::into)
     }
 }
+
+/// Results listed per find_definition call.
+const MAX_DEFINITIONS: usize = 50;
+
+pub struct FindDefinition;
+
+#[async_trait]
+impl Tool for FindDefinition {
+    fn name(&self) -> &str {
+        "find_definition"
+    }
+    fn description(&self) -> String {
+        "Where a function, type, class or constant is defined: `file:line  signature`, exact name first, then \
+         names starting with or containing it. Faster and more precise than grep, which also returns comments, \
+         docs and usages; use grep for text and usages."
+            .into()
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{
+            "name":{"type":"string","description":"The name, e.g. `pick_task_fair` or `Config` (part of a name works too)"},
+            "path":{"type":"string","description":"Only under this directory (default: the whole workspace)"}
+        },"required":["name"]})
+    }
+    fn summarize(&self, args: &Value) -> String {
+        args.get("name").and_then(Value::as_str).unwrap_or("?").to_string()
+    }
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<String> {
+        let name = super::arg_str(&args, "name")?.to_string();
+        let path = arg_opt_str(&args, "path").unwrap_or("").to_string();
+        ctx.resolve_checked(if path.is_empty() { "." } else { &path }, false)?;
+        let shared = ctx.repo_map.clone();
+        let cwd = ctx.cwd.clone();
+        tokio::task::spawn_blocking(move || {
+            let render = |map: &RepoMap| {
+                let (hits, total) = map.find(&name, &path, MAX_DEFINITIONS);
+                if hits.is_empty() {
+                    return format!("No definition named like '{name}'. Try grep (it may be a macro, a generated name, or text).");
+                }
+                let mut s: String = hits.iter().map(|h| format!("{}:{}  {}\n", h.path, h.line, h.sig)).collect();
+                if total > hits.len() {
+                    s.push_str(&format!("[{} more; narrow with a longer name or `path`]\n", total - hits.len()));
+                }
+                s
+            };
+            match shared {
+                Some(m) => {
+                    let mut map = m.lock().unwrap();
+                    map.refresh(&cwd, &path);
+                    render(&map)
+                }
+                None => render(&RepoMap::build(&cwd)),
+            }
+        })
+        .await
+        .map_err(Into::into)
+    }
+}

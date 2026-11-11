@@ -26,6 +26,9 @@ const MAX_ITEMS_PER_FILE: usize = 60;
 pub struct Item {
     pub line: usize,
     pub sig: String,
+    /// The defined name (`pick_task_fair`, `Config`), for find_definition.
+    #[serde(default)]
+    pub name: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -222,7 +225,10 @@ fn scan(lang: Lang, text: &str) -> (Option<String>, Vec<Item>) {
         .lines()
         .enumerate()
         .filter(|(_, l)| re.is_match(l))
-        .map(|(i, l)| Item { line: i + 1, sig: signature(l) })
+        .map(|(i, l)| {
+            let sig = signature(l);
+            Item { line: i + 1, name: item_name(&sig).unwrap_or_default().to_string(), sig }
+        })
         .filter(|it| !it.sig.is_empty())
         .collect();
     (file_doc(lang, text), items)
@@ -803,4 +809,133 @@ fn cache_file(root: &Path) -> Option<PathBuf> {
     let abs = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let key: String = abs.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
     dirs::data_dir().map(|d| d.join("zilch").join("repomap").join(format!("{}.json", key.trim_matches('_'))))
+}
+
+/// The name a definition line defines: the identifier before `(` for functions (C, JS, …), else
+/// the one after the keyword (`struct Config`, `class App`, `impl Foo`, `type T`).
+pub fn item_name(sig: &str) -> Option<&str> {
+    static AFTER: OnceLock<Regex> = OnceLock::new();
+    static CALL: OnceLock<Regex> = OnceLock::new();
+    let after = AFTER.get_or_init(|| {
+        Regex::new(r"\b(?:fn|struct|enum|trait|type|const|static|mod|union|impl(?:<[^>]*>)?|macro_rules!|class|interface|def|function\*?|func(?:\s*\([^)]*\))?|module|record|object|fun|namespace|let|var)\s+([A-Za-z_][\w:.]*)").expect("valid")
+    });
+    let call = CALL.get_or_init(|| Regex::new(r"([A-Za-z_]\w*)\s*\(").expect("valid"));
+    // A function: the identifier right before a `(` (skipping keywords: `pub(crate)`, Go's
+    // `func (receiver)`).
+    const NOT_NAMES: &[&str] = &["pub", "func", "fn", "if", "while", "for", "return", "sizeof", "static", "def", "function"];
+    if let Some(n) = call.captures_iter(sig).filter_map(|c| c.get(1)).map(|m| m.as_str()).find(|n| !NOT_NAMES.contains(n)) {
+        if !sig.contains("impl") {
+            return Some(n);
+        }
+    }
+    if let Some(c) = after.captures(sig) {
+        let n = c.get(1)?.as_str();
+        // `impl Trait for Type`: the type is what is defined.
+        if sig.contains("impl") {
+            if let Some((_, ty)) = sig.split_once(" for ") {
+                return ty.split(|c: char| !(c.is_alphanumeric() || c == '_')).find(|s| !s.is_empty());
+            }
+        }
+        return Some(n.rsplit(['.', ':']).next().unwrap_or(n));
+    }
+    call.captures(sig).and_then(|c| c.get(1)).map(|m| m.as_str())
+}
+
+/// One find_definition hit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Found {
+    pub path: String,
+    pub line: usize,
+    pub sig: String,
+}
+
+impl RepoMap {
+    /// Definitions named `name`: exact matches first, then the same name ignoring case, then names
+    /// starting with it, then names containing it (each group in path order). Under `path` if given.
+    pub fn find(&self, name: &str, path: &str, limit: usize) -> (Vec<Found>, usize) {
+        let name = name.trim();
+        if name.is_empty() {
+            return (vec![], 0);
+        }
+        let path = path.trim().trim_start_matches("./").trim_end_matches('/');
+        let path = if path == "." { "" } else { path };
+        let prefix = if path.is_empty() { String::new() } else { format!("{path}/") };
+        let lower = name.to_lowercase();
+        let mut groups: [Vec<Found>; 4] = Default::default();
+        for f in self.files.iter().filter(|f| path.is_empty() || f.path == path || f.path.starts_with(&prefix)) {
+            for it in &f.items {
+                let n = if it.name.is_empty() { item_name(&it.sig).unwrap_or("") } else { it.name.as_str() };
+                if n.is_empty() {
+                    continue;
+                }
+                let rank = if n == name {
+                    0
+                } else {
+                    let nl = n.to_lowercase();
+                    if nl == lower {
+                        1
+                    } else if nl.starts_with(&lower) {
+                        2
+                    } else if nl.contains(&lower) {
+                        3
+                    } else {
+                        continue;
+                    }
+                };
+                groups[rank].push(Found { path: f.path.clone(), line: it.line, sig: it.sig.clone() });
+            }
+        }
+        let total = groups.iter().map(Vec::len).sum();
+        (groups.into_iter().flatten().take(limit).collect(), total)
+    }
+}
+
+#[cfg(test)]
+mod find_tests {
+    use super::*;
+
+    #[test]
+    fn names_are_taken_from_definitions_in_each_language() {
+        let cases = [
+            ("pub fn verify(t: &str) -> bool", "verify"),
+            ("pub(crate) async fn run_task(&self)", "run_task"),
+            ("struct Inner;", "Inner"),
+            ("impl Inner", "Inner"),
+            ("impl Display for Claims", "Claims"),
+            ("impl<T> Tool for Wrapper<T>", "Wrapper"),
+            ("class Invoice", "Invoice"),
+            ("def total(self)", "total"),
+            ("export async function handler(req)", "handler"),
+            ("export const LIMIT", "LIMIT"),
+            ("func (s *Server) Serve(l net.Listener) error", "Serve"),
+            ("function M.send(text)", "send"),
+            ("static struct task_struct *pick_task_fair(struct rq *rq)", "pick_task_fair"),
+            ("int ext4_mb_new_blocks(handle_t *handle, struct ext4_allocation_request *ar, int *errp)", "ext4_mb_new_blocks"),
+        ];
+        for (sig, want) in cases {
+            assert_eq!(item_name(sig), Some(want), "{sig}");
+        }
+    }
+
+    #[test]
+    fn find_ranks_exact_then_case_then_prefix_then_substring() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        std::fs::create_dir_all(r.join("kernel/sched")).unwrap();
+        std::fs::create_dir_all(r.join("drivers")).unwrap();
+        std::fs::write(
+            r.join("kernel/sched/fair.c"),
+            "static struct task_struct *pick_task_fair(struct rq *rq)\n{\n}\nvoid pick_task_fair_helper(void)\n{\n}\n",
+        )
+        .unwrap();
+        std::fs::write(r.join("drivers/x.c"), "int do_pick_task_fair(void)\n{\n}\nint Pick_Task_Fair(void)\n{\n}\n").unwrap();
+        let map = RepoMap::build(r);
+        let (hits, total) = map.find("pick_task_fair", "", 50);
+        let got: Vec<(&str, usize)> = hits.iter().map(|h| (h.path.as_str(), h.line)).collect();
+        assert_eq!(total, 4);
+        assert_eq!(got, [("kernel/sched/fair.c", 1), ("drivers/x.c", 4), ("kernel/sched/fair.c", 4), ("drivers/x.c", 1)]);
+        let (hits, _) = map.find("pick_task_fair", "kernel", 50);
+        assert!(hits.iter().all(|h| h.path.starts_with("kernel/")));
+        assert_eq!(map.find("pick", "", 2).0.len(), 2, "capped");
+    }
 }
