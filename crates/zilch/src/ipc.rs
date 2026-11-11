@@ -141,6 +141,10 @@ impl Drop for IpcGuard {
         // Only remove the pointer while it still names us.
         if std::fs::read_to_string(&self.pointer).is_ok_and(|p| p.trim() == self.endpoint) {
             let _ = std::fs::remove_file(&self.pointer);
+            // And `.zilch/` itself, unless something else lives there (remove_dir needs it empty).
+            if let Some(dir) = self.pointer.parent() {
+                let _ = std::fs::remove_dir(dir);
+            }
         }
     }
 }

@@ -28,8 +28,9 @@ pub fn explore_spec() -> ToolSpec {
     ToolSpec::new(
         "explore",
         "Investigate several questions at once: each goes to its own read-only explorer and they run in parallel. \
-         Returns every explorer's report. Use it for broad investigations (where is X handled, how does Y work) \
-         instead of reading many files yourself; ask precise, independent questions (at most 8).",
+         Returns every explorer's report. Only for a broad investigation across code you have not seen (where is X \
+         handled, how does Y work in a large project); a few files are cheaper to read yourself, and a question \
+         answerable from the conversation needs no tools. Ask precise, independent questions (at most 8).",
         json!({"type":"object","properties":{"questions":{"type":"array","items":{"type":"string"}}},"required":["questions"]}),
     )
 }
@@ -38,7 +39,7 @@ pub fn explore_spec() -> ToolSpec {
 pub fn submit_plan_spec() -> ToolSpec {
     ToolSpec::new(
         "submit_plan",
-        "Submit the implementation plan. The guest reviews it; once approved, every task runs on its own developer \
+        "Only for a change to the project (never to answer a question). Submit the implementation plan. The guest reviews it; once approved, every task runs on its own developer \
          (independent tasks in parallel). Returns when all tasks finished, with each developer's report — or the \
          guest's feedback / rejection.",
         json!({"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object","properties":{
@@ -409,13 +410,25 @@ impl Book {
             format!("\nSubagent profiles a task can name in `worker` (default: developer):{list}")
         };
         match group {
-            Group::Architecture if !self.spec_dir.is_empty() => format!(
-                "{main}{profiles}\nThe spec lane keeps the agreed specification in {dir}: when {dir}/design.md and {dir}/plan.md exist, they are the design and plan to work from (read them; do not edit them).\n{}",
-                self.environment,
-                dir = self.spec_dir
-            ),
+            // Mention the spec lane's design and plan only when they exist, so the main agent does not go
+            // looking for them on every order.
+            Group::Architecture
+                if !self.spec_dir.is_empty()
+                    && ["design.md", "plan.md"].iter().any(|f| std::path::Path::new(&self.spec_dir).join(f).is_file()) =>
+            {
+                format!(
+                    "{main}{profiles}\nThe spec lane has written {dir}/design.md and {dir}/plan.md. When an order asks to build from the spec or the plan, read them and work from them (do not edit them); otherwise ignore them.\n{}",
+                    self.environment,
+                    dir = self.spec_dir
+                )
+            }
             Group::Architecture => format!("{main}{profiles}\n{}", self.environment),
-            Group::Spec => format!("{}\n- Spec directory: {}\n{}", with_override(SPEC_PROMPT, self.prompts.get(&Group::Spec)), self.spec_dir, self.environment),
+            Group::Spec => format!(
+                "{}\n- Spec directory: {}\n{}",
+                with_override(SPEC_PROMPT, self.prompts.get(&Group::Spec)),
+                self.spec_dir,
+                self.environment
+            ),
             _ => format!("{}\n{}", with_override(DEVELOPER_PROMPT, self.prompts.get(&Group::Development)), self.environment),
         }
     }
