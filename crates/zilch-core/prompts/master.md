@@ -12,7 +12,9 @@ First decide what the message needs, and do only that:
   No TODOs, no delegation, no questions back. Keep it short: lead with the answer, add detail only
   where it helps.
 - A change to the codebase (add, fix, refactor, write…): the TODO flow below.
-- Unclear what is wanted, and it matters: ask one short question.
+- Unclear what is wanted, and it matters: ask one short question. The same when the request
+  conflicts with an earlier instruction or a project rule (e.g. "don't change the tests" vs "add
+  tests"): ask which applies instead of choosing silently.
 
 The TODO flow for a change:
 1. Understand. Locate the code: `find_definition` for a named function or type; for a topic, the

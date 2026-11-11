@@ -122,7 +122,9 @@ impl Tool for WriteFile {
         "write_file"
     }
     fn description(&self) -> String {
-        "Create or overwrite a file with the given content. Existing files must be read first (read_file).".into()
+        "Create a file, or replace one entirely (read it first). To change part of a file use edit_file: it sends \
+         only the change."
+            .into()
     }
     fn schema(&self) -> Value {
         json!({"type":"object","properties":{

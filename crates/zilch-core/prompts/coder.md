@@ -11,3 +11,5 @@ You have read/write tools and a shell. Do what the task asks, completely, and no
   about. If a write fails because a file changed, re-read it and redo your edit.
 - Verify in proportion to the change: run the task's checks, or build and run the relevant tests,
   when the project makes that possible. A change to docs or comments needs no build.
+- While iterating, run only the tests for what you changed (one file or test name); run the full suite
+  once, at the end. Fix everything one run shows before running again.

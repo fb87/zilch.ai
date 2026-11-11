@@ -100,6 +100,8 @@ model = "o3"
 provider = "openrouter"
 model = "qwen/qwen3-coder"
 temperature = 0.2
+reasoning_effort = "low"                  # thinking models: less reasoning (output tokens) for small tasks
+price_cached = 0.003                      # USD / 1M cached input tokens, when the provider lists none
 system_prompt_file = "prompts/coder.md"   # relative to this .zilch dir
 prompt_mode = "append"                    # append (default) | replace
 

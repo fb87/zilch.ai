@@ -433,7 +433,7 @@ impl RepoMap {
         let deepest = self.files.iter().map(|f| parent(&f.path).matches('/').count() + 1).max().unwrap_or(1);
         let total_lines: usize = self.files.iter().map(|f| f.lines).sum();
         let project = self.dir_docs.get("").map(|d| format!("Project: {d}\n")).unwrap_or_default();
-        let head = format!("{project}{} source files, {} lines.\n", self.files.len(), fmt_lines(total_lines));
+        let head = format!("{project}{} source files, {} lines.\n", self.files.len(), approx_lines(total_lines));
         // Richest first: every directory with a line per documented file; else directories only,
         // opened where the code is.
         // (A line per file cannot fit when there are more files than budget/20 characters each.)
@@ -484,7 +484,7 @@ impl RepoMap {
                 // Sorted right after the directory's listed children.
                 return (
                     format!("{d}/\u{10ffff}"),
-                    format!("{d}/… {} more: {}{more} ({files} files, {} lines)\n", rest.len(), some.join(", "), fmt_lines(lines)),
+                    format!("{d}/… {} more: {}{more} ({files} files, {} lines)\n", rest.len(), some.join(", "), approx_lines(lines)),
                 );
             }
             let (dir, files, lines, names): (&str, usize, usize, Vec<&str>) = match e {
@@ -510,7 +510,7 @@ impl RepoMap {
                 }
                 None => String::new(),
             };
-            (dir.to_string(), format!("{shown}{what} ({files} files, {} lines)\n", fmt_lines(lines)))
+            (dir.to_string(), format!("{shown}{what} ({files} files, {} lines)\n", approx_lines(lines)))
         };
         let open = |dir: &str| -> Vec<Entry> {
             let mut v: Vec<Entry> = kids.get(dir).into_iter().flatten().cloned().map(Entry::Tree).collect();
@@ -636,7 +636,7 @@ impl RepoMap {
                     Some(d) => format!(" — {d}"),
                     None => String::new(),
                 };
-                out.push_str(&format!("{shown}{dir_line} ({files} files, {} lines)\n", fmt_lines(*lines)));
+                out.push_str(&format!("{shown}{dir_line} ({files} files, {} lines)\n", approx_lines(*lines)));
                 for f in here.iter().filter(|f| f.doc.is_some()) {
                     let name = f.path.rsplit('/').next().unwrap_or(&f.path);
                     out.push_str(&format!("  {name} — {}\n", f.doc.as_deref().unwrap_or_default()));
@@ -646,7 +646,7 @@ impl RepoMap {
                 }
                 continue;
             }
-            out.push_str(&format!("{shown}{what} ({files} files, {} lines)\n", fmt_lines(*lines)));
+            out.push_str(&format!("{shown}{what} ({files} files, {} lines)\n", approx_lines(*lines)));
         }
         out
     }
@@ -713,6 +713,20 @@ fn clip(s: String, max: usize) -> String {
     }
     let end = s[..cut].rfind('\n').unwrap_or(cut);
     format!("{}\n… (cut; ask repo_map for a narrower path)", &s[..end])
+}
+
+/// Sizes in the overview (the lead agents' system prompt) are rounded, so ordinary edits leave the
+/// prompt unchanged and the provider's cached prefix valid across sessions: one significant digit
+/// below 10k (43 → "~40", 187 → "~200", 4 123 → "~4k"), two above (15 234 → "~15k").
+fn approx_lines(n: usize) -> String {
+    if n < 10 {
+        return n.to_string();
+    }
+    let digits = n.to_string().len() as u32;
+    let keep = if n < 10_000 { 1 } else { 2 };
+    let unit = 10usize.pow(digits - keep);
+    let rounded = (n + unit / 2) / unit * unit;
+    format!("~{}", if rounded >= 1000 { format!("{}k", rounded / 1000) } else { rounded.to_string() })
 }
 
 fn fmt_lines(n: usize) -> String {
@@ -963,5 +977,23 @@ mod find_tests {
         let (hits, _) = map.find("pick_task_fair", "kernel", 50);
         assert!(hits.iter().all(|h| h.path.starts_with("kernel/")));
         assert_eq!(map.find("pick", "", 2).0.len(), 2, "capped");
+    }
+}
+
+#[cfg(test)]
+mod approx_tests {
+    use super::*;
+
+    #[test]
+    fn overview_sizes_are_rounded_so_small_edits_keep_the_prompt() {
+        assert_eq!(approx_lines(7), "7");
+        assert_eq!(approx_lines(43), "~40");
+        assert_eq!(approx_lines(46), "~50");
+        assert_eq!(approx_lines(187), "~200");
+        assert_eq!(approx_lines(4_123), "~4k");
+        assert_eq!(approx_lines(15_234), "~15k");
+        assert_eq!(approx_lines(2_217_000), "~2200k");
+        // Adding a few lines to a 4k-line directory does not change its overview line.
+        assert_eq!(approx_lines(4_123), approx_lines(4_190));
     }
 }

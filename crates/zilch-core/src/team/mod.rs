@@ -406,7 +406,13 @@ impl Team {
             },
         });
         // The map from the disk cache if there is one (refreshed in the background below), else a scan.
-        let (repo_map, from_cache) = crate::repomap::RepoMap::load_or_build(&cfg.cwd);
+        let (mut repo_map, from_cache) = crate::repomap::RepoMap::load_or_build(&cfg.cwd);
+        if from_cache {
+            // Bring the cached map up to date before taking the overview: an overview from before the
+            // last session's edits would change in the session after this one, a full-prefix cache
+            // miss for the provider. (Only changed files are read: milliseconds for most trees.)
+            repo_map.refresh(&cfg.cwd, "");
+        }
         let shared = Arc::new(TeamShared {
             pool: WorkerPool::new(cfg.max_workers),
             providers,
@@ -439,15 +445,13 @@ impl Team {
         });
 
         if from_cache {
-            // Bring the cached map up to date (only changed files are read) without delaying startup.
+            // Save the refreshed map in the background (a large tree's cache takes a moment to write).
             let (map, cwd) = (shared.repo_map.clone(), shared.cfg.cwd.clone());
             std::thread::Builder::new()
                 .name("zilch-repomap".into())
                 .spawn(move || {
-                    let mut fresh = map.lock().unwrap().clone();
-                    fresh.refresh(&cwd, "");
-                    fresh.save(&cwd);
-                    *map.lock().unwrap() = fresh;
+                    let snapshot = map.lock().unwrap().clone();
+                    snapshot.save(&cwd);
                 })
                 .ok();
         }
