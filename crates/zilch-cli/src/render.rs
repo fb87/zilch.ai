@@ -733,21 +733,32 @@ impl Screen {
 
     pub fn usage_report(&self) -> String {
         let mut s = String::new();
-        let (mut pi, mut co) = (0, 0);
+        let (mut pi, mut co, mut ca) = (0, 0, 0);
         let mut total_cost: Option<f64> = None;
         for ((agent, model), u) in &self.usage {
             let cost = self.cost.get(&(agent.clone(), model.clone())).copied();
             let c = cost.map_or("      ?".to_string(), |c| format!("${c:>8.4}"));
-            s.push_str(&format!("  {agent:<14} {model:<36} in {:>8}  out {:>7}  {c}\n", u.prompt_tokens, u.completion_tokens));
+            s.push_str(&format!(
+                "  {agent:<14} {model:<36} in {:>8} ({})  out {:>7}  {c}\n",
+                u.prompt_tokens,
+                cached_share(u.cached_tokens, u.prompt_tokens),
+                u.completion_tokens
+            ));
             pi += u.prompt_tokens;
             co += u.completion_tokens;
+            ca += u.cached_tokens;
             if let Some(c) = cost {
                 *total_cost.get_or_insert(0.0) += c;
             }
         }
         let tc = total_cost.map_or("(prices unknown)".to_string(), |c| format!("${c:>8.4}"));
-        s.push_str(&format!("  {:<51} in {pi:>8}  out {co:>7}  {tc}", "total"));
+        s.push_str(&format!("  {:<51} in {pi:>8} ({})  out {co:>7}  {tc}", "total", cached_share(ca, pi)));
         s
+    }
+
+    /// Cached prompt tokens across all agents (what the providers served from their prompt caches).
+    pub fn total_cached(&self) -> u64 {
+        self.usage.values().map(|u| u.cached_tokens).sum()
     }
 
     pub fn total_tokens(&self) -> (u64, u64) {
@@ -918,6 +929,15 @@ impl Write for PrinterOut {
     fn flush(&mut self) -> std::io::Result<()> {
         // Partial lines (streaming text) are kept until their newline arrives.
         Ok(())
+    }
+}
+
+/// "62% cached" (or "no cache hits" / "cache not reported" when nothing was served from a cache).
+pub fn cached_share(cached: u64, prompt: u64) -> String {
+    match (cached, prompt) {
+        (_, 0) => "-".into(),
+        (0, _) => "0% cached".into(),
+        (c, p) => format!("{}% cached", (c * 100 / p).min(100)),
     }
 }
 

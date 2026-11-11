@@ -109,8 +109,15 @@ pub fn parse_chunk(data: &str) -> anyhow::Result<Option<Vec<LlmEvent>>> {
             events.push(LlmEvent::Finish(r.to_string()));
         }
     }
-    if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-        if let Ok(u) = serde_json::from_value::<Usage>(u.clone()) {
+    if let Some(raw) = v.get("usage").filter(|u| !u.is_null()) {
+        if let Ok(mut u) = serde_json::from_value::<Usage>(raw.clone()) {
+            // OpenAI and most compatible providers: prompt_tokens_details.cached_tokens; DeepSeek:
+            // prompt_cache_hit_tokens.
+            u.cached_tokens = raw["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .or_else(|| raw["prompt_cache_hit_tokens"].as_u64())
+                .unwrap_or(0)
+                .min(u.prompt_tokens);
             events.push(LlmEvent::Usage(u));
         }
     }
@@ -159,5 +166,25 @@ mod tests {
             matches!(&ev[1], LlmEvent::ToolCallDelta { index: 0, id: Some(id), name: Some(n), args } if id == "c1" && n == "read_file" && args == "{\"pa")
         );
         assert!(parse_chunk("[DONE]").unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn usage(payload: &str) -> Usage {
+        let evs = parse_chunk(payload).unwrap().unwrap();
+        evs.into_iter().find_map(|e| if let LlmEvent::Usage(u) = e { Some(u) } else { None }).expect("usage")
+    }
+
+    #[test]
+    fn cached_prompt_tokens_are_read_from_openai_and_deepseek_usage() {
+        let openai = r#"{"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":768}}}"#;
+        assert_eq!(usage(openai).cached_tokens, 768);
+        let deepseek = r#"{"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":5,"prompt_cache_hit_tokens":900}}"#;
+        assert_eq!(usage(deepseek).cached_tokens, 900);
+        let none = r#"{"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":5}}"#;
+        assert_eq!(usage(none).cached_tokens, 0);
     }
 }

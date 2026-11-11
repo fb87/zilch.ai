@@ -39,7 +39,7 @@ impl Protocol {
     }
 
     pub fn parser(self) -> StreamParser {
-        StreamParser { protocol: self, input_tokens: 0, done: false, tool_index: HashMap::new() }
+        StreamParser { protocol: self, input_tokens: 0, cached_tokens: 0, done: false, tool_index: HashMap::new() }
     }
 }
 
@@ -141,6 +141,11 @@ fn anthropic_body(req: &ChatRequest) -> Value {
             ),
         }
     }
+    // Prompt caching: Anthropic caches only up to blocks marked `cache_control`. Mark the end of the
+    // conversation so the next request (which extends it) reads everything up to here from the cache.
+    if let Some(last) = msgs.last_mut().and_then(|(_, blocks)| blocks.last_mut()) {
+        last["cache_control"] = json!({"type": "ephemeral"});
+    }
     let messages: Vec<Value> = msgs.into_iter().map(|(role, content)| json!({"role": role, "content": content})).collect();
     let mut body = json!({
         "model": req.binding.model,
@@ -149,16 +154,20 @@ fn anthropic_body(req: &ChatRequest) -> Value {
         "max_tokens": req.binding.max_tokens.unwrap_or(8192),
     });
     let obj = body.as_object_mut().expect("object");
+    // The system prompt and the tool definitions are the same on every call: cache them too.
     let sys = system_text(req);
     if !sys.is_empty() {
-        obj.insert("system".into(), sys.into());
+        obj.insert("system".into(), json!([{"type": "text", "text": sys, "cache_control": {"type": "ephemeral"}}]));
     }
     if !req.tools.is_empty() {
-        let tools: Vec<Value> = req
+        let mut tools: Vec<Value> = req
             .tools
             .iter()
             .map(|t| json!({"name": t.function.name, "description": t.function.description, "input_schema": t.function.parameters}))
             .collect();
+        if let Some(last) = tools.last_mut() {
+            last["cache_control"] = json!({"type": "ephemeral"});
+        }
         obj.insert("tools".into(), tools.into());
     }
     insert_common(obj, req, "max_tokens");
@@ -171,6 +180,8 @@ fn anthropic_body(req: &ChatRequest) -> Value {
 pub struct StreamParser {
     protocol: Protocol,
     input_tokens: u64,
+    /// Anthropic: input tokens read from the prompt cache (part of `input_tokens`).
+    cached_tokens: u64,
     done: bool,
     /// Responses: output_index → our tool-call index.
     tool_index: HashMap<u64, usize>,
@@ -225,6 +236,7 @@ impl StreamParser {
                 out.push(LlmEvent::Usage(Usage {
                     prompt_tokens: u["input_tokens"].as_u64().unwrap_or(0),
                     completion_tokens: u["output_tokens"].as_u64().unwrap_or(0),
+                    cached_tokens: u["input_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
                 }));
                 out.push(LlmEvent::Finish(v["response"]["status"].as_str().unwrap_or("completed").to_string()));
                 self.done = true;
@@ -246,6 +258,7 @@ impl StreamParser {
                 self.input_tokens = v["message"]["usage"]["input_tokens"].as_u64().unwrap_or(0)
                     + v["message"]["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0)
                     + v["message"]["usage"]["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                self.cached_tokens = v["message"]["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0);
             }
             "content_block_start" => {
                 let b = &v["content_block"];
@@ -277,6 +290,7 @@ impl StreamParser {
                 out.push(LlmEvent::Usage(Usage {
                     prompt_tokens: self.input_tokens,
                     completion_tokens: v["usage"]["output_tokens"].as_u64().unwrap_or(0),
+                    cached_tokens: self.cached_tokens,
                 }));
                 if let Some(r) = v["delta"]["stop_reason"].as_str() {
                     out.push(LlmEvent::Finish(r.to_string()));
@@ -342,8 +356,13 @@ mod tests {
     #[test]
     fn anthropic_body_shape() {
         let b = Protocol::Anthropic.body(&req());
-        assert_eq!(b["system"], "SYS");
+        assert_eq!(b["system"][0]["text"], "SYS");
         assert_eq!(b["max_tokens"], 100);
+        // Cache breakpoints: the system prompt, the last tool, the last block of the conversation.
+        assert_eq!(b["system"][0]["cache_control"]["type"], "ephemeral");
+        let tools = b["tools"].as_array().unwrap();
+        assert_eq!(tools.last().unwrap()["cache_control"]["type"], "ephemeral");
+        assert!(tools[..tools.len() - 1].iter().all(|t| t.get("cache_control").is_none()));
         let m = b["messages"].as_array().unwrap();
         let roles: Vec<&str> = m.iter().map(|x| x["role"].as_str().unwrap()).collect();
         assert_eq!(roles, vec!["user", "assistant", "user"], "alternating, tool results merged with next user text");
@@ -353,6 +372,8 @@ mod tests {
         assert_eq!(m[2]["content"][0]["type"], "tool_result");
         assert_eq!(m[2]["content"][1]["content"], "(empty)");
         assert_eq!(m[2]["content"][2]["text"], "next");
+        assert_eq!(m[2]["content"][2]["cache_control"]["type"], "ephemeral");
+        assert!(m[2]["content"][0].get("cache_control").is_none() && m[0]["content"][0].get("cache_control").is_none());
         assert_eq!(b["tools"][0]["input_schema"]["type"], "object");
     }
 
@@ -397,14 +418,14 @@ mod tests {
                 r#"{"type":"response.function_call_arguments.delta","output_index":2,"delta":"{\"pattern\""}"#,
                 r#"{"type":"response.function_call_arguments.delta","output_index":2,"delta":":\"*.rs\"}"}"#,
                 r#"{"type":"response.output_item.added","output_index":3,"item":{"type":"function_call","name":"grep","call_id":"call_2","arguments":"{}"}}"#,
-                r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":50,"output_tokens":7}}}"#,
+                r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":50,"output_tokens":7,"input_tokens_details":{"cached_tokens":32}}}}"#,
             ],
         );
         assert_eq!(m.text(), "Calling glob.");
         assert_eq!(m.tool_calls.len(), 2);
         assert_eq!((m.tool_calls[0].id.as_str(), m.tool_calls[0].function.arguments.as_str()), ("call_1", "{\"pattern\":\"*.rs\"}"));
         assert_eq!(m.tool_calls[1].function.name, "grep");
-        assert_eq!((u.prompt_tokens, u.completion_tokens), (50, 7));
+        assert_eq!((u.prompt_tokens, u.completion_tokens, u.cached_tokens), (50, 7, 32));
     }
 
     #[test]
@@ -426,7 +447,7 @@ mod tests {
         );
         assert_eq!(m.text(), "Let me look");
         assert_eq!((m.tool_calls[0].id.as_str(), m.tool_calls[0].function.arguments.as_str()), ("toolu_1", "{\"path\":\"a.rs\"}"));
-        assert_eq!((u.prompt_tokens, u.completion_tokens), (40, 12));
+        assert_eq!((u.prompt_tokens, u.completion_tokens, u.cached_tokens), (40, 12, 10));
     }
 
     #[test]

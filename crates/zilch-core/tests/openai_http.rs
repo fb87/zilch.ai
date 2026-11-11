@@ -157,7 +157,7 @@ async fn anthropic_protocol_over_http() {
         .and(path("/v1/messages"))
         .and(header("x-api-key", "ak"))
         .and(header("anthropic-version", "2023-06-01"))
-        .and(body_partial_json(serde_json::json!({"model":"claude-x","stream":true,"system":"S","max_tokens":8192})))
+        .and(body_partial_json(serde_json::json!({"model":"claude-x","stream":true,"system":[{"type":"text","text":"S","cache_control":{"type":"ephemeral"}}],"max_tokens":8192})))
         .respond_with(ResponseTemplate::new(200).set_body_string(body))
         .expect(1)
         .mount(&s)

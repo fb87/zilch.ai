@@ -164,12 +164,20 @@ pub struct Usage {
     pub prompt_tokens: u64,
     #[serde(default)]
     pub completion_tokens: u64,
+    /// Of `prompt_tokens`, how many the provider served from its prompt cache (0 if unreported).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cached_tokens: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl std::ops::AddAssign for Usage {
     fn add_assign(&mut self, o: Self) {
         self.prompt_tokens += o.prompt_tokens;
         self.completion_tokens += o.completion_tokens;
+        self.cached_tokens += o.cached_tokens;
     }
 }
 

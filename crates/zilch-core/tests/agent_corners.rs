@@ -131,7 +131,7 @@ async fn caps_refuse_before_sending_and_costs_are_recorded() {
     let mut b = agent(
         dir.path(),
         vec![Some(vec![
-            LlmEvent::Usage(zilch_core::llm::Usage { prompt_tokens: 1500, completion_tokens: 10 }),
+            LlmEvent::Usage(zilch_core::llm::Usage { prompt_tokens: 1500, completion_tokens: 10, ..Default::default() }),
             LlmEvent::TextDelta("ok".into()),
         ])],
     );

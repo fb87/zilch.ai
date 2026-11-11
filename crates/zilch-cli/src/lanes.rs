@@ -93,7 +93,11 @@ impl Dispatcher {
         }
         let me = self.clone();
         let handle = tokio::spawn(async move {
-            let (before_in, before_out) = me.screen.lock().await.total_tokens();
+            let (before_in, before_out, before_cached) = {
+                let s = me.screen.lock().await;
+                let (i, o) = s.total_tokens();
+                (i, o, s.total_cached())
+            };
             let res = match lane {
                 Lane::Code => me.team.run(&text).await,
                 Lane::Spec => me.team.run_spec(&text).await,
@@ -102,11 +106,13 @@ impl Dispatcher {
             tokio::time::sleep(std::time::Duration::from_millis(30)).await;
             let mut s = me.screen.lock().await;
             let (i, o) = s.total_tokens();
+            let cached = s.total_cached() - before_cached;
+            let cached = if cached > 0 { format!(" ({cached} cached)") } else { String::new() };
             let msg = match res {
                 Ok(_) if s.active == lane.root() => {
                     let cost = s.total_cost().map(|c| format!(" · session ${c:.4}")).unwrap_or_default();
                     format!(
-                        "{}↳ {} · +{} in / +{} out tokens{cost}{}",
+                        "{}↳ {} · +{} in{cached} / +{} out tokens{cost}{}",
                         s.c(DIM),
                         if s.color { lane.icon() } else { lane.name() },
                         i - before_in,

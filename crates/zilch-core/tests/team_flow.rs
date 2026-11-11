@@ -364,7 +364,7 @@ async fn a_high_cost_model_in_use_too_long_alerts_until_acknowledged_or_switched
     let price = |o: f64| ModelInfo { context: None, input_per_mtok: Some(1.0), output_per_mtok: Some(o) };
     team.set_catalog([("openai/opus-big".to_string(), price(75.0)), ("openai/cheap".to_string(), price(0.5))].into());
     let meter = &team.shared.meter;
-    let small = Usage { prompt_tokens: 1000, completion_tokens: 100 };
+    let small = Usage { prompt_tokens: 1000, completion_tokens: 100, ..Default::default() };
 
     // A cheap model never alerts, however long it is used.
     team.set_model("master", Some("cheap"), None).unwrap();
@@ -384,7 +384,7 @@ async fn a_high_cost_model_in_use_too_long_alerts_until_acknowledged_or_switched
     // /ack silences it until the next step (another 30 minutes, or $2 spent).
     assert_eq!(team.ack_cost_alerts(), 1);
     assert!(team.cost_alerts().is_empty());
-    meter.record("openai/opus-big", &Usage { prompt_tokens: 0, completion_tokens: 30_000 }); // $2.25
+    meter.record("openai/opus-big", &Usage { prompt_tokens: 0, completion_tokens: 30_000, ..Default::default() }); // $2.25
     assert_eq!(team.cost_alerts().len(), 1, "spending past $2 alerts again");
     team.ack_cost_alerts();
 

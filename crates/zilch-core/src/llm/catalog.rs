@@ -168,11 +168,11 @@ mod tests {
             .write()
             .unwrap()
             .insert("p/m".into(), ModelInfo { context: None, input_per_mtok: Some(2.0), output_per_mtok: Some(10.0) });
-        let c = m.record("p/m", &Usage { prompt_tokens: 1000, completion_tokens: 500 }).unwrap();
+        let c = m.record("p/m", &Usage { prompt_tokens: 1000, completion_tokens: 500, ..Default::default() }).unwrap();
         assert!((c - 0.007).abs() < 1e-9);
         assert!(!m.would_exceed("p/m", 1000)); // +0.002 → 0.009
         assert!(m.would_exceed("p/m", 2000)); // +0.004 → 0.011
-        assert!(m.record("unknown/model", &Usage { prompt_tokens: 5, completion_tokens: 5 }).is_none());
+        assert!(m.record("unknown/model", &Usage { prompt_tokens: 5, completion_tokens: 5, ..Default::default() }).is_none());
         assert!(!CostMeter::new(None).would_exceed("p/m", u64::MAX));
     }
 }
