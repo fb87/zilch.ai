@@ -70,7 +70,7 @@ pub fn build(profile: &Profile, env: &PromptEnv) -> String {
     );
 
     let mut envs = format!(
-        "## Environment\n- Agent id: {{{{agent_id}}}}\n- Working directory: {{{{cwd}}}}\n- OS: {{{{os}}}}\n- Date: {{{{date}}}}\n- Model: {}\n- Your tools: {{{{tools}}}}",
+        "## Environment\n- Working directory: {{{{cwd}}}}\n- OS: {{{{os}}}}\n- Date: {{{{date}}}}\n- Model: {}\n- Your tools: {{{{tools}}}}",
         profile.binding.model
     );
     if profile.role == AgentRole::Master {
@@ -217,7 +217,8 @@ mod tests {
         let tools = vec!["read_file".to_string()];
         let w = vec![("coder".to_string(), "writes code".to_string())];
         let p = build(&profile(AgentRole::Worker, None, PromptMode::Append), &env(&tools, &w));
-        assert!(p.contains("DEFAULT PROMPT") && p.contains("STATUS: done") && p.contains("coder#1") && p.contains("read_file"));
+        assert!(p.contains("DEFAULT PROMPT") && p.contains("STATUS: done") && p.contains("read_file"));
+        assert!(!p.contains("coder#1"), "no instance id: every instance of a profile shares one cacheable prompt");
         assert!(p.contains("m1"));
 
         let p = build(&profile(AgentRole::Worker, Some("EXTRA"), PromptMode::Append), &env(&tools, &w));

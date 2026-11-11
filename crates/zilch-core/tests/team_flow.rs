@@ -169,11 +169,12 @@ async fn master_plans_and_workers_run_in_parallel() {
             assert!(m.tool_calls.iter().all(|c| !["write_file", "edit_file", "bash"].contains(&c.function.name.as_str())));
         }
     }
-    // Each worker instance got its own composed system prompt (coder default + contract + its id).
+    // Every worker instance got the composed coder prompt (default + contract), the same for all, so
+    // they share the provider's prompt cache (the instance id is not in it).
     let sys: Vec<String> =
         reqs.iter().filter(|r| !r.messages[0].text().contains("MASTER")).map(|r| r.messages[0].text().to_string()).collect();
     assert!(sys.iter().all(|s| s.contains("You are a CODER") && s.contains("STATUS: done | failed")));
-    assert!(sys.iter().any(|s| s.contains("coder#1")) && sys.iter().any(|s| s.contains("coder#2")));
+    assert!(sys.windows(2).all(|w| w[0] == w[1]) && !sys[0].contains("coder#"));
 }
 
 #[tokio::test]
@@ -393,4 +394,50 @@ async fn a_high_cost_model_in_use_too_long_alerts_until_acknowledged_or_switched
     assert_eq!(team.cost_alerts().len(), 1);
     team.set_model("master", None, None).unwrap();
     assert!(team.cost_alerts().is_empty());
+}
+
+/// Two instances of the same worker profile send the same system prompt and tools, so a
+/// provider's prompt cache built by one serves the other. Run with --nocapture to see the size of
+/// every tool definition the master and the workers send.
+#[tokio::test]
+async fn instances_of_a_profile_share_their_prompt_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let script: Box<Script> = Box::new(|req| {
+        if !req.messages[0].text().contains("MASTER") {
+            return worker_script(req);
+        }
+        match assistant_turns(req) {
+            0 => vec![call(
+                "c0",
+                "todo_write",
+                json!({"items":[{"id":"a","title":"A","task":"make a","files":["a.txt"]},{"id":"b","title":"B","task":"make b","files":["b.txt"]}]}),
+            )],
+            1 => vec![call("c0", "propose_plan", json!({"summary":"two files"}))],
+            2 => vec![call("c0", "run_todos", json!({}))],
+            _ => vec![text("done")],
+        }
+    });
+    let (team, fake, _, _) = setup(dir.path(), 4, script);
+    team.run("make a and b").await.unwrap();
+    let reqs = fake.requests.lock().unwrap().clone();
+    let workers: Vec<&ChatRequest> = reqs.iter().filter(|r| !r.messages[0].text().contains("MASTER")).collect();
+    let firsts: Vec<&ChatRequest> = workers.iter().copied().filter(|r| r.messages.len() == 2).collect();
+    assert!(firsts.len() >= 2, "two worker instances started");
+    assert_eq!(firsts[0].messages[0].text(), firsts[1].messages[0].text(), "same system prompt for every coder instance");
+    assert_eq!(serde_json::to_string(&firsts[0].tools).unwrap(), serde_json::to_string(&firsts[1].tools).unwrap());
+
+    let sizes = |label: &str, r: &ChatRequest| {
+        let mut v: Vec<(usize, String)> =
+            r.tools.iter().map(|t| (serde_json::to_string(t).unwrap().len() / 4, t.function.name.clone())).collect();
+        v.sort_by(|a, b| b.cmp(a));
+        let total: usize = v.iter().map(|(n, _)| n).sum();
+        let system = r.messages[0].text().len() / 4;
+        println!("{label}: tools ~{total} tokens, system prompt ~{system} tokens");
+        for (n, name) in v {
+            println!("  {name:<16} ~{n}");
+        }
+    };
+    let master = reqs.iter().find(|r| r.messages[0].text().contains("MASTER")).unwrap();
+    sizes("master", master);
+    sizes("coder", firsts[0]);
 }

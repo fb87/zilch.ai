@@ -20,18 +20,15 @@ impl Tool for Delegate {
     fn description(&self) -> String {
         let workers = self.0.worker_profiles().iter().map(|(n, d)| format!("{n} ({d})")).collect::<Vec<_>>().join("; ");
         format!(
-            "Send one task to a worker and wait for its report. Several delegate calls in one turn run in parallel. \
-             Without todo_id: READ-ONLY exploration (worker gets read-only tools; default worker \"explorer\"), only for a broad \
-             investigation of code you have not seen: a few files are cheaper to read yourself, and a question answerable \
-             from the conversation needs no tools. \
-             With todo_id: follow-up work on that approved TODO with write access to its files (defaults to the \
-             instance that ran it, keeping its context). Worker profiles: {workers}. You can also target a live \
-             instance id like \"coder#2\"."
+            "Send one task to a worker and wait for its report; several calls in one turn run in parallel. Without \
+             todo_id: read-only investigation (default worker \"explorer\"), only for broad questions about code you have \
+             not seen. With todo_id: follow-up on that approved TODO by the instance that ran it. Workers: {workers}; \
+             or an instance id like \"coder#2\"."
         )
     }
     fn schema(&self) -> Value {
         json!({"type":"object","properties":{
-            "task":{"type":"string","description":"Complete, self-contained instructions"},
+            "task":{"type":"string","description":"Self-contained instructions"},
             "worker":{"type":"string","description":"Profile name or instance id"},
             "todo_id":{"type":"string"},
             "fresh":{"type":"boolean","description":"Reset the instance's history first"}

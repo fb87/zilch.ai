@@ -18,21 +18,19 @@ impl Tool for TodoWrite {
         "todo_write"
     }
     fn description(&self) -> String {
-        "Only for a change to the codebase (never to answer a question). Create, update, cancel or remove TODO items \
-         (upsert by id). Each item is one unit of work for one worker. \
-         Keep items independent with disjoint `files` so they run in parallel; use `depends_on` only when required. \
-         Set status \"cancelled\" to drop an item, or \"pending\" to retry a failed/blocked one."
+        "For a change to the codebase only. Create or update TODO items (upsert by id), one unit of work per worker. \
+         Disjoint `files` run in parallel; `depends_on` only where required. status \"cancelled\" drops an item, \"pending\" retries it."
             .into()
     }
     fn schema(&self) -> Value {
         json!({"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{
-            "id":{"type":"string","description":"Short stable id, e.g. \"t1\""},
+            "id":{"type":"string","description":"e.g. t1"},
             "title":{"type":"string"},
-            "task":{"type":"string","description":"Complete, self-contained brief for the worker (it cannot see this conversation)"},
-            "worker":{"type":"string","description":"Worker profile (default \"coder\") or an existing instance id like \"coder#2\""},
-            "files":{"type":"array","items":{"type":"string"},"description":"Globs of files this item may modify"},
+            "task":{"type":"string","description":"Self-contained brief: the worker cannot see this conversation"},
+            "worker":{"type":"string","description":"Profile (default coder) or instance id"},
+            "files":{"type":"array","items":{"type":"string"},"description":"Files, directories or globs it may modify"},
             "depends_on":{"type":"array","items":{"type":"string"}},
-            "model":{"type":"string","description":"Optional model override for this item"},
+            "model":{"type":"string"},
             "provider":{"type":"string"},
             "status":{"type":"string","enum":["pending","cancelled"]},
             "remove":{"type":"boolean"}

@@ -161,9 +161,8 @@ async fn resume_continues_master_todos_and_workers() {
     let first_master = log.iter().find(|r| is_master(r)).unwrap();
     assert!(first_master.messages.iter().any(|m| m.text().contains("PELICAN")), "master history restored");
     assert!(first_master.messages.iter().any(|m| m.text() == "make a and b"));
-    // The follow-up went to coder#1, whose request still contains its earlier brief.
+    // The follow-up went to coder#1: its request still contains its earlier brief.
     let coder1_followup = log.iter().find(|r| !is_master(r) && last_user(r).contains("a2.txt")).unwrap();
-    assert!(coder1_followup.messages[0].text().contains("coder#1"));
     assert!(coder1_followup.messages.iter().any(|m| m.text().contains("FILE=a.txt")), "worker history restored");
     // Parallel TODOs ran on two distinct instances: the restored coder#1 and a fresh coder#2.
     let mut ids: Vec<String> = t2.todos().into_iter().filter(|t| t.id == "c" || t.id == "d").filter_map(|t| t.instance).collect();

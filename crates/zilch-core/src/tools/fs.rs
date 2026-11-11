@@ -19,17 +19,15 @@ impl Tool for ReadFile {
         "read_file"
     }
     fn description(&self) -> String {
-        "Read a text file. Returns numbered lines (`  N\\tline`). Use offset/limit (1-based lines) to read part of a \
-         file. A file over 1500 lines read without them returns its outline (definitions with line numbers) and first \
-         lines, so you can read just the ranges you need. Re-reading lines you already have, of an unchanged file, \
-         returns a short note instead of the text: use your earlier output."
+        "Read a text file as numbered lines; offset/limit (1-based) for a range. Over 1500 lines without a range: its \
+         outline (definitions with line numbers) and first lines. Re-reading unchanged lines you have: a short note."
             .into()
     }
     fn schema(&self) -> Value {
         json!({"type":"object","properties":{
-            "path":{"type":"string","description":"File path, relative to the working directory or absolute"},
-            "offset":{"type":"integer","description":"First line to read (1-based)"},
-            "limit":{"type":"integer","description":"Max lines to read (default 2000)"}
+            "path":{"type":"string"},
+            "offset":{"type":"integer"},
+            "limit":{"type":"integer","description":"Lines (default 2000)"}
         },"required":["path"]})
     }
     fn summarize(&self, args: &Value) -> String {
