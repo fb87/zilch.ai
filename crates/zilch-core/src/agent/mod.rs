@@ -1,4 +1,5 @@
 pub mod approval;
+pub mod budget;
 pub mod compact;
 pub mod events;
 pub mod run;

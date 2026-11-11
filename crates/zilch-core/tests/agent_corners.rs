@@ -170,3 +170,43 @@ async fn a_reply_that_keeps_repeating_while_streaming_is_cut() {
     let cut = a.history.iter().find(|m| m.text().contains("cut by the supervisor")).expect("cut reply kept, shortened");
     assert!(cut.text().len() < 600, "only a short head of the runaway text stays in history");
 }
+
+/// Different read-only calls, one per model call (varied so the loop supervisor stays quiet).
+fn varied_reads(n: usize) -> Vec<Option<Vec<LlmEvent>>> {
+    (0..n).map(|i| Some(vec![call(0, "glob", &format!("{{\"pattern\":\"*{i}*\"}}"))])).collect()
+}
+
+#[tokio::test]
+async fn out_of_budget_an_agent_is_asked_to_wrap_up_and_its_report_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    // Same glob result every time ("No files found"): no new information, so no extension.
+    let mut script = varied_reads(10);
+    script.push(Some(vec![LlmEvent::TextDelta("parts 1-2 done, part 3 left\nSTATUS: failed".into())]));
+    let mut a = agent(dir.path(), script);
+    a.loop_limit = 0;
+    let out = a.run("go").await.unwrap();
+    assert_eq!(out, "parts 1-2 done, part 3 left\nSTATUS: failed", "the wrap-up report, not a stop note");
+    assert!(a.history.iter().any(|m| m.role == Role::User && m.text().contains("used its budget of 10 model calls")));
+}
+
+#[tokio::test]
+async fn an_agent_ignoring_the_wrap_up_is_stopped_after_the_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = agent(dir.path(), varied_reads(40));
+    a.loop_limit = 0;
+    let out = a.run("go").await.unwrap();
+    assert!(out.starts_with("[stopped after reaching max_steps=10 (15 model calls"), "{out}");
+}
+
+#[tokio::test]
+async fn an_agent_making_progress_gets_more_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    // Writes a new file on every call: progress, so 14 calls are fine with a budget of 10.
+    let mut script: Vec<_> =
+        (0..14).map(|i| Some(vec![call(0, "write_file", &format!("{{\"path\":\"f{i}.txt\",\"content\":\"x\"}}"))])).collect();
+    script.push(Some(vec![LlmEvent::TextDelta("all written".into())]));
+    let mut a = agent(dir.path(), script);
+    a.loop_limit = 0;
+    assert_eq!(a.run("go").await.unwrap(), "all written");
+    assert!(dir.path().join("f13.txt").exists());
+}

@@ -80,10 +80,31 @@ impl Agent {
         self.history.push(Message::user(input));
         let mut reminded = false;
         let mut supervisor = Supervisor::new(self.loop_limit);
+        let mut budget = super::budget::StepBudget::new(self.max_steps);
 
-        for _step in 0..self.max_steps {
+        loop {
             if cancel.is_cancelled() {
                 bail!("cancelled");
+            }
+            match budget.before_call() {
+                super::budget::Decision::Go => {}
+                super::budget::Decision::Extended { limit, writes, fresh } => self.emit(EventKind::Notice(format!(
+                    "{}: still making progress ({writes} write(s), {fresh} new result(s)) — budget extended to {limit} model calls",
+                    self.id
+                ))),
+                super::budget::Decision::WrapUp { grace } => {
+                    self.emit(EventKind::Notice(format!(
+                        "⚠ {}: used its budget of {} model calls — asked to wrap up ({grace} more)",
+                        self.id, self.max_steps
+                    )));
+                    self.history.push(Message::user(super::budget::wrap_up_message(self.max_steps, grace)));
+                }
+                super::budget::Decision::Stop { limit } => {
+                    let note =
+                        format!("[stopped after reaching max_steps={} ({limit} model calls with extensions and wrap-up)]", self.max_steps);
+                    self.history.push(Message::assistant(&note));
+                    return Ok(note);
+                }
             }
             let specs = self.tools.specs();
             if let Some(r) = super::compact::maybe_compact(
@@ -203,6 +224,9 @@ impl Agent {
                 .map(|(c, r)| CallRecord { name: &c.function.name, arguments: &c.function.arguments, result: r })
                 .collect();
             let verdict = supervisor.observe(&text, &records);
+            for (call, result) in calls.iter().zip(&results) {
+                budget.record(&call.function.name, result);
+            }
             for (call, result) in calls.iter().zip(results) {
                 self.history.push(Message::tool(&call.id, result));
             }
@@ -210,9 +234,6 @@ impl Agent {
                 return Ok(stop);
             }
         }
-        let note = format!("[stopped after reaching max_steps={}]", self.max_steps);
-        self.history.push(Message::assistant(&note));
-        Ok(note)
     }
 
     /// Act on the supervisor's verdict: a nudge goes into the history (the turn continues); a
