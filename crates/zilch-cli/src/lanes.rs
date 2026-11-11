@@ -102,6 +102,10 @@ impl Dispatcher {
                 Lane::Code => me.team.run(&text).await,
                 Lane::Spec => me.team.run_spec(&text).await,
             };
+            // Between requests: compact the master's finished work in the background.
+            if lane == Lane::Code {
+                me.team.after_turn();
+            }
             // Let the renderer drain pending events before printing the footer.
             tokio::time::sleep(std::time::Duration::from_millis(30)).await;
             let mut s = me.screen.lock().await;

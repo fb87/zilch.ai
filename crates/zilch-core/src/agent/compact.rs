@@ -166,6 +166,50 @@ pub async fn summarize(
     Ok(out)
 }
 
+const DIGEST_INSTRUCTION: &str = "[compaction] Do not call any tool and do not continue the work. Write a digest of this whole \
+conversation so far, to replace it: you will continue from the digest alone. One short block per request the user \
+made: what was asked, what was done (files changed, results, test outcomes), decisions and the user's preferences, \
+and anything left open. Then the facts about the codebase you will need again (paths, names, conventions). Terse \
+bullet points; no raw tool output.";
+
+/// Safe-point compaction (between requests, while the agent is idle): digest the whole history.
+/// The request is the agent's own prefix (its system prompt, history and tools, exactly as it last
+/// sent them) plus one instruction, so a caching provider serves almost all of the input from its
+/// cache. The last request and reply stay verbatim after the digest.
+pub async fn digest(
+    llm: &dyn LlmClient,
+    binding: &ModelBinding,
+    session: Option<String>,
+    system: &str,
+    tools: &[ToolSpec],
+    history: &[Message],
+) -> anyhow::Result<Vec<Message>> {
+    let mut messages = Vec::with_capacity(history.len() + 2);
+    messages.push(Message::system(system));
+    messages.extend(history.iter().cloned());
+    messages.push(Message::user(DIGEST_INSTRUCTION));
+    let req = ChatRequest {
+        binding: ModelBinding { max_tokens: Some(binding.max_tokens.unwrap_or(4_000).min(4_000)), ..binding.clone() },
+        messages,
+        tools: tools.to_vec(),
+        session,
+    };
+    let (msg, _) = complete(llm, &req, |_| {}).await?;
+    let summary = msg.text().trim().to_string();
+    if summary.is_empty() || !msg.tool_calls.is_empty() {
+        anyhow::bail!("the model did not write a digest");
+    }
+    // The last exchange verbatim, so a follow-up ("and the other one?") still has its referent.
+    let last_user = history.iter().rposition(|m| m.role == Role::User && !m.text().starts_with("<conversation-summary>"));
+    let last_reply = history.iter().rev().find(|m| m.role == Role::Assistant && m.tool_calls.is_empty() && !m.text().is_empty());
+    let mut text = format!("<conversation-summary>\nEarlier conversation, compacted:\n{summary}\n");
+    if let (Some(u), Some(r)) = (last_user, last_reply) {
+        text.push_str(&format!("\nThe last request (verbatim):\n{}\n\nYour reply to it (verbatim):\n{}\n", history[u].text(), r.text()));
+    }
+    text.push_str("</conversation-summary>");
+    Ok(vec![Message::user(text), Message::assistant("Understood. Continuing from that summary.")])
+}
+
 /// What a compaction pass did, for logging.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactReport {

@@ -84,6 +84,10 @@ pub struct ToolCtx {
     pub file_locks: FileLocks,
     /// Content hash of every file this agent has read or written (stale-edit detection).
     pub read_hashes: Mutex<HashMap<PathBuf, String>>,
+    /// What read_file has shown this agent that is still in its context: path → (content hash, line
+    /// ranges). A re-read of an unchanged range is answered with a note instead of the text. Cleared
+    /// when those earlier outputs may be gone (compaction, reset, a rolled-back turn).
+    pub shown: Mutex<HashMap<PathBuf, ShownRanges>>,
     /// Approved write scope for the task currently being executed (None = nothing pre-approved).
     pub scope: Mutex<Option<Scope>>,
     /// Team-wide safety policy (sandbox, environment scrubbing).
@@ -95,6 +99,9 @@ pub struct ToolCtx {
     /// The team's repository map (None: `repo_map` builds one per call).
     pub repo_map: Option<Arc<Mutex<crate::repomap::RepoMap>>>,
 }
+
+/// A file's content hash and the line ranges of it an agent has been shown.
+pub type ShownRanges = (String, Vec<(usize, usize)>);
 
 /// Safety policy applied by the built-in tools.
 #[derive(Debug, Clone)]
@@ -178,6 +185,7 @@ impl ToolCtx {
             cancel,
             file_locks,
             read_hashes: Mutex::new(HashMap::new()),
+            shown: Mutex::new(HashMap::new()),
             scope: Mutex::new(None),
             policy: Arc::new(ToolPolicy::default()),
             budget: None,

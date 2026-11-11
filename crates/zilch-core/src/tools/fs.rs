@@ -6,6 +6,10 @@ use std::path::Path;
 
 const DEFAULT_LIMIT: usize = 2000;
 const MAX_LINE: usize = 2000;
+/// A whole-file read of a longer file returns its outline and first lines instead (an explicit
+/// offset/limit reads anything).
+const OUTLINE_OVER: usize = 1_500;
+const OUTLINE_HEAD: usize = 40;
 
 pub struct ReadFile;
 
@@ -15,7 +19,11 @@ impl Tool for ReadFile {
         "read_file"
     }
     fn description(&self) -> String {
-        "Read a text file. Returns numbered lines (`  N\\tline`). Use offset/limit (1-based lines) for large files.".into()
+        "Read a text file. Returns numbered lines (`  N\\tline`). Use offset/limit (1-based lines) to read part of a \
+         file. A file over 1500 lines read without them returns its outline (definitions with line numbers) and first \
+         lines, so you can read just the ranges you need. Re-reading lines you already have, of an unchanged file, \
+         returns a short note instead of the text: use your earlier output."
+            .into()
     }
     fn schema(&self) -> Value {
         json!({"type":"object","properties":{
@@ -35,9 +43,60 @@ impl Tool for ReadFile {
             bail!("{} looks like a binary file", path.display());
         }
         let text = String::from_utf8_lossy(&bytes);
+        let explicit = args.get("offset").is_some_and(|v| !v.is_null()) || args.get("limit").is_some_and(|v| !v.is_null());
         let offset = arg_opt_u64(&args, "offset").unwrap_or(1).max(1) as usize;
         let limit = arg_opt_u64(&args, "limit").map(|l| l as usize).unwrap_or(DEFAULT_LIMIT);
         let total = text.lines().count();
+        let hash = sha256(&bytes);
+        let shown_path = arg_str(&args, "path")?.to_string();
+
+        // Already in the context and unchanged: don't send it again.
+        let end = (offset - 1 + limit).min(total);
+        let covered =
+            ctx.shown.lock().unwrap().get(&path).is_some_and(|(h, ranges)| {
+                *h == hash && total > 0 && offset <= end && ranges.iter().any(|(a, b)| *a <= offset && end <= *b)
+            });
+        if covered {
+            return Ok(format!(
+                "[{shown_path} lines {offset}-{end}: unchanged since you read them earlier in this conversation. Use that \
+                 output; the text was not sent again.]"
+            ));
+        }
+        let remember = |a: usize, b: usize| {
+            let mut s = ctx.shown.lock().unwrap();
+            let e = s.entry(path.clone()).or_insert_with(|| (hash.clone(), vec![]));
+            if e.0 != hash {
+                *e = (hash.clone(), vec![]);
+            }
+            e.1.push((a, b));
+        };
+
+        // A long file read whole: its shape first, so the agent reads only the ranges it needs.
+        if !explicit && total > OUTLINE_OVER {
+            let mut out = format!("{shown_path}: {total} lines. Definitions (line: signature):\n");
+            match crate::repomap::outline(&shown_path, &text) {
+                Some(items) if !items.is_empty() => {
+                    for it in items.iter().take(150) {
+                        out.push_str(&format!("{:>6}: {}\n", it.line, it.sig));
+                    }
+                    if items.len() > 150 {
+                        out.push_str(&format!("  … {} more\n", items.len() - 150));
+                    }
+                }
+                _ => out.push_str("  (no outline for this file type)\n"),
+            }
+            out.push_str(&format!("First {OUTLINE_HEAD} lines:\n"));
+            for (i, line) in text.lines().enumerate().take(OUTLINE_HEAD) {
+                let line = if line.len() > MAX_LINE { &line[..line.floor_char_boundary(MAX_LINE)] } else { line };
+                out.push_str(&format!("{:>6}\t{}\n", i + 1, line));
+            }
+            out.push_str(&format!(
+                "[lines 1-{OUTLINE_HEAD} of {total}. Read the ranges you need with offset/limit (e.g. offset=120 limit=80); \
+                 the whole file: offset=1 limit={total}.]\n"
+            ));
+            remember(1, OUTLINE_HEAD.min(total));
+            return Ok(out);
+        }
         let mut out = String::new();
         for (i, line) in text.lines().enumerate().skip(offset - 1).take(limit) {
             let line = if line.len() > MAX_LINE { &line[..line.floor_char_boundary(MAX_LINE)] } else { line };
@@ -47,6 +106,9 @@ impl Tool for ReadFile {
             return Ok("(empty file)".into());
         }
         let shown_end = (offset - 1 + limit).min(total);
+        if offset <= shown_end {
+            remember(offset, shown_end);
+        }
         if shown_end < total || offset > 1 {
             out.push_str(&format!("[lines {}-{} of {}]\n", offset, shown_end, total));
         }
@@ -208,5 +270,58 @@ mod sandbox_tests {
         // Opt-out works.
         let open = ctx(&ws, false);
         assert!(ReadFile.call(json!({"path":"../secret.txt"}), &open).await.unwrap().contains("TOP SECRET"));
+    }
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+    use crate::agent::{ApprovalGate, ApprovalMode, AutoApprove, EventSink};
+    use crate::team::file_locks::FileLocks;
+    use crate::tools::CancelCell;
+    use std::sync::Arc;
+
+    fn ctx(dir: &Path) -> ToolCtx {
+        let gate = Arc::new(ApprovalGate::new(ApprovalMode::Auto, Arc::new(AutoApprove)));
+        ToolCtx::new("t", dir.to_path_buf(), gate, EventSink::null(), CancelCell::default(), FileLocks::default())
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_file_is_not_sent_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let c = ctx(dir.path());
+        let read = |args: Value| ReadFile.call(args, &c);
+        assert!(read(json!({"path":"a.txt"})).await.unwrap().contains("two"));
+        let again = read(json!({"path":"a.txt"})).await.unwrap();
+        assert!(again.contains("unchanged since you read them") && !again.contains("two"), "{again}");
+        // A range inside what was shown is covered too; a changed file is read for real.
+        assert!(read(json!({"path":"a.txt","offset":2,"limit":1})).await.unwrap().contains("unchanged"));
+        std::fs::write(dir.path().join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        assert!(read(json!({"path":"a.txt"})).await.unwrap().contains("TWO"));
+        // Once the earlier outputs may be gone (compaction, reset), it is sent again.
+        c.shown.lock().unwrap().clear();
+        assert!(read(json!({"path":"a.txt"})).await.unwrap().contains("TWO"));
+    }
+
+    #[tokio::test]
+    async fn a_long_file_read_whole_returns_its_outline_and_first_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut src = String::from("//! Big module.\n");
+        for i in 0..1600 {
+            src.push_str(&format!("pub fn f{i}() {{}}\n"));
+        }
+        std::fs::write(dir.path().join("big.rs"), &src).unwrap();
+        let c = ctx(dir.path());
+        let out = ReadFile.call(json!({"path":"big.rs"}), &c).await.unwrap();
+        assert!(out.starts_with("big.rs: 1601 lines. Definitions"), "{out}");
+        assert!(out.contains("   100: pub fn f98()") && out.contains("… 1450 more"), "outline with line numbers, capped: {out}");
+        assert!(out.contains("    40\t") && !out.contains("    41\t"), "first 40 lines only");
+        assert!(out.contains("the whole file: offset=1 limit=1601"));
+        // Asking explicitly reads anything: a range, or the whole file.
+        let part = ReadFile.call(json!({"path":"big.rs","offset":300,"limit":2}), &c).await.unwrap();
+        assert!(part.contains("   300\tpub fn f298() {}") && part.contains("[lines 300-301 of 1601]"), "{part}");
+        let all = ReadFile.call(json!({"path":"big.rs","offset":1,"limit":1601}), &c).await.unwrap();
+        assert!(all.contains("  1601\tpub fn f1599() {}"));
     }
 }

@@ -313,6 +313,9 @@ async fn real_main() -> Result<i32> {
         // The Ctrl-C task keeps the event sink alive, so give the renderer a moment instead of joining it.
         tokio::time::sleep(Duration::from_millis(50)).await;
         renderer.abort();
+        if let Some(sum) = screen.lock().await.session_summary() {
+            eprintln!("{sum}");
+        }
         return Ok(match res {
             Ok(answer) => {
                 println!("{}", render::wrap_for_tty(1, &answer, team.shared.cfg.markdown_indent));
@@ -561,6 +564,12 @@ async fn repl(
     lanes.shutdown().await;
     if let Some(h) = &history {
         let _ = rl.save_history(h);
+    }
+    {
+        let s = screen.lock().await;
+        if let Some(sum) = s.session_summary() {
+            println!("{}{sum}{}", s.c(DIM), s.c(RESET));
+        }
     }
     if team.save().await.ok().flatten().is_some() {
         let s = screen.lock().await;

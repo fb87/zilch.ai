@@ -346,7 +346,18 @@ pub struct Team {
     spec: AsyncMutex<Agent>,
     spec_system: String,
     spec_cancel: CancelCell,
+    /// Code-lane requests started so far (a pending idle compaction checks nothing new came in).
+    turns: std::sync::atomic::AtomicU64,
 }
+
+/// Safe-point compaction of the master between requests (like a garbage collector): over this share
+/// of its context budget, right after a request (the provider still has the prefix cached, so the
+/// digest request is cheap)...
+const COMPACT_AFTER_TURN: f64 = 0.40;
+/// ...over this share, once the provider has dropped its cache anyway (no new request meanwhile).
+const COMPACT_WHEN_COLD: f64 = 0.20;
+/// Roughly how long providers keep a prompt prefix cached.
+const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// Spec lane context: the documents' current versions every turn.
 struct SpecHooks(Arc<SpecStore>);
@@ -394,7 +405,8 @@ impl Team {
                 protect_git: cfg.bash_protect_git,
             },
         });
-        let repo_map = crate::repomap::RepoMap::build(&cfg.cwd);
+        // The map from the disk cache if there is one (refreshed in the background below), else a scan.
+        let (repo_map, from_cache) = crate::repomap::RepoMap::load_or_build(&cfg.cwd);
         let shared = Arc::new(TeamShared {
             pool: WorkerPool::new(cfg.max_workers),
             providers,
@@ -425,6 +437,20 @@ impl Team {
             repo_map: Arc::new(std::sync::Mutex::new(repo_map)),
             cfg,
         });
+
+        if from_cache {
+            // Bring the cached map up to date (only changed files are read) without delaying startup.
+            let (map, cwd) = (shared.repo_map.clone(), shared.cfg.cwd.clone());
+            std::thread::Builder::new()
+                .name("zilch-repomap".into())
+                .spawn(move || {
+                    let mut fresh = map.lock().unwrap().clone();
+                    fresh.refresh(&cwd, "");
+                    fresh.save(&cwd);
+                    *map.lock().unwrap() = fresh;
+                })
+                .ok();
+        }
 
         // Master: read-only tools + coordination tools, nothing mutating (enforced again here).
         let mut reg = tools::worker_tools().filter(|t| !t.mutating() && READONLY_TOOLS.contains(&t.name()));
@@ -512,7 +538,15 @@ impl Team {
             usage: Default::default(),
             session: crate::agent::run::new_session_id("spec"),
         };
-        Ok(Self { shared, master: AsyncMutex::new(master), master_system: system, spec: AsyncMutex::new(spec), spec_system, spec_cancel })
+        Ok(Self {
+            shared,
+            master: AsyncMutex::new(master),
+            master_system: system,
+            spec: AsyncMutex::new(spec),
+            spec_system,
+            spec_cancel,
+            turns: Default::default(),
+        })
     }
 
     /// Save the session to `store` after every turn.
@@ -538,6 +572,7 @@ impl Team {
     /// The single entry point for the user.
     pub async fn run(&self, input: &str) -> Result<String> {
         self.shared.cancel.reset();
+        self.turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         {
             let mut p = self.shared.persist.lock().unwrap();
             if p.title.is_empty() {
@@ -576,6 +611,27 @@ impl Team {
             self.shared.events.emit("master", EventKind::Notice(format!("warning: could not save session: {e:#}")));
         }
         res
+    }
+
+    /// Call after a code-lane request finished: compacts the master's finished work in the
+    /// background, so the next request starts from a smaller history (see COMPACT_AFTER_TURN).
+    /// A request arriving meanwhile waits for it.
+    pub fn after_turn(self: &Arc<Self>) {
+        let me = self.clone();
+        let turn = me.turns.load(std::sync::atomic::Ordering::SeqCst);
+        tokio::spawn(async move {
+            let done = me.master.lock().await.compact_idle(COMPACT_AFTER_TURN).await.is_some();
+            if !done {
+                tokio::time::sleep(CACHE_TTL).await;
+                if me.turns.load(std::sync::atomic::Ordering::SeqCst) != turn {
+                    return; // a newer request took over; its own after_turn decides
+                }
+                if me.master.lock().await.compact_idle(COMPACT_WHEN_COLD).await.is_none() {
+                    return;
+                }
+            }
+            let _ = me.save().await;
+        });
     }
 
     /// Capture the full team state (call between turns, when no worker is running).

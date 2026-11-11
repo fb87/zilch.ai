@@ -22,13 +22,13 @@ const MAX_SCAN_BYTES: u64 = 512 * 1024;
 /// Definitions listed per file in a detail view.
 const MAX_ITEMS_PER_FILE: usize = 60;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Item {
     pub line: usize,
     pub sig: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FileEntry {
     /// Path relative to the root, with `/` separators.
     pub path: String,
@@ -39,7 +39,7 @@ pub struct FileEntry {
     pub items: Vec<Item>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RepoMap {
     pub files: Vec<FileEntry>,
     /// Directory (relative, "" = root) → description from a README or a package manifest.
@@ -211,6 +211,11 @@ fn file_doc(lang: Lang, text: &str) -> Option<String> {
     first_sentence(&block.join(" "))
 }
 
+/// A file's top-level definitions with line numbers (None for languages the map does not know).
+pub fn outline(path: &str, text: &str) -> Option<Vec<Item>> {
+    lang_of(path).map(|l| scan(l, text).1)
+}
+
 fn scan(lang: Lang, text: &str) -> (Option<String>, Vec<Item>) {
     let re = item_pattern(lang);
     let items = text
@@ -227,6 +232,11 @@ fn scan(lang: Lang, text: &str) -> (Option<String>, Vec<Item>) {
 fn readme_doc(text: &str) -> Option<String> {
     let mut para = Vec::new();
     for l in text.lines().map(str::trim) {
+        // Underlined (setext) headings: the title line, then a line of = or -.
+        if !l.is_empty() && l.chars().all(|c| c == '=' || c == '-') {
+            para.pop();
+            continue;
+        }
         let skip = l.starts_with('#') || l.starts_with("[!") || l.starts_with("![") || l.starts_with('<') || l.starts_with("```");
         if l.is_empty() || skip {
             if !para.is_empty() {
@@ -259,6 +269,31 @@ const MODULE_FILES: &[&str] =
     &["mod.rs", "lib.rs", "main.rs", "__init__.py", "index.ts", "index.js", "init.lua", "doc.go", "main.go", "main.py"];
 
 impl RepoMap {
+    /// The map of `root` from the disk cache if there is one (possibly behind: call `refresh`), else
+    /// a fresh scan, which is then cached. Returns (map, came from the cache).
+    pub fn load_or_build(root: &Path) -> (Self, bool) {
+        if let Some(map) = cache_file(root).and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<RepoMap>(&b).ok()) {
+            return (map, true);
+        }
+        let map = Self::build(root);
+        map.save(root);
+        (map, false)
+    }
+
+    /// Cache the map (best effort) in zilch's data directory, never in the project.
+    pub fn save(&self, root: &Path) {
+        let Some(path) = cache_file(root) else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(bytes) = serde_json::to_vec(self) {
+            let tmp = path.with_extension("tmp");
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+
     /// Scan `root`, honouring .gitignore and skipping hidden files.
     pub fn build(root: &Path) -> Self {
         Self::scan_under(root, root, &[])
@@ -284,44 +319,89 @@ impl RepoMap {
     /// Scan files under `start`; a file whose mtime matches its entry in `old` is reused as is.
     fn scan_under(root: &Path, start: &Path, old: &[FileEntry]) -> Self {
         let old: std::collections::HashMap<&str, &FileEntry> = old.iter().map(|f| (f.path.as_str(), f)).collect();
-        let mut map = RepoMap::default();
-        let walker = WalkBuilder::new(start).hidden(true).git_ignore(true).require_git(false).build();
-        let mut paths: Vec<PathBuf> =
-            walker.filter_map(Result::ok).filter(|e| e.file_type().is_some_and(|t| t.is_file())).map(|e| e.into_path()).collect();
+        // Walk in parallel (ripgrep's walker), then scan the files on every core.
+        let found = std::sync::Mutex::new(Vec::<PathBuf>::new());
+        WalkBuilder::new(start).hidden(true).git_ignore(true).require_git(false).build_parallel().run(|| {
+            let found = &found;
+            Box::new(move |e| {
+                if let Ok(e) = e {
+                    if e.file_type().is_some_and(|t| t.is_file()) {
+                        found.lock().unwrap().push(e.into_path());
+                    }
+                }
+                ignore::WalkState::Continue
+            })
+        });
+        let mut paths = found.into_inner().unwrap();
         paths.sort();
-        for p in paths {
-            let Ok(rel) = p.strip_prefix(root) else { continue };
+        enum Found {
+            File(FileEntry),
+            /// A directory description: (directory, text, from a README).
+            Doc(String, String, bool),
+        }
+        let one = |p: &PathBuf| -> Vec<Found> {
+            let mut out = vec![];
+            let Ok(rel) = p.strip_prefix(root) else { return out };
             let rel = rel.to_string_lossy().replace('\\', "/");
-            let name = rel.rsplit('/').next().unwrap_or(&rel).to_string();
-            let meta = std::fs::metadata(&p).ok();
+            let name = name_of(&rel).to_string();
+            let meta = std::fs::metadata(p).ok();
             let small = meta.as_ref().is_some_and(|m| m.len() <= MAX_SCAN_BYTES);
             let mtime = meta.as_ref().and_then(|m| m.modified().ok());
             if matches!(name.as_str(), "README.md" | "README" | "readme.md" | "Cargo.toml" | "package.json" | "pyproject.toml") && small {
-                if let Ok(text) = std::fs::read_to_string(&p) {
-                    let doc = if name.to_lowercase().starts_with("readme") { readme_doc(&text) } else { manifest_doc(&name, &text) };
+                if let Ok(text) = std::fs::read_to_string(p) {
+                    let readme = name.to_lowercase().starts_with("readme");
+                    let doc = if readme { readme_doc(&text) } else { manifest_doc(&name, &text) };
                     if let Some(d) = doc {
-                        // A README describes its directory better than a manifest does.
-                        let dir = parent(&rel).to_string();
-                        if name.to_lowercase().starts_with("readme") || !map.dir_docs.contains_key(&dir) {
-                            map.dir_docs.insert(dir, d);
-                        }
+                        out.push(Found::Doc(parent(&rel).to_string(), d, readme));
                     }
                 }
             }
-            let Some(lang) = lang_of(&rel) else { continue };
+            let Some(lang) = lang_of(&rel) else { return out };
             if let Some(prev) = old.get(rel.as_str()).filter(|f| f.mtime.is_some() && f.mtime == mtime) {
-                map.files.push((*prev).clone());
-                continue;
+                out.push(Found::File((*prev).clone()));
+                return out;
             }
-            let (lines, doc, items) = match std::fs::read_to_string(&p) {
+            let (lines, doc, items) = match std::fs::read_to_string(p) {
                 Ok(text) if small => {
                     let (doc, items) = scan(lang, &text);
                     (text.lines().count(), doc, items)
                 }
                 Ok(text) => (text.lines().count(), None, vec![]),
-                Err(_) => continue, // not text
+                Err(_) => return out, // not text
             };
-            map.files.push(FileEntry { path: rel, mtime, lines, doc, items });
+            out.push(Found::File(FileEntry { path: rel, mtime, lines, doc, items }));
+            out
+        };
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let mut results: Vec<(usize, Vec<Found>)> = std::thread::scope(|s| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut mine = vec![];
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(p) = paths.get(i) else { break };
+                            mine.push((i, one(p)));
+                        }
+                        mine
+                    })
+                })
+                .collect();
+            workers.into_iter().flat_map(|w| w.join().unwrap_or_default()).collect()
+        });
+        results.sort_by_key(|(i, _)| *i);
+        let mut map = RepoMap::default();
+        for found in results.into_iter().flat_map(|(_, f)| f) {
+            match found {
+                Found::File(f) => map.files.push(f),
+                // A README describes its directory better than a manifest does.
+                Found::Doc(dir, d, readme) => {
+                    if readme || !map.dir_docs.contains_key(&dir) {
+                        map.dir_docs.insert(dir, d);
+                    }
+                }
+            }
         }
         map
     }
@@ -331,9 +411,10 @@ impl RepoMap {
         if let Some(d) = self.dir_docs.get(dir) {
             return Some(d.clone());
         }
+        // Files are sorted by path: binary search instead of a scan.
         MODULE_FILES.iter().find_map(|m| {
             let path = if dir.is_empty() { m.to_string() } else { format!("{dir}/{m}") };
-            self.files.iter().find(|f| f.path == path).and_then(|f| f.doc.clone())
+            self.files.binary_search_by(|f| f.path.as_str().cmp(path.as_str())).ok().and_then(|i| self.files[i].doc.clone())
         })
     }
 
@@ -347,21 +428,144 @@ impl RepoMap {
         let total_lines: usize = self.files.iter().map(|f| f.lines).sum();
         let project = self.dir_docs.get("").map(|d| format!("Project: {d}\n")).unwrap_or_default();
         let head = format!("{project}{} source files, {} lines.\n", self.files.len(), fmt_lines(total_lines));
-        // Richest first: every directory with a line per documented file; then directories only, at
-        // fewer and fewer levels.
+        // Richest first: every directory with a line per documented file; else directories only,
+        // opened where the code is.
         let rich = self.render_overview(deepest, true);
         if head.len() + rich.len() <= max_chars {
             return format!("{head}{rich}");
         }
-        let mut best = String::new();
-        for depth in (1..=deepest.max(1)).rev() {
-            let body = self.render_overview(depth, false);
-            if head.len() + body.len() <= max_chars || depth == 1 {
-                best = body;
-                break;
+        format!("{head}{}", self.frontier_overview(max_chars.saturating_sub(head.len())))
+    }
+
+    /// Directories only, expanded where the code is: start from the top level and keep opening the
+    /// directory with the most files while the listing fits in `budget` characters. A huge tree
+    /// (`drivers/`) opens into its parts; a small one stays a single line.
+    fn frontier_overview(&self, budget: usize) -> String {
+        // Every directory with source files below it: (files, lines) in total, and its own files.
+        let mut total: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        let mut direct: BTreeMap<String, Vec<&FileEntry>> = BTreeMap::new();
+        for f in &self.files {
+            let d = parent(&f.path).to_string();
+            direct.entry(d.clone()).or_default().push(f);
+            let mut cur = Some(d);
+            while let Some(dir) = cur {
+                let e = total.entry(dir.clone()).or_default();
+                e.0 += 1;
+                e.1 += f.lines;
+                cur = if dir.is_empty() { None } else { Some(parent(&dir).to_string()) };
             }
         }
-        format!("{head}{best}")
+        let mut kids: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for d in total.keys().filter(|d| !d.is_empty()) {
+            kids.entry(parent(d).to_string()).or_default().push(d.clone());
+        }
+        // A listing entry: a whole subtree, or only the files directly in an opened directory.
+        #[derive(Clone, PartialEq)]
+        enum Entry {
+            Tree(String),
+            Here(String),
+            /// The subdirectories of a partly opened directory that are not listed one by one.
+            Rest(String, Vec<String>),
+        }
+        let line = |e: &Entry| -> (String, String) {
+            if let Entry::Rest(d, rest) = e {
+                let (files, lines) = rest.iter().fold((0, 0), |(f, l), r| (f + total[r].0, l + total[r].1));
+                let some: Vec<&str> = rest.iter().take(6).map(|r| name_of(r)).collect();
+                let more = if rest.len() > 6 { ", …" } else { "" };
+                // Sorted right after the directory's listed children.
+                return (
+                    format!("{d}/\u{10ffff}"),
+                    format!("{d}/… {} more: {}{more} ({files} files, {} lines)\n", rest.len(), some.join(", "), fmt_lines(lines)),
+                );
+            }
+            let (dir, files, lines, names): (&str, usize, usize, Vec<&str>) = match e {
+                Entry::Tree(d) => {
+                    let names = direct.get(d).map(|v| v.iter().map(|f| name_of(&f.path)).collect()).unwrap_or_default();
+                    (d, total[d].0, total[d].1, names)
+                }
+                Entry::Here(d) => {
+                    let v = &direct[d];
+                    (d, v.len(), v.iter().map(|f| f.lines).sum(), v.iter().map(|f| name_of(&f.path)).collect())
+                }
+                Entry::Rest(..) => unreachable!("handled above"),
+            };
+            let shown = if dir.is_empty() { String::from("./") } else { format!("{dir}/") };
+            let what = match self.dir_doc(dir) {
+                Some(d) => format!(" — {d}"),
+                None if !names.is_empty() => {
+                    let mut n = names.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+                    if names.len() > 5 {
+                        n.push_str(", …");
+                    }
+                    format!(" — {n}")
+                }
+                None => String::new(),
+            };
+            (dir.to_string(), format!("{shown}{what} ({files} files, {} lines)\n", fmt_lines(lines)))
+        };
+        let open = |dir: &str| -> Vec<Entry> {
+            let mut v: Vec<Entry> = kids.get(dir).into_iter().flatten().cloned().map(Entry::Tree).collect();
+            if direct.contains_key(dir) {
+                v.push(Entry::Here(dir.to_string()));
+            }
+            v
+        };
+        // Each entry's line is built once (a directory description looks through the files).
+        let memo: std::cell::RefCell<std::collections::HashMap<(bool, String), (String, String)>> = Default::default();
+        let cached = |e: &Entry| -> (String, String) {
+            let key = match e {
+                Entry::Tree(d) => (true, d.clone()),
+                Entry::Here(d) => (false, d.clone()),
+                Entry::Rest(..) => return line(e),
+            };
+            memo.borrow_mut().entry(key).or_insert_with(|| line(e)).clone()
+        };
+        let render = |entries: &[Entry]| -> String {
+            let mut lines: Vec<(String, String)> = entries.iter().map(cached).collect();
+            lines.sort();
+            lines.into_iter().map(|(_, l)| l).collect()
+        };
+        let mut entries = open("");
+        let mut stuck: std::collections::HashSet<String> = Default::default();
+        loop {
+            // The biggest subtree that can still be opened.
+            let pick = entries
+                .iter()
+                .filter_map(|e| match e {
+                    Entry::Tree(d) if !stuck.contains(d) && kids.contains_key(d) => Some(d.clone()),
+                    _ => None,
+                })
+                .max_by_key(|d| total[d].0);
+            let Some(dir) = pick else { break };
+            let others: Vec<Entry> = entries.iter().filter(|e| **e != Entry::Tree(dir.clone())).cloned().collect();
+            let mut next = others.clone();
+            next.extend(open(&dir));
+            if render(&next).len() <= budget {
+                entries = next;
+                continue;
+            }
+            // Too many children to list them all: list the biggest ones, summarize the rest in one line.
+            let mut children: Vec<String> = kids[&dir].clone();
+            children.sort_by_key(|c| std::cmp::Reverse(total[c].0));
+            let mut opened = false;
+            for k in (2..children.len()).rev() {
+                let mut next = others.clone();
+                next.extend(children[..k].iter().cloned().map(Entry::Tree));
+                next.push(Entry::Rest(dir.clone(), children[k..].to_vec()));
+                if direct.contains_key(&dir) {
+                    next.push(Entry::Here(dir.clone()));
+                }
+                if render(&next).len() <= budget {
+                    entries = next;
+                    opened = true;
+                    break;
+                }
+            }
+            if !opened {
+                stuck.insert(dir);
+            }
+        }
+        render(&entries)
     }
 
     fn render_overview(&self, depth: usize, with_files: bool) -> String {
@@ -588,4 +792,15 @@ mod refresh_tests {
         map.refresh(r, "");
         assert!(map.detail("top.rs", 1000).contains("later"));
     }
+}
+
+fn name_of(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// `<data dir>/zilch/repomap/<workspace key>.json`.
+fn cache_file(root: &Path) -> Option<PathBuf> {
+    let abs = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let key: String = abs.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+    dirs::data_dir().map(|d| d.join("zilch").join("repomap").join(format!("{}.json", key.trim_matches('_'))))
 }

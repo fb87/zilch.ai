@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use zilch_core::agent::run::new_session_id;
 use zilch_core::agent::{Agent, ApprovalGate, ApprovalMode, AutoApprove, EventSink};
-use zilch_core::llm::{ChatRequest, EventStream, LlmClient, LlmEvent, ModelBinding, Role};
+use zilch_core::llm::{ChatRequest, EventStream, LlmClient, LlmEvent, Message, ModelBinding, Role};
 use zilch_core::team::file_locks::FileLocks;
 use zilch_core::tools::{worker_tools, CancelCell, ToolCtx};
 
@@ -209,4 +209,63 @@ async fn an_agent_making_progress_gets_more_calls() {
     a.loop_limit = 0;
     assert_eq!(a.run("go").await.unwrap(), "all written");
     assert!(dir.path().join("f13.txt").exists());
+}
+
+/// Records every request; answers with the next scripted response.
+struct Recording(Mutex<Vec<ChatRequest>>, Mutex<Vec<Vec<LlmEvent>>>);
+
+#[async_trait]
+impl LlmClient for Recording {
+    async fn stream(&self, req: &ChatRequest) -> Result<EventStream> {
+        self.0.lock().unwrap().push(req.clone());
+        let evs = self.1.lock().unwrap().remove(0);
+        Ok(Box::pin(futures::stream::iter(evs.into_iter().map(Ok))))
+    }
+}
+
+#[tokio::test]
+async fn idle_compaction_rides_the_cached_prefix_and_keeps_the_last_exchange() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = Arc::new(Recording(Mutex::new(vec![]), Mutex::new(vec![vec![LlmEvent::TextDelta("- order 1: added a.txt".into())]])));
+    let mut a = agent(dir.path(), vec![]);
+    a.llm = rec.clone();
+    a.context_tokens = 16_000;
+    let big = "x".repeat(8_000);
+    a.history = vec![
+        Message::user("order 1: add a.txt"),
+        Message::assistant(format!("done, here is a lot: {big}")),
+        Message::user("order 2: what is in a.txt?"),
+        Message::assistant("It holds the word hello."),
+    ];
+    let before = a.history.clone();
+    assert!(a.compact_idle(0.9).await.is_none(), "under the threshold: nothing happens");
+    let r = a.compact_idle(0.05).await.expect("compacted");
+    assert!(r.after < r.before);
+    // The request is the agent's own prefix + one instruction, with the same tools.
+    let req = &rec.0.lock().unwrap()[0];
+    assert_eq!(req.messages[0].text(), "s");
+    assert_eq!(&req.messages[1..5], &before[..]);
+    assert!(req.messages[5].text().starts_with("[compaction]"));
+    assert_eq!(req.tools.len(), a.tools.specs().len());
+    // A digest, then the last request and reply verbatim.
+    assert_eq!(a.history.len(), 2);
+    let s = a.history[0].text();
+    assert!(
+        s.contains("- order 1: added a.txt") && s.contains("order 2: what is in a.txt?") && s.contains("It holds the word hello."),
+        "{s}"
+    );
+    assert!(!s.contains(&big));
+}
+
+#[tokio::test]
+async fn idle_compaction_keeps_the_history_when_the_model_does_not_write_a_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = Arc::new(Recording(Mutex::new(vec![]), Mutex::new(vec![vec![call(0, "read_file", "{\"path\":\"a\"}")]])));
+    let mut a = agent(dir.path(), vec![]);
+    a.llm = rec;
+    a.context_tokens = 16_000;
+    a.history = vec![Message::user("q"), Message::assistant("x".repeat(9_000)), Message::user("q2"), Message::assistant("a2")];
+    let before = a.history.clone();
+    assert!(a.compact_idle(0.05).await.is_none());
+    assert_eq!(a.history, before);
 }

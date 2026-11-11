@@ -50,6 +50,7 @@ impl Agent {
     pub fn reset(&mut self) {
         self.history.clear();
         self.ctx.read_hashes.lock().unwrap().clear();
+        self.ctx.shown.lock().unwrap().clear();
         self.session = new_session_id(&self.id);
     }
 
@@ -71,6 +72,8 @@ impl Agent {
         self.emit(EventKind::Idle);
         if res.is_err() && !self.history[start..].iter().any(|m| m.role == crate::llm::Role::Assistant) {
             self.history.truncate(start);
+            // Files read in the dropped part are no longer in the context.
+            self.ctx.shown.lock().unwrap().clear();
         }
         res
     }
@@ -118,6 +121,8 @@ impl Agent {
             )
             .await
             {
+                // Older read_file outputs may have been elided or summarized away: read for real again.
+                self.ctx.shown.lock().unwrap().clear();
                 let how = if r.summarized { "summarized older turns" } else { "elided old tool output" };
                 self.emit(EventKind::Notice(format!(
                     "{}: compacted history ~{:.1}k → ~{:.1}k tokens ({how})",
@@ -234,6 +239,33 @@ impl Agent {
                 return Ok(stop);
             }
         }
+    }
+
+    /// Safe-point compaction (call between turns): replace the history with a digest, when it uses
+    /// at least `min_share` of the context budget. Returns what it did, or None (not needed or failed).
+    pub async fn compact_idle(&mut self, min_share: f64) -> Option<super::compact::CompactReport> {
+        let specs = self.tools.specs();
+        let before = super::compact::estimate_tokens(&self.system, &self.history, &specs);
+        if self.history.len() < 4 || (before as f64) < self.context_tokens as f64 * min_share {
+            return None;
+        }
+        self.emit(EventKind::Notice(format!("{}: compacting finished work (~{:.1}k tokens)…", self.id, before as f64 / 1000.0)));
+        let new = super::compact::digest(self.llm.as_ref(), &self.binding, Some(self.session.clone()), &self.system, &specs, &self.history)
+            .await
+            .ok()?;
+        let after = super::compact::estimate_tokens(&self.system, &new, &specs);
+        if after >= before {
+            return None;
+        }
+        self.history = new;
+        self.ctx.shown.lock().unwrap().clear();
+        self.emit(EventKind::Notice(format!(
+            "{}: compacted finished work ~{:.1}k → ~{:.1}k tokens",
+            self.id,
+            before as f64 / 1000.0,
+            after as f64 / 1000.0
+        )));
+        Some(super::compact::CompactReport { before, after, summarized: true })
     }
 
     /// Act on the supervisor's verdict: a nudge goes into the history (the turn continues); a

@@ -38,6 +38,8 @@ pub struct Screen {
     worker_text: HashMap<String, String>,
     pub usage: BTreeMap<(String, String), Usage>,
     pub cost: BTreeMap<(String, String), f64>,
+    /// Model requests made this session (one per usage report).
+    pub requests: u64,
     /// Animate the status panel with cursor movement (off in the REPL: the input line is live).
     pub live_panel: bool,
     /// Lane-aware output (REPL): only the active lane streams; the other one is summarized.
@@ -102,6 +104,7 @@ impl Screen {
             todos: vec![],
             busy: BTreeMap::new(),
             started: Instant::now(),
+            requests: 0,
             delegations: BTreeMap::new(),
             worker_text: HashMap::new(),
             usage: BTreeMap::new(),
@@ -706,6 +709,7 @@ impl Screen {
                 }
             }
             EventKind::Usage { model, usage, cost } => {
+                self.requests += 1;
                 let key = (ev.agent, model);
                 if let Some(c) = cost {
                     *self.cost.entry(key.clone()).or_default() += c;
@@ -753,7 +757,28 @@ impl Screen {
         }
         let tc = total_cost.map_or("(prices unknown)".to_string(), |c| format!("${c:>8.4}"));
         s.push_str(&format!("  {:<51} in {pi:>8} ({})  out {co:>7}  {tc}", "total", cached_share(ca, pi)));
+        if let Some(sum) = self.session_summary() {
+            s.push_str(&format!("\n  {sum}"));
+        }
         s
+    }
+
+    /// One line for the whole session: requests, input (cached share), output, cost and duration.
+    /// None before the first model request.
+    pub fn session_summary(&self) -> Option<String> {
+        if self.requests == 0 {
+            return None;
+        }
+        let (i, o) = self.total_tokens();
+        let cost = self.total_cost().map(|c| format!(" · ${c:.4}")).unwrap_or_default();
+        Some(format!(
+            "Session: {} model requests · {} in ({}) · {} out{cost} · {}",
+            self.requests,
+            fmt_tokens(i),
+            cached_share(self.total_cached(), i),
+            fmt_tokens(o),
+            fmt_secs(self.started.elapsed().as_secs())
+        ))
     }
 
     /// Cached prompt tokens across all agents (what the providers served from their prompt caches).
@@ -929,6 +954,15 @@ impl Write for PrinterOut {
     fn flush(&mut self) -> std::io::Result<()> {
         // Partial lines (streaming text) are kept until their newline arrives.
         Ok(())
+    }
+}
+
+/// 950 → "950", 12_345 → "12.3k", 2_500_000 → "2.50M".
+pub fn fmt_tokens(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => format!("{:.1}k", n as f64 / 1e3),
+        _ => format!("{:.2}M", n as f64 / 1e6),
     }
 }
 
