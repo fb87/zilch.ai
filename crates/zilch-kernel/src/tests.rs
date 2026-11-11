@@ -1031,3 +1031,154 @@ fn a_task_still_making_progress_gets_more_budget_one_going_in_circles_does_not()
     assert!(!run.seen.iter().any(|e| matches!(e, KernelEvent::Signal { reason, .. } if reason.contains("budget extended"))), "{summary}");
     assert!(summary.contains("model-call budget exhausted (10 calls"), "wrap-up note, then stopped after the grace: {summary}");
 }
+
+#[test]
+fn the_main_agent_dispatches_a_planner_whose_plan_runs_and_whose_report_comes_back() {
+    // Main: dispatch the order to a planner, then serve with what it reported.
+    struct Main;
+    impl Agent for Main {
+        fn step(&mut self, _: &AcbView, wake: Vec<SyscallResult>) -> StepResult {
+            let last = wake.first().map(SyscallResult::text).unwrap_or_default();
+            if let Some(report) = last.strip_prefix("Report from the plan subagent:\n") {
+                return StepResult::Syscalls(vec![Syscall::Serve { summary: format!("main: {report}") }]);
+            }
+            if last.contains("did not finish") || last.starts_with("no subagent") {
+                return StepResult::Syscalls(vec![Syscall::Serve { summary: last }]);
+            }
+            StepResult::Syscalls(vec![Syscall::Dispatch { agent: "plan".into(), brief: "build a and b".into() }])
+        }
+    }
+    // Planner: explores, plans, and reports when the plan has run.
+    struct Planner(u8);
+    impl Agent for Planner {
+        fn step(&mut self, _: &AcbView, wake: Vec<SyscallResult>) -> StepResult {
+            self.0 += 1;
+            let last = wake.first().map(SyscallResult::text).unwrap_or_default();
+            match self.0 {
+                1 => StepResult::Syscalls(vec![Syscall::Explore { questions: vec!["where?".into()] }]),
+                2 => {
+                    assert!(last.starts_with("All explorers reported"), "{last}");
+                    StepResult::Syscalls(vec![Syscall::SubmitPlan { tasks: vec![task("T1", &[], &["a"]), task("T2", &[], &["b"])] }])
+                }
+                _ => {
+                    assert!(last.starts_with("All tasks finished"), "{last}");
+                    StepResult::Exit(ExitStatus::ok("a and b are built"))
+                }
+            }
+        }
+    }
+    struct B;
+    impl Recipes for B {
+        fn architect(&self, _: TicketId, _: &str) -> Box<dyn Agent> {
+            Box::new(Main)
+        }
+        fn developer(&self, _: TicketId, _: &PlanTask, _: &str) -> Box<dyn Agent> {
+            worker()(&task("w", &[], &[]))
+        }
+        fn explorer(&self, _: TicketId, _: &str) -> Option<Box<dyn Agent>> {
+            Some(Box::new(Scripted(0, |_, _, _| StepResult::Exit(ExitStatus::ok("over there")))))
+        }
+        fn subagent(&self, _: TicketId, agent: &str, brief: &str) -> Option<Box<dyn Agent>> {
+            assert_eq!(brief, "build a and b");
+            (agent == "plan").then(|| Box::new(Planner(0)) as Box<dyn Agent>)
+        }
+    }
+    let bus = Arc::new(EventBus::new());
+    let events = bus.subscribe(10_000);
+    let k = start(cfg(), Arc::new(FakeDrivers::default()), Arc::new(B), bus);
+    let mut run = Run { k, events, seen: vec![] };
+    run.k.send(Cmd::Order("add a and b".into()));
+    let (ok, summary) = run.served();
+    assert!(ok && summary == "main: a and b are built", "{summary}");
+    // The developers were the planner's children, and the planner the main agent's.
+    let parent = |p: Pid| {
+        run.seen.iter().find_map(|e| match e {
+            KernelEvent::Spawned { pid, parent, .. } if *pid == p => Some(*parent),
+            _ => None,
+        })
+    };
+    let devs: Vec<Pid> = run
+        .seen
+        .iter()
+        .filter_map(|e| match e {
+            KernelEvent::Spawned { pid, title, .. } if title.starts_with("[T") => Some(*pid),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(devs.len(), 2);
+    let planner = parent(devs[0]).flatten().expect("a parent");
+    assert_eq!(parent(planner), Some(Some(1)));
+}
+
+#[test]
+fn only_the_main_agent_dispatches_and_only_known_subagents() {
+    struct Main;
+    impl Agent for Main {
+        fn step(&mut self, _: &AcbView, wake: Vec<SyscallResult>) -> StepResult {
+            match wake.first().map(SyscallResult::text) {
+                None => StepResult::Syscalls(vec![Syscall::Dispatch { agent: "chef".into(), brief: "cook".into() }]),
+                Some(t) if t.contains("Order #") => {
+                    StepResult::Syscalls(vec![Syscall::Dispatch { agent: "chef".into(), brief: "cook".into() }])
+                }
+                Some(t) => StepResult::Syscalls(vec![Syscall::Serve { summary: t }]),
+            }
+        }
+    }
+    struct B;
+    impl Recipes for B {
+        fn architect(&self, _: TicketId, _: &str) -> Box<dyn Agent> {
+            Box::new(Main)
+        }
+        fn developer(&self, _: TicketId, _: &PlanTask, _: &str) -> Box<dyn Agent> {
+            worker()(&task("w", &[], &[]))
+        }
+    }
+    let bus = Arc::new(EventBus::new());
+    let events = bus.subscribe(10_000);
+    let k = start(cfg(), Arc::new(FakeDrivers::default()), Arc::new(B), bus);
+    let mut run = Run { k, events, seen: vec![] };
+    run.k.send(Cmd::Order("x".into()));
+    let (_, summary) = run.served();
+    assert!(summary.contains("no subagent 'chef'"), "{summary}");
+}
+
+#[test]
+fn a_repeated_dispatch_in_one_step_runs_once() {
+    // The model asks twice in one step: the first dispatch runs, the second is refused.
+    struct Main;
+    impl Agent for Main {
+        fn step(&mut self, _: &AcbView, wake: Vec<SyscallResult>) -> StepResult {
+            match wake.first().map(SyscallResult::text) {
+                Some(t) if t.starts_with("Report from") => {
+                    assert!(wake[1].text().contains("the first one in this step runs"), "{}", wake[1].text());
+                    StepResult::Syscalls(vec![Syscall::Serve { summary: t }])
+                }
+                _ => {
+                    let d = || Syscall::Dispatch { agent: "answer".into(), brief: "why?".into() };
+                    StepResult::Syscalls(vec![d(), d()])
+                }
+            }
+        }
+    }
+    struct B;
+    impl Recipes for B {
+        fn architect(&self, _: TicketId, _: &str) -> Box<dyn Agent> {
+            Box::new(Main)
+        }
+        fn developer(&self, _: TicketId, _: &PlanTask, _: &str) -> Box<dyn Agent> {
+            worker()(&task("w", &[], &[]))
+        }
+        fn subagent(&self, _: TicketId, _: &str, _: &str) -> Option<Box<dyn Agent>> {
+            Some(Box::new(Scripted(0, |_, _, _| StepResult::Exit(ExitStatus::ok("because")))))
+        }
+    }
+    let bus = Arc::new(EventBus::new());
+    let events = bus.subscribe(10_000);
+    let k = start(cfg(), Arc::new(FakeDrivers::default()), Arc::new(B), bus);
+    let mut run = Run { k, events, seen: vec![] };
+    run.k.send(Cmd::Order("why?".into()));
+    let (ok, summary) = run.served();
+    assert!(ok && summary == "Report from the answer subagent:\nbecause", "{summary}");
+    let spawned = run.seen.iter().filter(|e| matches!(e, KernelEvent::Spawned { title, .. } if title.starts_with("answer"))).count();
+    assert_eq!(spawned, 1);
+}

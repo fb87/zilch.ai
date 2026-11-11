@@ -59,7 +59,7 @@ pub fn complete(line: &str, pos: usize, live: &Live) -> (usize, Vec<String>) {
         }
         ["/model"] => pick(words(&["main", "developer"]), true),
         ["/model", "main" | "developer"] => pick(words(&["default"]).into_iter().chain(live.models.iter().cloned()).collect(), true),
-        ["/prompt"] => pick(words(&["main", "developer"]), false),
+        ["/prompt"] => pick(words(&["main", "answerer", "planner", "developer", "spec"]), false),
         ["/kill"] => pick(pids(), false),
         _ => vec![],
     };
@@ -88,7 +88,7 @@ mod tests {
         assert_eq!(c("/model main glm"), ["glm-5.3 ", "glm-5.3-flash "]);
         assert_eq!(c("/model main de"), ["default "]);
         assert_eq!(c("/kill 1"), ["1", "12"]);
-        assert_eq!(c("/prompt "), ["developer", "main"]);
+        assert_eq!(c("/prompt "), ["answerer", "developer", "main", "planner", "spec"]);
         assert!(c("/model main glm-5.3 x").is_empty(), "nothing after the last argument");
     }
 

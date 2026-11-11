@@ -128,6 +128,11 @@ pub trait Recipes: Send + Sync + 'static {
     fn explorer(&self, _ticket: TicketId, _question: &str) -> Option<Box<dyn Agent>> {
         None
     }
+    /// A subagent the code lane's main agent dispatches an order to (`agent`: "answer" or "plan"),
+    /// with a self-contained brief (None: no such subagent).
+    fn subagent(&self, _ticket: TicketId, _agent: &str, _brief: &str) -> Option<Box<dyn Agent>> {
+        None
+    }
     /// The spec lane's resident agent (None: this kitchen has no spec lane).
     fn spec(&self, _ticket: TicketId, _order: &str) -> Option<Box<dyn Agent>> {
         None
@@ -392,6 +397,8 @@ struct PlanRun {
     tasks: Vec<PlanTask>,
     runs: Vec<TaskRun>,
     approved: bool,
+    /// Who submitted it (the main agent, or a planner it dispatched): gets the answer and the results.
+    owner: Pid,
 }
 
 struct Ticket {
@@ -513,6 +520,8 @@ pub struct Kernel {
     session_cancel: CancelToken,
     /// Explorations in progress: explorer pid → (the agent that asked, which question).
     explorers: BTreeMap<Pid, (Pid, usize)>,
+    /// Dispatched subagent → (the main agent waiting for it, its batch, the subagent kind).
+    dispatched: BTreeMap<Pid, (Pid, u64, String)>,
     /// Per asking agent: (its batch, its parked slot, the questions, the reports so far).
     explorations: BTreeMap<Pid, Exploration>,
     acbs: BTreeMap<Pid, Acb>,
@@ -616,6 +625,7 @@ impl Kernel {
             pending_orders: VecDeque::new(),
             session_cancel: CancelToken::new(),
             explorers: BTreeMap::new(),
+            dispatched: BTreeMap::new(),
             explorations: BTreeMap::new(),
             acbs: BTreeMap::new(),
             queues: Default::default(),
@@ -1127,26 +1137,28 @@ impl Kernel {
         // Calls that park the agent use its one parked slot: at most one per step. recv and serve
         // also change what the agent waits for, so they come alone; submit_plan and explore may share
         // a step with ordinary tool calls.
-        let parking = calls
-            .iter()
-            .filter(|c| matches!(c, Syscall::Recv | Syscall::SubmitPlan { .. } | Syscall::Serve { .. } | Syscall::Explore { .. }))
-            .count();
         let alone_needed = calls.iter().any(|c| matches!(c, Syscall::Recv | Syscall::Serve { .. }));
-        let exclusive = parking > 1 || (alone_needed && n > 1);
+        // recv / serve mixed with other calls: none of them runs. Several other parking calls: the
+        // first runs, the rest are refused (a model repeating a call loses nothing).
+        let refuse_all = alone_needed && n > 1;
+        let mut parked = false;
         for (idx, call) in calls.into_iter().enumerate() {
             self.bus.publish(KernelEvent::SyscallIssued { pid, idx, summary: call.summary() });
+            let parks = matches!(
+                call,
+                Syscall::Recv | Syscall::SubmitPlan { .. } | Syscall::Serve { .. } | Syscall::Explore { .. } | Syscall::Dispatch { .. }
+            );
+            if parks && (refuse_all || parked) {
+                let why = if refuse_all {
+                    "recv and serve must be the only call in their step; call it again by itself"
+                } else {
+                    "only one of submit_plan / explore / dispatch per step: the first one in this step runs, this one did not"
+                };
+                self.fill(pid, batch, idx, SyscallResult::Failed(why.into()));
+                continue;
+            }
+            parked |= parks;
             match call {
-                Syscall::Recv | Syscall::SubmitPlan { .. } | Syscall::Serve { .. } | Syscall::Explore { .. } if exclusive => {
-                    self.fill(
-                        pid,
-                        batch,
-                        idx,
-                        SyscallResult::Failed(
-                            "only one of recv / serve / submit_plan / explore per step (recv and serve alone); call it again by itself"
-                                .into(),
-                        ),
-                    );
-                }
                 Syscall::Send { to, kind, body } => {
                     let r = self.send_msg(pid, to, kind, body);
                     self.fill(pid, batch, idx, r);
@@ -1166,6 +1178,7 @@ impl Kernel {
                 Syscall::SubmitPlan { tasks } => self.submit_plan(pid, batch, idx, tasks),
                 Syscall::Serve { summary } => self.serve(pid, batch, idx, summary),
                 Syscall::Explore { questions } => self.explore(pid, batch, idx, questions),
+                Syscall::Dispatch { agent, brief } => self.hand_off(pid, batch, idx, agent, brief),
                 call @ (Syscall::Complete(_) | Syscall::Tool { .. }) => {
                     if let Syscall::Tool { name, args, .. } = &call {
                         let access = self.drivers.classify(name, args);
@@ -1442,8 +1455,13 @@ impl Kernel {
     /// A lane's main agent asks questions: one read-only explorer each, in parallel; the agent waits
     /// (blocked on its children) and gets all reports at once.
     fn explore(&mut self, pid: Pid, batch: u64, idx: usize, questions: Vec<String>) {
-        if !self.is_main(pid) {
-            return self.fill(pid, batch, idx, SyscallResult::Failed("only a main agent may send explorers".into()));
+        if !self.is_main(pid) && !self.dispatched.contains_key(&pid) {
+            return self.fill(
+                pid,
+                batch,
+                idx,
+                SyscallResult::Failed("only a main agent or a subagent it dispatched may send explorers".into()),
+            );
         }
         let questions: Vec<String> = questions.into_iter().map(|q| q.trim().to_string()).filter(|q| !q.is_empty()).take(8).collect();
         if questions.is_empty() {
@@ -1492,15 +1510,57 @@ impl Kernel {
         }
     }
 
+    // ── dispatch ──
+
+    /// The code lane's main agent hands the order to one subagent and waits for its report.
+    fn hand_off(&mut self, pid: Pid, batch: u64, idx: usize, agent: String, brief: String) {
+        if self.mains.get(&Group::Architecture) != Some(&pid) {
+            return self.fill(pid, batch, idx, SyscallResult::Failed("only the code lane's main agent may dispatch".into()));
+        }
+        let agent = agent.trim().to_lowercase();
+        if brief.trim().is_empty() {
+            return self.fill(pid, batch, idx, SyscallResult::Failed("the brief is empty: say what the subagent should do".into()));
+        }
+        let ticket = self.acbs.get(&pid).map(|a| a.ticket).unwrap_or_default();
+        let Some(sub) = self.recipes.subagent(ticket, &agent, &brief) else {
+            return self.fill(pid, batch, idx, SyscallResult::Failed(format!("no subagent '{agent}': use \"answer\" or \"plan\"")));
+        };
+        let cancel = self.tickets.get(&ticket).map(|t| t.cancel.child()).unwrap_or_default();
+        // Dispatched agents read; a planner's developers write (their caps come with the plan).
+        let caps = Caps { write: vec![], write_any: false, exec: false };
+        let title = format!("{agent}: {}", brief.lines().next().unwrap_or("").chars().take(50).collect::<String>());
+        let child = self.spawn(sub, Some(pid), ticket, Group::Development, title, caps, cancel.child(), 0);
+        self.dispatched.insert(child, (pid, batch, agent));
+        if let Some(a) = self.acbs.get_mut(&pid) {
+            a.parked_slot = Some(idx);
+        }
+        self.set_state(pid, State::Blocked(Block::Child));
+    }
+
+    /// A dispatched subagent ended: its report goes to the main agent that dispatched it.
+    fn dispatch_done(&mut self, pid: Pid, ok: bool, report: &str) {
+        let Some((asker, batch, agent)) = self.dispatched.remove(&pid) else { return };
+        let report: String = report.trim().chars().take(20_000).collect();
+        let head = if ok { format!("Report from the {agent} subagent:") } else { format!("The {agent} subagent did not finish:") };
+        if self.acbs.get(&asker).is_some_and(|a| a.batch == batch) {
+            self.wake_parked(asker, SyscallResult::Output(format!("{head}\n{report}")));
+        }
+    }
+
     // ── plans ──
 
     fn submit_plan(&mut self, pid: Pid, batch: u64, idx: usize, tasks: Vec<PlanTask>) {
         let (ticket, is_root) = match self.acbs.get(&pid) {
-            Some(a) => (a.ticket, self.tickets.get(&a.ticket).is_some_and(|t| t.root == pid)),
+            Some(a) => (a.ticket, self.tickets.get(&a.ticket).is_some_and(|t| t.root == pid) || self.dispatched.contains_key(&pid)),
             None => return,
         };
         if !is_root {
-            return self.fill(pid, batch, idx, SyscallResult::Failed("only the main agent may submit a plan".into()));
+            return self.fill(
+                pid,
+                batch,
+                idx,
+                SyscallResult::Failed("only the main agent or a planner it dispatched may submit a plan".into()),
+            );
         }
         if self.tickets.get(&ticket).is_none_or(|t| t.served) {
             return self.fill(
@@ -1525,7 +1585,7 @@ impl Kernel {
         let text = render_plan(&tasks);
         let runs = tasks.iter().map(|_| TaskRun { status: TaskStatus::Pending, pid: None, report: String::new() }).collect();
         if let Some(t) = self.tickets.get_mut(&ticket) {
-            t.plan = Some(PlanRun { tasks, runs, approved: false });
+            t.plan = Some(PlanRun { tasks, runs, approved: false, owner: pid });
         }
         if let Some(a) = self.acbs.get_mut(&pid) {
             a.parked_slot = Some(idx);
@@ -1552,7 +1612,7 @@ impl Kernel {
             }
             None => return,
         };
-        let Some(root) = self.tickets.get(&ticket).map(|t| t.root) else { return };
+        let Some(root) = self.tickets.get(&ticket).map(|t| t.plan.as_ref().map_or(t.root, |p| p.owner)) else { return };
         let reply = match text.trim().to_lowercase().as_str() {
             "y" | "yes" | "approve" => None,
             "r" | "n" | "no" | "reject" => {
@@ -1597,8 +1657,9 @@ impl Kernel {
     /// Start every task that can run; when none is left running, hand the digest to the architect.
     fn fire(&mut self, ticket: TicketId) {
         let Some(t) = self.tickets.get_mut(&ticket) else { return };
-        let (root, cancel) = (t.root, t.cancel.clone());
+        let cancel = t.cancel.clone();
         let Some(p) = t.plan.as_mut().filter(|p| p.approved) else { return };
+        let root = p.owner;
         let mut status: Vec<TaskStatus> = p.runs.iter().map(|r| r.status).collect();
         let blocked = plan::propagate_failures(&p.tasks, &mut status);
         for i in &blocked {
@@ -1640,6 +1701,7 @@ impl Kernel {
         self.bus.publish(KernelEvent::Exited { pid, ok: st.ok, report: st.report.clone() });
         self.drivers.release(pid);
         self.explorer_done(pid, &st.report);
+        self.dispatch_done(pid, st.ok, &st.report);
         if let Some(lane) = self.mains.iter().find(|(_, m)| **m == pid).map(|(l, _)| *l) {
             // A lane's resident agent itself ended (exit, kill, budget, crash): its current order
             // ends with its last word; its queued orders cannot be served by it. The lane's next

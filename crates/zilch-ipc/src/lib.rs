@@ -164,6 +164,9 @@ pub enum Syscall {
     /// A lane's main agent: investigate these questions with read-only explorers, one per question,
     /// in parallel; the result holds every explorer's report.
     Explore { questions: Vec<String> },
+    /// The code lane's main agent hands the order to one subagent (`agent`: "answer" or "plan") with a
+    /// self-contained brief; the result is that subagent's report.
+    Dispatch { agent: String, brief: String },
 }
 
 impl Syscall {
@@ -184,6 +187,7 @@ impl Syscall {
             Syscall::SubmitPlan { tasks } => format!("submit_plan ({} tasks)", tasks.len()),
             Syscall::Serve { .. } => "serve".into(),
             Syscall::Explore { questions } => format!("explore ({} question(s))", questions.len()),
+            Syscall::Dispatch { agent, .. } => format!("dispatch ({agent})"),
         }
     }
 }

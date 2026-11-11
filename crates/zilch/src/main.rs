@@ -407,7 +407,7 @@ Type an order to place it. While a plan waits for you: y approves, n rejects, an
 /models      the model of the main agent and the subagents
 /model <main|developer> <model> [provider]   switch for this session (`default` switches back)
 /ack         silence the high-cost model warning until its next step
-/prompt [main|developer]   the system prompt
+/prompt [main|answerer|planner|developer|spec]   the system prompt
 /sessions    this directory's saved sessions (--resume <id> continues one)
 /recap       this session's orders and the last answer
 /clear       start a fresh session (new main agent, empty context; the old one stays resumable)
@@ -892,10 +892,13 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                     None => println!("({msg})"),
                 }
             }
-            "/prompt" => {
-                let group = if arg.starts_with("dev") { Group::Development } else { Group::Architecture };
-                println!("{}", book.system_prompt(group));
-            }
+            "/prompt" => match arg {
+                a if a.starts_with("dev") => println!("{}", book.system_prompt(Group::Development)),
+                a if a.starts_with("plan") => println!("{}", book.subagent_prompt("plan").unwrap_or_default()),
+                a if a.starts_with("answer") => println!("{}", book.subagent_prompt("answer").unwrap_or_default()),
+                a if a.starts_with("spec") => println!("{}", book.system_prompt(Group::Spec)),
+                _ => println!("{}", book.system_prompt(Group::Architecture)),
+            },
             "/about" => println!("{}", about(&cwd, &cfg.sources, session_path.as_ref())),
             "/redraw" => {
                 if color {

@@ -22,6 +22,23 @@ pub const MAIN_PROMPT: &str = include_str!("../prompts/main.md");
 pub const DEVELOPER_PROMPT: &str = include_str!("../prompts/developer.md");
 pub const SPEC_PROMPT: &str = include_str!("../prompts/spec.md");
 pub const EXPLORER_PROMPT: &str = include_str!("../prompts/explorer.md");
+pub const ANSWERER_PROMPT: &str = include_str!("../prompts/answerer.md");
+pub const PLANNER_PROMPT: &str = include_str!("../prompts/planner.md");
+
+/// The main agent's only tool: hand the order to one subagent.
+pub fn dispatch_spec() -> ToolSpec {
+    ToolSpec::new(
+        "dispatch",
+        "Hand the guest's order to one subagent and wait for its report. agent \"answer\": questions, explanations, \
+         checks, anything conversational. agent \"plan\": any change to the project (it plans, the guest approves, \
+         developers carry it out). The brief is all the subagent sees: the request word for word plus the session \
+         context it needs.",
+        json!({"type":"object","properties":{
+            "agent":{"type":"string","enum":["answer","plan"]},
+            "brief":{"type":"string","description":"Self-contained: the guest's request verbatim and the context needed"}
+        },"required":["agent","brief"]}),
+    )
+}
 
 /// The main agent's fan-out tool: questions answered by read-only explorers in parallel.
 pub fn explore_spec() -> ToolSpec {
@@ -189,6 +206,9 @@ impl LlmAgent {
                         Ok(questions) => syscalls.push(Syscall::Explore { questions }),
                         Err(e) => return Some(format!("Error: explore needs `questions`, a list of strings: {e}")),
                     }
+                } else if c.function.name == "dispatch" {
+                    let field = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                    syscalls.push(Syscall::Dispatch { agent: field("agent"), brief: field("brief") });
                 } else if c.function.name == "submit_plan" {
                     match serde_json::from_value::<Vec<PlanTask>>(args.get("tasks").cloned().unwrap_or(Value::Null)) {
                         Ok(tasks) => syscalls.push(Syscall::SubmitPlan { tasks }),
@@ -328,7 +348,10 @@ fn with_override(base: &str, o: Option<&(String, bool)>) -> String {
 pub struct Book {
     pub architect: SharedBinding,
     pub developer: SharedBinding,
+    /// The main agent's tools (just `dispatch`).
     pub architect_tools: Vec<ToolSpec>,
+    /// Read-only tools of the subagents the main agent dispatches (answerer, planner).
+    pub read_tools: Vec<ToolSpec>,
     pub developer_tools: Vec<ToolSpec>,
     /// Environment section shared by every prompt (workspace, OS, date, AGENTS.md).
     pub environment: String,
@@ -351,20 +374,20 @@ pub struct Book {
 }
 
 impl Book {
-    /// `architect_tools` should not include `submit_plan`; it is added here.
+    /// `read_tools`: what the answerer and planner read with (explore and submit_plan are added
+    /// here); the main agent itself only dispatches.
     pub fn new(
         architect: ModelBinding,
         developer: ModelBinding,
-        mut architect_tools: Vec<ToolSpec>,
+        read_tools: Vec<ToolSpec>,
         developer_tools: Vec<ToolSpec>,
         cwd: &Path,
     ) -> Self {
-        architect_tools.push(submit_plan_spec());
-        architect_tools.push(explore_spec());
         Self {
             architect: Arc::new(RwLock::new(architect)),
             developer: Arc::new(RwLock::new(developer)),
-            architect_tools,
+            architect_tools: vec![dispatch_spec()],
+            read_tools,
             developer_tools,
             environment: environment(cwd),
             main_context_tokens: 64_000,
@@ -402,27 +425,10 @@ impl Book {
 
     /// `/prompt`: the system prompt a group's agents get.
     pub fn system_prompt(&self, group: Group) -> String {
-        let main = with_override(MAIN_PROMPT, self.prompts.get(&Group::Architecture));
-        let profiles = if self.profiles.is_empty() {
-            String::new()
-        } else {
-            let list: String = self.profiles.iter().map(|p| format!("\n  - {}: {}", p.name, p.description)).collect();
-            format!("\nSubagent profiles a task can name in `worker` (default: developer):{list}")
-        };
         match group {
-            // Mention the spec lane's design and plan only when they exist, so the main agent does not go
-            // looking for them on every order.
-            Group::Architecture
-                if !self.spec_dir.is_empty()
-                    && ["design.md", "plan.md"].iter().any(|f| std::path::Path::new(&self.spec_dir).join(f).is_file()) =>
-            {
-                format!(
-                    "{main}{profiles}\nThe spec lane has written {dir}/design.md and {dir}/plan.md. When an order asks to build from the spec or the plan, read them and work from them (do not edit them); otherwise ignore them.\n{}",
-                    self.environment,
-                    dir = self.spec_dir
-                )
+            Group::Architecture => {
+                format!("{}\n{}", with_override(MAIN_PROMPT, self.prompts.get(&Group::Architecture)), self.environment)
             }
-            Group::Architecture => format!("{main}{profiles}\n{}", self.environment),
             Group::Spec => format!(
                 "{}\n- Spec directory: {}\n{}",
                 with_override(SPEC_PROMPT, self.prompts.get(&Group::Spec)),
@@ -430,6 +436,35 @@ impl Book {
                 self.environment
             ),
             _ => format!("{}\n{}", with_override(DEVELOPER_PROMPT, self.prompts.get(&Group::Development)), self.environment),
+        }
+    }
+
+    /// The prompt of a subagent the main agent dispatches to ("answer" or "plan").
+    pub fn subagent_prompt(&self, agent: &str) -> Option<String> {
+        match agent {
+            "answer" => Some(format!("{ANSWERER_PROMPT}\n{}", self.environment)),
+            "plan" => {
+                let profiles = if self.profiles.is_empty() {
+                    String::new()
+                } else {
+                    let list: String = self.profiles.iter().map(|p| format!("\n  - {}: {}", p.name, p.description)).collect();
+                    format!("\nDeveloper profiles a task can name in `worker` (default: developer):{list}\n")
+                };
+                // Mention the spec lane's design and plan only when they exist, so the planner does
+                // not go looking for them on every change.
+                let spec = if !self.spec_dir.is_empty()
+                    && ["design.md", "plan.md"].iter().any(|f| Path::new(&self.spec_dir).join(f).is_file())
+                {
+                    format!(
+                        "\nThe spec lane has written {dir}/design.md and {dir}/plan.md. When the brief asks to build from the spec or the plan, read them and work from them (do not edit them); otherwise ignore them.\n",
+                        dir = self.spec_dir
+                    )
+                } else {
+                    String::new()
+                };
+                Some(format!("{PLANNER_PROMPT}{profiles}{spec}\n{}", self.environment))
+            }
+            _ => None,
         }
     }
 
@@ -473,6 +508,22 @@ impl Recipes for Book {
                 self.session(ticket, Group::Development),
             )
             .with_shared_binding(self.developer.clone()),
+        ))
+    }
+
+    fn subagent(&self, ticket: TicketId, agent: &str, brief: &str) -> Option<Box<dyn Agent>> {
+        let system = self.subagent_prompt(agent)?;
+        let mut tools = self.read_tools.clone();
+        if !self.explorer_tools.is_empty() {
+            tools.push(explore_spec());
+        }
+        if agent == "plan" {
+            tools.push(submit_plan_spec());
+        }
+        // They do the thinking the guest is waiting for: the main agent's model.
+        Some(Box::new(
+            LlmAgent::new(self.binding(Group::Architecture), system, brief.to_string(), tools, self.session(ticket, Group::Architecture))
+                .with_shared_binding(self.architect.clone()),
         ))
     }
 

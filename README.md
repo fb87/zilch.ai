@@ -6,9 +6,9 @@ the waiter, a kernel is the kitchen, agents are cooks. No agent framework and no
 plain `std` threads.
 
 - **One main agent, many subagents.** You talk to one main agent that keeps the whole session's
-  context. For a change it writes requirements, a design and a plan; you approve the plan; the
-  kernel starts one fresh **subagent** per task and runs independent tasks in parallel. Each
-  subagent may write only the files its task owns.
+  context and only dispatches: a question goes to an **answerer**, a change to a **planner**. You
+  approve the planner's plan; the kernel starts one fresh **developer** per task and runs
+  independent tasks in parallel. Each developer may write only the files its task owns.
 - **A real kernel.** Agents are processes with a pid, run one step at a time on a pool of step
   workers, and reach the outside world only through syscalls (model calls and tool calls alike) run
   on driver pools. A timer tick drives a supervisor that nudges, restarts or stops looping and hung
@@ -20,8 +20,8 @@ plain `std` threads.
  you ⇄ CLI (waiter) ──orders/answers──▶ KERNEL (kitchen) ──events──▶ CLI, JSONL log
                                           │ process table · scheduler + timer tick · supervisor
             ┌─────────────────────────────┼───────────────────────────────┐
-     main agent (code lane)        spec agent (spec lane)        subagents, explorers
-     no writes · plans · explore   spec.md / design / plan       owned paths · read-only
+     main agent (code lane)        spec agent (spec lane)        answerer · planner · developers
+     dispatch only                 spec.md / design / plan       read · read+plan · owned paths
             └──── syscalls ──▶ driver pools: LLM (HTTP) · files/search/git · bash (sandbox)
 ```
 
@@ -46,16 +46,19 @@ OPENAI_BASE_URL=http://localhost:11434/v1 zilch --model qwen2.5-coder   # Ollama
 ```
 
 How an order flows:
-1. The main agent explores the code (several read-only **explorers** can investigate in parallel).
-2. It works out the requirements and design and calls `submit_plan`; it writes no files itself, so
-   your project gets no planning documents (approved plans are kept with the session, outside it).
+1. The main agent dispatches it with a self-contained brief: a question, explanation or check to the
+   read-only **answerer** (its report comes back and the main agent replies; no plan, nothing to
+   approve), a change to the **planner**.
+2. The planner reads what the change touches (read-only **explorers** can investigate a large
+   codebase in parallel) and calls `submit_plan`. Nobody writes planning documents into your
+   project (approved plans are kept with the session, outside it).
 3. You see the tasks grouped into parallel waves: `y` approves, `n` rejects, anything else is
    feedback. A stray Enter never approves.
 4. The kernel runs the plan as a dependency graph: independent tasks at once on their own
    subagents, dependents after them, overlapping file scopes never at the same time. A failed task
    blocks its dependents.
-5. The main agent checks the result and replies; that serves the order. Orders typed while it is
-   busy are queued; a follow-up can refer to earlier orders.
+5. The planner checks the result and reports; the main agent replies, which serves the order.
+   Orders typed while it is busy are queued; a follow-up can refer to earlier orders.
 
 **REPL commands**
 
@@ -67,7 +70,7 @@ How an order flows:
 | `/spec` · `/code` · `/status` | switch lanes · which lane you type into, what runs, the spec documents' state |
 | `/usage` · `/models` · `/model main\|developer <model> [provider]` · `/ack` | tokens and USD · models in use · switch for this session (`default` switches back) · silence the high-cost warning |
 | `/sessions` · `/recap` · `/clear` | saved sessions · this session's orders and last answer · a fresh session |
-| `/prompt [main\|developer]` · `/about` · `/redraw` · `/help` · `/exit` | |
+| `/prompt [main\|answerer\|planner\|developer\|spec]` · `/about` · `/redraw` · `/help` · `/exit` | |
 
 Tab completes commands, their arguments (groups, model names from the providers' lists, live pids)
 and `@` mentions. A status row above the prompt shows what each busy process is doing, a waiting
@@ -121,7 +124,7 @@ tools = ["read_file", "glob", "grep", "bash"]
 developer = 2_000_000
 ```
 
-Custom profiles can also be files: `.zilch/agents/<name>.toml`. The main agent sees the profiles
+Custom profiles can also be files: `.zilch/agents/<name>.toml`. The planner sees the profiles
 and gives a task to one with the task's `worker` field; the task then runs on that profile's model,
 tools and prompt. Every agent's prompt ends with the environment (workspace, OS, date) and the
 nearest `AGENTS.md`. Startup stops if a group's provider is unknown or its key is missing.
@@ -148,8 +151,9 @@ crates/zilch          the `zilch` binary: REPL, status row, plan/command questio
   calls and tool calls are syscalls that run on driver pools (commands on their own pool), several
   per step in parallel, so step workers never wait on the network. Long calls send heartbeats, so
   slow is not mistaken for stuck.
-- **Capabilities.** The main agent writes nothing, the spec agent only its spec documents,
-  a subagent only its task's `owned_paths`, explorers nothing; only subagents run commands.
+- **Capabilities.** The main agent only dispatches; the answerer, planner and explorers only read;
+  the spec agent writes only its spec documents, a developer only its task's `owned_paths`; only
+  developers run commands.
 - **Supervisor** (code only, no extra model calls). Loops are compared after removing what changes
   from run to run (durations, timestamps, temp paths, addresses): the same call with the same result
   3×, the same reply 3×, 5 failing steps in a row, or a reply that keeps repeating itself while it
@@ -171,7 +175,7 @@ few focused questions per turn, with suggested answers) and maintains `spec.md` 
 stable ids and EARS acceptance criteria), `design.md` and `plan.md` in `spec_dir`. Versioning is
 enforced by zilch: `release_spec` freezes the draft as an immutable `versions/spec-vN.md` with a
 changelog entry, and design and plan are stamped with the spec version they derive from. `/code`
-switches back; the main agent works from the spec lane's design and plan. Both lanes run in
+switches back; the planner works from the spec lane's design and plan. Both lanes run in
 parallel; spec orders are marked in the output.
 
 ## Sessions

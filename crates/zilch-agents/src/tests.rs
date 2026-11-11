@@ -52,10 +52,25 @@ fn an_order_is_planned_approved_cooked_in_parallel_and_served() {
                 let reply = if remembers { "Earlier I had a, b and c written." } else { "I do not know." };
                 return vec![LlmEvent::TextDelta(reply.into()), usage];
             }
+            // The main agent only dispatches, then replies with the report.
+            let tools: Vec<&str> = req.tools.iter().map(|t| t.function.name.as_str()).collect();
+            assert_eq!(tools, ["dispatch"]);
+            return match last_tool_result(req) {
+                Some(r) if r.starts_with("Report from the plan subagent:") => {
+                    assert!(r.contains("planner: a, b and c are in place"), "{r}");
+                    vec![LlmEvent::TextDelta("Summary: a, b and c were written.".into()), usage]
+                }
+                _ => vec![call(0, "dispatch", json!({"agent":"plan","brief":"Order: write a, b and c"})), usage],
+            };
+        }
+        if system.contains("PLANNER") {
+            assert_eq!(first_user, "Order: write a, b and c");
+            let tools: Vec<&str> = req.tools.iter().map(|t| t.function.name.as_str()).collect();
+            assert!(tools.contains(&"submit_plan") && !tools.contains(&"write_file"), "{tools:?}");
             return match last_tool_result(req) {
                 Some(r) if r.starts_with("All tasks finished") => {
                     assert!(r.contains("[T3] Write c — Done"), "{r}");
-                    vec![LlmEvent::TextDelta("Summary: a, b and c were written.".into()), usage]
+                    vec![LlmEvent::TextDelta("planner: a, b and c are in place".into()), usage]
                 }
                 _ => vec![
                     call(0, "submit_plan", json!({"tasks":[
@@ -340,7 +355,7 @@ fn prompt_overrides_apply_and_a_task_can_run_on_a_custom_profile() {
     });
     let main = book.system_prompt(Group::Architecture);
     assert!(main.starts_with("You are terse.") && !main.contains("MAIN agent"), "replace drops the built-in prompt");
-    assert!(main.contains("- tester: runs tests"), "the main agent learns the profiles");
+    assert!(book.subagent_prompt("plan").unwrap().contains("- tester: runs tests"), "the planner learns the profiles");
     let dev = book.system_prompt(Group::Development);
     assert!(dev.contains("DEVELOPER") && dev.contains("Prefer small diffs."), "append keeps the built-in prompt");
     // A task naming the profile asks its model, with its prompt.
