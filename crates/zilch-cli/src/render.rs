@@ -845,9 +845,9 @@ fn clip(s: &str, width: usize) -> String {
             c if c.is_control() => continue,
             c => c,
         };
-        // Ambiguous-width glyphs (▸, ⧉, …) are drawn two columns wide by some terminals and fonts:
-        // count them as two so the row still fits there.
-        let w = ch.width().unwrap_or(0).max(ch.width_cjk().unwrap_or(0));
+        // (A terminal drawing an ambiguous-width glyph like ▸ or ⧉ two columns wide may still overrun
+        // by a column or two; the status row is drawn with autowrap off, so it is cut, not wrapped.)
+        let w = ch.width().unwrap_or(0);
         if cols + w > max - 1 {
             out.push('…');
             out.push_str(RESET);
