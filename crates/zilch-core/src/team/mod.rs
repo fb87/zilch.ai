@@ -23,6 +23,9 @@ use todo::{Todo, TodoList, TodoStatus};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 /// State shared by the master's coordination tools, the scheduler and the pool.
+/// Size of the repository overview in the lane agents' prompts (about 2–3k tokens at most).
+const REPO_OVERVIEW_CHARS: usize = 10_000;
+
 pub struct TeamShared {
     pub cfg: Config,
     pub providers: Providers,
@@ -47,6 +50,11 @@ pub struct TeamShared {
     pub model_overrides: Mutex<std::collections::HashMap<String, ModelBinding>>,
     /// High-cost model warnings the user acknowledged: model key → (minutes step, spend step).
     cost_acked: Mutex<std::collections::HashMap<String, (u64, u64)>>,
+    /// The repository map behind the `repo_map` tool (re-scanned lazily where it is asked about).
+    pub repo_map: Arc<std::sync::Mutex<crate::repomap::RepoMap>>,
+    /// The map's overview in the lane agents' system prompts: a snapshot, so their cached prompt
+    /// prefix stays the same while workers edit files.
+    pub repo_overview: String,
 }
 
 impl TeamShared {
@@ -162,12 +170,14 @@ impl TeamShared {
             reg = reg.filter(|t| !t.mutating());
         }
         let names = reg.names();
-        let system = prompt::build(profile, &PromptEnv { cwd: &self.cfg.cwd, agent_id: &id, tools: &names, workers: &[] });
+        let system =
+            prompt::build(profile, &PromptEnv { cwd: &self.cfg.cwd, agent_id: &id, tools: &names, workers: &[], repo_overview: None });
         let llm = self.providers.get(&binding.provider)?;
         let ctx = Arc::new(
             ToolCtx::new(&id, self.cfg.cwd.clone(), self.gate.clone(), self.events.clone(), self.cancel.clone(), self.file_locks.clone())
                 .with_policy(self.policy.clone(), self.budget.clone())
-                .with_meter(self.meter.clone()),
+                .with_meter(self.meter.clone())
+                .with_repo_map(self.repo_map.clone()),
         );
         self.events.emit(&id, EventKind::InstanceSpawned { id: id.clone(), model: binding.key() });
         let agent = Agent {
@@ -384,6 +394,7 @@ impl Team {
                 protect_git: cfg.bash_protect_git,
             },
         });
+        let repo_map = crate::repomap::RepoMap::build(&cfg.cwd);
         let shared = Arc::new(TeamShared {
             pool: WorkerPool::new(cfg.max_workers),
             providers,
@@ -410,6 +421,8 @@ impl Team {
             task_failures: Mutex::default(),
             model_overrides: Mutex::default(),
             cost_acked: Mutex::default(),
+            repo_overview: repo_map.overview(REPO_OVERVIEW_CHARS),
+            repo_map: Arc::new(std::sync::Mutex::new(repo_map)),
             cfg,
         });
 
@@ -423,11 +436,21 @@ impl Team {
         let reg = reg.subset(&profile.tools);
         let names = reg.names();
         let workers = shared.worker_profiles();
-        let system = prompt::build(&profile, &PromptEnv { cwd: &shared.cfg.cwd, agent_id: "master", tools: &names, workers: &workers });
+        let system = prompt::build(
+            &profile,
+            &PromptEnv {
+                cwd: &shared.cfg.cwd,
+                agent_id: "master",
+                tools: &names,
+                workers: &workers,
+                repo_overview: Some(&shared.repo_overview),
+            },
+        );
         let ctx = Arc::new(
             ToolCtx::new("master", shared.cfg.cwd.clone(), gate, events, shared.cancel.clone(), shared.file_locks.clone())
                 .with_policy(shared.policy.clone(), shared.budget.clone())
-                .with_meter(shared.meter.clone()),
+                .with_meter(shared.meter.clone())
+                .with_repo_map(shared.repo_map.clone()),
         );
         let master = Agent {
             id: "master".into(),
@@ -455,7 +478,10 @@ impl Team {
         sreg.register(Arc::new(ReleaseSpec(shared.spec_store.clone())));
         let sreg = sreg.subset(&sprof.tools);
         let snames = sreg.names();
-        let spec_system = prompt::build(&sprof, &PromptEnv { cwd: &shared.cfg.cwd, agent_id: "spec", tools: &snames, workers: &[] });
+        let spec_system = prompt::build(
+            &sprof,
+            &PromptEnv { cwd: &shared.cfg.cwd, agent_id: "spec", tools: &snames, workers: &[], repo_overview: Some(&shared.repo_overview) },
+        );
         let spec_cancel = CancelCell::default();
         let sctx = Arc::new(
             ToolCtx::new(
@@ -467,7 +493,8 @@ impl Team {
                 shared.file_locks.clone(),
             )
             .with_policy(shared.policy.clone(), shared.budget.clone())
-            .with_meter(shared.meter.clone()),
+            .with_meter(shared.meter.clone())
+            .with_repo_map(shared.repo_map.clone()),
         );
         let spec = Agent {
             id: "spec".into(),
@@ -878,7 +905,10 @@ impl Team {
         }
         let p = self.shared.cfg.profile(name)?;
         let names = self.shared.worker_tools.subset(&p.tools).names();
-        Some(prompt::build(p, &PromptEnv { cwd: &self.shared.cfg.cwd, agent_id: &format!("{name}#N"), tools: &names, workers: &[] }))
+        Some(prompt::build(
+            p,
+            &PromptEnv { cwd: &self.shared.cfg.cwd, agent_id: &format!("{name}#N"), tools: &names, workers: &[], repo_overview: None },
+        ))
     }
 
     pub async fn master_tool_names(&self) -> Vec<String> {

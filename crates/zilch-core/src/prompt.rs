@@ -45,6 +45,8 @@ pub struct PromptEnv<'a> {
     pub tools: &'a [String],
     /// (name, description) of worker profiles — shown to the master.
     pub workers: &'a [(String, String)],
+    /// The repository map's overview (lane agents; None for workers, who get a focused brief).
+    pub repo_overview: Option<&'a str>,
 }
 
 pub fn build(profile: &Profile, env: &PromptEnv) -> String {
@@ -80,6 +82,13 @@ pub fn build(profile: &Profile, env: &PromptEnv) -> String {
         }
     }
     parts.push(envs);
+
+    if let Some(map) = env.repo_overview {
+        parts.push(format!(
+            "## Repository map (taken at session start)\nEvery source directory with its purpose, and each documented file. Start here instead of searching; `repo_map` with a directory or file lists its definitions with line numbers (always current).\n{}",
+            map.trim_end()
+        ));
+    }
 
     if let Some((path, text)) = find_agents_md(env.cwd) {
         parts.push(format!("## Project instructions ({})\n{}", path.display(), text.trim()));
@@ -200,7 +209,7 @@ mod tests {
     }
 
     fn env<'a>(tools: &'a [String], workers: &'a [(String, String)]) -> PromptEnv<'a> {
-        PromptEnv { cwd: Path::new("/nonexistent/zz"), agent_id: "coder#1", tools, workers }
+        PromptEnv { cwd: Path::new("/nonexistent/zz"), agent_id: "coder#1", tools, workers, repo_overview: None }
     }
 
     #[test]

@@ -5,6 +5,7 @@ pub mod delegate;
 pub mod edit;
 pub mod fs;
 pub mod git;
+pub mod repomap_tool;
 pub mod sandbox;
 #[cfg(target_os = "linux")]
 pub mod sandbox_linux;
@@ -91,6 +92,8 @@ pub struct ToolCtx {
     pub budget: Option<Arc<TokenBudget>>,
     /// Team-wide cost accounting (prices + optional dollar cap).
     pub meter: Arc<crate::llm::catalog::CostMeter>,
+    /// The team's repository map (None: `repo_map` builds one per call).
+    pub repo_map: Option<Arc<Mutex<crate::repomap::RepoMap>>>,
 }
 
 /// Safety policy applied by the built-in tools.
@@ -179,6 +182,7 @@ impl ToolCtx {
             policy: Arc::new(ToolPolicy::default()),
             budget: None,
             meter: Arc::new(crate::llm::catalog::CostMeter::new(None)),
+            repo_map: None,
         }
     }
 
@@ -190,6 +194,11 @@ impl ToolCtx {
     pub fn with_policy(mut self, policy: Arc<ToolPolicy>, budget: Option<Arc<TokenBudget>>) -> Self {
         self.policy = policy;
         self.budget = budget;
+        self
+    }
+
+    pub fn with_repo_map(mut self, map: Arc<Mutex<crate::repomap::RepoMap>>) -> Self {
+        self.repo_map = Some(map);
         self
     }
 
@@ -313,6 +322,7 @@ pub fn worker_tools() -> ToolRegistry {
     r.register(Arc::new(edit::EditFile));
     r.register(Arc::new(search::GlobTool));
     r.register(Arc::new(search::GrepTool));
+    r.register(Arc::new(repomap_tool::RepoMapTool));
     r.register(Arc::new(git::GitTool));
     r.register(Arc::new(bash::Bash));
     r

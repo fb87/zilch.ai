@@ -8,6 +8,7 @@ pub mod config;
 pub mod llm;
 pub mod profile;
 pub mod prompt;
+pub mod repomap;
 pub mod team;
 pub mod tools;
 
