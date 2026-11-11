@@ -76,6 +76,8 @@ pub struct RoleCfg {
     pub price_in: Option<f64>,
     /// USD per 1M output tokens (overrides discovered pricing).
     pub price_out: Option<f64>,
+    /// USD per 1M cached input tokens (default: the input price, or the provider's listed cache price).
+    pub price_cached: Option<f64>,
     pub system_prompt: Option<String>,
     pub system_prompt_file: Option<PathBuf>,
     pub prompt_mode: Option<PromptMode>,
@@ -96,6 +98,7 @@ impl RoleCfg {
         self.context_tokens = self.context_tokens.or(f.context_tokens);
         self.price_in = self.price_in.or(f.price_in);
         self.price_out = self.price_out.or(f.price_out);
+        self.price_cached = self.price_cached.or(f.price_cached);
     }
 
     fn merge(&mut self, o: RoleCfg) {
@@ -113,6 +116,7 @@ impl RoleCfg {
         merge_opt(&mut self.context_tokens, o.context_tokens);
         merge_opt(&mut self.price_in, o.price_in);
         merge_opt(&mut self.price_out, o.price_out);
+        merge_opt(&mut self.price_cached, o.price_cached);
         if o.system_prompt.is_some() || o.system_prompt_file.is_some() {
             self.system_prompt = o.system_prompt;
             self.system_prompt_file = o.system_prompt_file;
@@ -522,6 +526,8 @@ fn build_profile(name: &str, rc: RoleCfg, defaults: &RoleCfg) -> Result<Profile>
             context: None,
             input_per_mtok: rc.price_in.or(defaults.price_in),
             output_per_mtok: rc.price_out.or(defaults.price_out),
+            cached_input_per_mtok: rc.price_cached.or(defaults.price_cached),
+            peak: None,
         },
     })
 }
@@ -753,7 +759,7 @@ mod catalog_tests {
         let mut cat = std::collections::HashMap::new();
         cat.insert(
             "openai/gpt-4.1".to_string(),
-            ModelInfo { context: Some(1_000_000), input_per_mtok: Some(2.0), output_per_mtok: Some(8.0) },
+            ModelInfo { context: Some(1_000_000), input_per_mtok: Some(2.0), output_per_mtok: Some(8.0), ..Default::default() },
         );
         cfg.apply_catalog(&cat);
         assert_eq!(cfg.master().context_tokens, 64_000, "a lane agent keeps a session: capped, not the full 1M window");

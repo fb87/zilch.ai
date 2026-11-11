@@ -361,7 +361,7 @@ async fn a_high_cost_model_in_use_too_long_alerts_until_acknowledged_or_switched
     use zilch_core::llm::Usage;
     let dir = tempfile::tempdir().unwrap();
     let (team, _, _, _rx) = setup(dir.path(), 2, Box::new(|_| vec![text("ok")]));
-    let price = |o: f64| ModelInfo { context: None, input_per_mtok: Some(1.0), output_per_mtok: Some(o) };
+    let price = |o: f64| ModelInfo { context: None, input_per_mtok: Some(1.0), output_per_mtok: Some(o), ..Default::default() };
     team.set_catalog([("openai/opus-big".to_string(), price(75.0)), ("openai/cheap".to_string(), price(0.5))].into());
     let meter = &team.shared.meter;
     let small = Usage { prompt_tokens: 1000, completion_tokens: 100, ..Default::default() };

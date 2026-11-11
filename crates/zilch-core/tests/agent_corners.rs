@@ -127,7 +127,11 @@ async fn caps_refuse_before_sending_and_costs_are_recorded() {
 
     // Cost: recorded per response; the cap refuses the next request once it would be exceeded.
     let meter = Arc::new(CostMeter::new(Some(0.02)));
-    meter.catalog.write().unwrap().insert("/".into(), ModelInfo { context: None, input_per_mtok: Some(10.0), output_per_mtok: Some(10.0) });
+    meter
+        .catalog
+        .write()
+        .unwrap()
+        .insert("/".into(), ModelInfo { context: None, input_per_mtok: Some(10.0), output_per_mtok: Some(10.0), ..Default::default() });
     let mut b = agent(
         dir.path(),
         vec![Some(vec![

@@ -16,13 +16,48 @@ pub struct ModelInfo {
     pub input_per_mtok: Option<f64>,
     /// USD per 1M output tokens.
     pub output_per_mtok: Option<f64>,
+    /// USD per 1M input tokens served from the provider's prompt cache (None: the input price).
+    pub cached_input_per_mtok: Option<f64>,
+    /// Hours when the provider charges a multiple of these prices.
+    pub peak: Option<Peak>,
+}
+
+/// A price multiplier for some hours of the week (OpenCode `cost.multipliers`), in UTC.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Peak {
+    /// Bit 0 = Monday … bit 6 = Sunday.
+    pub days: u8,
+    /// [start, end) in minutes after 00:00 UTC; the first `count` are used.
+    pub windows: [(u16, u16); 4],
+    pub count: u8,
+    pub factor: f64,
+}
+
+impl Peak {
+    /// Does the multiplier apply at `unix_secs`?
+    pub fn applies(&self, unix_secs: u64) -> bool {
+        let day = unix_secs / 86_400;
+        let weekday = ((day + 3) % 7) as u8; // 1970-01-01 was a Thursday; Monday = 0
+        let minute = ((unix_secs % 86_400) / 60) as u16;
+        self.days & (1 << weekday) != 0 && self.windows[..self.count as usize].iter().any(|(a, b)| *a <= minute && minute < *b)
+    }
 }
 
 impl ModelInfo {
+    /// The cost of a request made now.
     pub fn cost(&self, u: &Usage) -> Option<f64> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        self.cost_at(u, now)
+    }
+    /// Fresh input at the input price, cached input at the cache price, output at the output price,
+    /// times the peak multiplier when it applies.
+    pub fn cost_at(&self, u: &Usage, unix_secs: u64) -> Option<f64> {
         let i = self.input_per_mtok?;
         let o = self.output_per_mtok?;
-        Some((u.prompt_tokens as f64 * i + u.completion_tokens as f64 * o) / 1_000_000.0)
+        let cached = u.cached_tokens.min(u.prompt_tokens);
+        let c = self.cached_input_per_mtok.unwrap_or(i);
+        let factor = self.peak.filter(|p| p.applies(unix_secs)).map_or(1.0, |p| p.factor);
+        Some(((u.prompt_tokens - cached) as f64 * i + cached as f64 * c + u.completion_tokens as f64 * o) * factor / 1_000_000.0)
     }
     /// Field-wise overlay: values in `o` win.
     pub fn merged(self, o: ModelInfo) -> ModelInfo {
@@ -30,8 +65,45 @@ impl ModelInfo {
             context: o.context.or(self.context),
             input_per_mtok: o.input_per_mtok.or(self.input_per_mtok),
             output_per_mtok: o.output_per_mtok.or(self.output_per_mtok),
+            cached_input_per_mtok: o.cached_input_per_mtok.or(self.cached_input_per_mtok),
+            peak: o.peak.or(self.peak),
         }
     }
+}
+
+/// OpenCode `cost.multipliers[0]`: `{when: {utc_days: {in: [..]}, any: [{all: [{utc_hours: {gte}}, {utc_hours: {lt}}]}]}, factor}`.
+fn parse_peak(v: &Value) -> Option<Peak> {
+    let m = v.as_array()?.first()?;
+    let factor = m.get("factor")?.as_f64()?;
+    let when = m.get("when")?;
+    let names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+    let days = match when.pointer("/utc_days/in").and_then(Value::as_array) {
+        Some(list) => list.iter().filter_map(|d| names.iter().position(|n| Some(*n) == d.as_str())).fold(0u8, |acc, i| acc | 1 << i),
+        None => 0x7f,
+    };
+    let minutes = |s: &str| -> Option<u16> {
+        let (h, m) = s.split_once(':')?;
+        Some(h.parse::<u16>().ok()? * 60 + m.parse::<u16>().ok()?)
+    };
+    let mut peak = Peak { days, factor, ..Default::default() };
+    for alt in when.get("any").and_then(Value::as_array).into_iter().flatten().take(4) {
+        let (mut start, mut end) = (0u16, 24 * 60);
+        for cond in alt.get("all").and_then(Value::as_array).into_iter().flatten() {
+            if let Some(g) = cond.pointer("/utc_hours/gte").and_then(Value::as_str).and_then(minutes) {
+                start = g;
+            }
+            if let Some(l) = cond.pointer("/utc_hours/lt").and_then(Value::as_str).and_then(minutes) {
+                end = l;
+            }
+        }
+        peak.windows[peak.count as usize] = (start, end);
+        peak.count += 1;
+    }
+    if peak.count == 0 {
+        peak.windows[0] = (0, 24 * 60);
+        peak.count = 1;
+    }
+    Some(peak)
 }
 
 /// Parse a `/models` response (model id → info). Unknown shapes yield no info, never an error.
@@ -46,6 +118,8 @@ pub fn parse_models(v: &Value) -> HashMap<String, ModelInfo> {
             context: m.pointer("/limit/context").and_then(Value::as_u64),
             input_per_mtok: m.pointer("/cost/text/input/price").and_then(num),
             output_per_mtok: m.pointer("/cost/text/output/price").and_then(num),
+            cached_input_per_mtok: m.pointer("/cost/text/input/cache/read").and_then(num),
+            peak: m.pointer("/cost/multipliers").and_then(parse_peak),
         };
         // OpenRouter: context_length, pricing.{prompt,completion} (USD / token, as strings)
         if info.context.is_none() {
@@ -56,6 +130,9 @@ pub fn parse_models(v: &Value) -> HashMap<String, ModelInfo> {
         }
         if info.output_per_mtok.is_none() {
             info.output_per_mtok = m.pointer("/pricing/completion").and_then(num).map(|p| p * 1_000_000.0);
+        }
+        if info.cached_input_per_mtok.is_none() {
+            info.cached_input_per_mtok = m.pointer("/pricing/input_cache_read").and_then(num).map(|p| p * 1_000_000.0);
         }
         out.insert(id.to_string(), info);
     }
@@ -149,7 +226,10 @@ mod tests {
             {"id":"glm-5.3","limit":{"context":200000},"cost":{"text":{"input":{"price":1.4},"output":{"price":4.4}}}}
         ]});
         let m = parse_models(&oc);
-        assert_eq!(m["beam-free"], ModelInfo { context: Some(1048576), input_per_mtok: Some(0.0), output_per_mtok: Some(0.0) });
+        assert_eq!(
+            m["beam-free"],
+            ModelInfo { context: Some(1048576), input_per_mtok: Some(0.0), output_per_mtok: Some(0.0), ..Default::default() }
+        );
         assert_eq!(m["glm-5.3"].input_per_mtok, Some(1.4));
 
         let or = json!({"data":[{"id":"x/y","context_length":32768,"pricing":{"prompt":"0.00000008","completion":"0.0000002"}}]});
@@ -164,15 +244,50 @@ mod tests {
     #[test]
     fn meter_tracks_spend_and_cap() {
         let m = CostMeter::new(Some(0.01));
-        m.catalog
-            .write()
-            .unwrap()
-            .insert("p/m".into(), ModelInfo { context: None, input_per_mtok: Some(2.0), output_per_mtok: Some(10.0) });
+        m.catalog.write().unwrap().insert(
+            "p/m".into(),
+            ModelInfo { context: None, input_per_mtok: Some(2.0), output_per_mtok: Some(10.0), ..Default::default() },
+        );
         let c = m.record("p/m", &Usage { prompt_tokens: 1000, completion_tokens: 500, ..Default::default() }).unwrap();
         assert!((c - 0.007).abs() < 1e-9);
         assert!(!m.would_exceed("p/m", 1000)); // +0.002 → 0.009
         assert!(m.would_exceed("p/m", 2000)); // +0.004 → 0.011
         assert!(m.record("unknown/model", &Usage { prompt_tokens: 5, completion_tokens: 5, ..Default::default() }).is_none());
         assert!(!CostMeter::new(None).would_exceed("p/m", u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod cache_price_tests {
+    use super::*;
+
+    fn deepseek() -> ModelInfo {
+        let v: Value = serde_json::from_str(
+            r#"{"data":[{"id":"deepseek-v4.1-flash","cost":{"text":{"input":{"price":0.15,"cache":{"read":0.003}},"output":{"price":0.6}},
+            "multipliers":[{"when":{"utc_days":{"in":["mon","tue","wed","thu","fri"]},"any":[
+              {"all":[{"utc_hours":{"gte":"01:00"}},{"utc_hours":{"lt":"04:00"}}]},
+              {"all":[{"utc_hours":{"gte":"06:00"}},{"utc_hours":{"lt":"10:00"}}]}]},"factor":2}]}}]}"#,
+        )
+        .unwrap();
+        parse_models(&v)["deepseek-v4.1-flash"]
+    }
+
+    #[test]
+    fn cached_tokens_and_peak_hours_are_priced_as_the_provider_lists_them() {
+        let m = deepseek();
+        assert_eq!((m.input_per_mtok, m.output_per_mtok, m.cached_input_per_mtok), (Some(0.15), Some(0.6), Some(0.003)));
+        // 1M prompt tokens of which 900k cached, 100k out.
+        let u = Usage { prompt_tokens: 1_000_000, completion_tokens: 100_000, cached_tokens: 900_000 };
+        // Wednesday 2026-11-11 12:00 UTC (off-peak): 0.1×0.15 + 0.9×0.003 + 0.1×0.6 = 0.0777
+        let off = 1_794_398_400;
+        assert!((m.cost_at(&u, off).unwrap() - 0.0777).abs() < 1e-9, "{:?}", m.cost_at(&u, off));
+        // Same day 07:30 UTC (peak): twice that.
+        let peak = off - 4 * 3600 - 1800;
+        assert!((m.cost_at(&u, peak).unwrap() - 0.1554).abs() < 1e-9);
+        // Saturday 07:30 UTC: off-peak again.
+        assert!((m.cost_at(&u, peak + 3 * 86_400).unwrap() - 0.0777).abs() < 1e-9);
+        // Without a cache price, cached tokens cost the input price.
+        let plain = ModelInfo { cached_input_per_mtok: None, peak: None, ..m };
+        assert!((plain.cost_at(&u, off).unwrap() - (0.15 + 0.06)).abs() < 1e-9);
     }
 }
