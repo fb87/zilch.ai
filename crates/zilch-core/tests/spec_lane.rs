@@ -163,7 +163,11 @@ async fn spec_lane_versions_documents_and_runs_in_parallel_with_code() {
     // 4) The code master works from plan/design and sees versions + updates.
     let log = fake.log.lock().unwrap().clone();
     let master_ctx: Vec<String> = log.iter().filter(|r| is_master(r)).map(context).collect();
-    assert!(master_ctx[0].contains("plan.md: based on spec v1") && master_ctx[0].contains("do not plan from spec.md"), "{}", master_ctx[0]);
+    assert!(
+        master_ctx[0].contains("plan.md: based on spec v1") && master_ctx[0].contains("(never from spec.md); otherwise ignore them"),
+        "{}",
+        master_ctx[0]
+    );
     assert!(master_ctx.last().unwrap().contains("plan.md was updated since you last looked"), "{:?}", master_ctx.last());
     // The code master never got spec-writing tools; the spec master never got coordination ones.
     let master_tools: Vec<String> = log.iter().find(|r| is_master(r)).unwrap().tools.iter().map(|t| t.function.name.clone()).collect();

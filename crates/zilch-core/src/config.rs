@@ -500,7 +500,11 @@ fn build_profile(name: &str, rc: RoleCfg, defaults: &RoleCfg) -> Result<Profile>
         binding,
         tools,
         max_steps: rc.max_steps.or(defaults.max_steps).unwrap_or(if role == AgentRole::Master { 60 } else { 80 }),
-        context_tokens: rc.context_tokens.or(defaults.context_tokens).unwrap_or(128_000).max(16_000),
+        context_tokens: rc
+            .context_tokens
+            .or(defaults.context_tokens)
+            .unwrap_or(if matches!(role, AgentRole::Master | AgentRole::Spec) { crate::profile::LANE_CONTEXT_TOKENS } else { 128_000 })
+            .max(16_000),
         default_prompt: default_prompt.to_string(),
         custom_prompt,
         prompt_mode: rc.prompt_mode.unwrap_or_default(),
@@ -718,7 +722,7 @@ impl Config {
                 continue;
             }
             if let Some(ctx) = cat.get(&p.binding.key()).and_then(|i| i.context) {
-                p.context_tokens = (ctx as usize).max(16_000);
+                p.context_tokens = p.context_for(Some(ctx));
             }
         }
     }
@@ -743,7 +747,8 @@ mod catalog_tests {
             ModelInfo { context: Some(1_000_000), input_per_mtok: Some(2.0), output_per_mtok: Some(8.0) },
         );
         cfg.apply_catalog(&cat);
-        assert_eq!(cfg.master().context_tokens, 1_000_000, "discovered");
+        assert_eq!(cfg.master().context_tokens, 64_000, "a lane agent keeps a session: capped, not the full 1M window");
+        assert_eq!(cfg.profile("explorer").unwrap().context_tokens, 1_000_000, "a worker gets the discovered window");
         assert_eq!(cfg.profile("coder").unwrap().context_tokens, 50_000, "explicit wins");
         let coder = cfg.profile("coder").unwrap();
         let merged = cat["openai/gpt-4.1"].merged(coder.pricing);

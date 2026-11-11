@@ -18,7 +18,7 @@ use crate::llm::ToolSpec;
 use crate::team::file_locks::FileLocks;
 use anyhow::Result;
 use async_trait::async_trait;
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::Glob;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -58,20 +58,18 @@ pub trait Tool: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct Scope {
     pub patterns: Vec<String>,
-    set: GlobSet,
 }
 
 impl Scope {
+    /// Files, directories (covering everything below) or globs; invalid globs are refused.
     pub fn new(patterns: &[String]) -> Result<Self> {
-        let mut b = GlobSetBuilder::new();
         for p in patterns {
-            b.add(Glob::new(p)?);
+            Glob::new(p)?;
         }
-        Ok(Self { patterns: patterns.to_vec(), set: b.build()? })
+        Ok(Self { patterns: patterns.to_vec() })
     }
     pub fn contains(&self, rel_path: &str) -> bool {
-        let p = rel_path.trim_start_matches("./");
-        self.set.is_match(p) || self.patterns.iter().any(|x| x == p)
+        self.patterns.iter().any(|x| crate::team::todo::path_matches(x, rel_path))
     }
 }
 

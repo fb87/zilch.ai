@@ -18,7 +18,8 @@ impl Tool for TodoWrite {
         "todo_write"
     }
     fn description(&self) -> String {
-        "Create, update, cancel or remove TODO items (upsert by id). Each item is one unit of work for one worker. \
+        "Only for a change to the codebase (never to answer a question). Create, update, cancel or remove TODO items \
+         (upsert by id). Each item is one unit of work for one worker. \
          Keep items independent with disjoint `files` so they run in parallel; use `depends_on` only when required. \
          Set status \"cancelled\" to drop an item, or \"pending\" to retry a failed/blocked one."
             .into()

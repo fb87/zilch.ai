@@ -243,21 +243,42 @@ impl TodoList {
     }
 }
 
-/// Every pattern in `files` is covered by `scope` (exact pattern, or matched by a scope glob).
+fn is_glob(p: &str) -> bool {
+    p.contains(['*', '?', '[', '{'])
+}
+
+/// Does a scope pattern cover `path`? A pattern without glob characters names a file or a directory:
+/// `src/x.rs`, `pkg/` and `pkg` all cover the path itself and everything below it (models write
+/// directories either way). Anything else is a glob with the usual meaning (`*` within a directory,
+/// `**` across).
+pub fn path_matches(pattern: &str, path: &str) -> bool {
+    let pattern = pattern.trim_start_matches("./");
+    let path = path.trim_start_matches("./");
+    if pattern.is_empty() {
+        return false;
+    }
+    if !is_glob(pattern) {
+        let dir = pattern.trim_end_matches('/');
+        return path == dir || path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'));
+    }
+    globset::GlobBuilder::new(pattern).literal_separator(true).build().map(|g| g.compile_matcher().is_match(path)).unwrap_or(false)
+}
+
+/// Every pattern in `files` is covered by `scope`.
 fn within(files: &[String], scope: &[String]) -> bool {
     if files.is_empty() {
         return false; // "touches anything" is never implicitly in scope
     }
-    files.iter().all(|f| scope.iter().any(|s| s == f || globset::Glob::new(s).map(|g| g.compile_matcher().is_match(f)).unwrap_or(false)))
+    files.iter().all(|f| scope.iter().any(|s| s == f || path_matches(s, f)))
 }
 
-/// Conservative overlap test between two file scopes.
+/// Conservative overlap test between two file scopes: one pattern covers the other, or two globs
+/// (which may match a common file).
 pub fn scopes_overlap(a: &[String], b: &[String]) -> bool {
     if a.is_empty() || b.is_empty() {
         return true;
     }
-    let m = |p: &str, s: &str| globset::Glob::new(p).map(|g| g.compile_matcher().is_match(s)).unwrap_or(true);
-    a.iter().any(|x| b.iter().any(|y| x == y || m(x, y) || m(y, x)))
+    a.iter().any(|x| b.iter().any(|y| x == y || path_matches(x, y) || path_matches(y, x) || (is_glob(x) && is_glob(y))))
 }
 
 #[cfg(test)]
@@ -306,5 +327,40 @@ mod tests {
         assert!(scopes_overlap(&s(&["src/**"]), &s(&["src/main.rs"])));
         assert!(!scopes_overlap(&s(&["src/a.rs"]), &s(&["src/b.rs"])));
         assert!(scopes_overlap(&s(&[]), &s(&["x"])));
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn directories_cover_what_is_below_them_however_they_are_written() {
+        for dir in ["zilch_agent/", "zilch_agent", "./zilch_agent/"] {
+            assert!(path_matches(dir, "zilch_agent/config.py"), "{dir}");
+            assert!(path_matches(dir, "zilch_agent/sub/x.py"), "{dir}");
+            assert!(!path_matches(dir, "zilch_agent_old/x.py"), "a name prefix is not a directory: {dir}");
+            assert!(!path_matches(dir, "other/zilch_agent/x.py"), "{dir}");
+        }
+        assert!(path_matches("src/x.rs", "src/x.rs") && !path_matches("src/x.rs", "src/y.rs"));
+        assert!(path_matches("src/**/*.rs", "src/a/b.rs") && !path_matches("src/*.rs", "src/a/b.rs"));
+    }
+
+    #[test]
+    fn directory_scopes_overlap_their_files() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(scopes_overlap(&s(&["zilch_agent/"]), &s(&["zilch_agent/config.py"])));
+        assert!(scopes_overlap(&s(&["zilch_agent"]), &s(&["zilch_agent/**"])));
+        assert!(!scopes_overlap(&s(&["zilch_agent/"]), &s(&["tests/"])));
+        assert!(!scopes_overlap(&s(&["src/a.rs"]), &s(&["src/b.rs"])));
+        assert!(scopes_overlap(&s(&["src/*.rs"]), &s(&["src/a.rs"])));
+        assert!(within(&s(&["pkg/a.py", "pkg/sub/b.py"]), &s(&["pkg/"])));
+    }
+
+    #[test]
+    fn a_worker_scope_lets_a_directory_task_write_its_files() {
+        let scope = crate::tools::Scope::new(&["zilch_agent/".to_string()]).unwrap();
+        assert!(scope.contains("zilch_agent/config.py") && scope.contains("./zilch_agent/llm.py"));
+        assert!(!scope.contains("setup.py"));
     }
 }

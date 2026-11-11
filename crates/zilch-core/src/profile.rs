@@ -43,7 +43,22 @@ pub struct Profile {
     pub prompt_mode: PromptMode,
 }
 
+/// Compaction budget of the long-lived lane agents (master, spec master) unless configured: they keep
+/// the whole session, so a full model window (up to 1M tokens) would make every call slow and costly.
+pub const LANE_CONTEXT_TOKENS: usize = 64_000;
+
 impl Profile {
+    /// The compaction budget for a model with this context window: the configured `context_tokens`,
+    /// else the window (capped for lane agents at [`LANE_CONTEXT_TOKENS`]); at least 16k.
+    pub fn context_for(&self, window: Option<u64>) -> usize {
+        if self.context_explicit {
+            return self.context_tokens;
+        }
+        let w = window.map_or(128_000, |w| w as usize);
+        let w = if matches!(self.role, AgentRole::Master | AgentRole::Spec) { w.min(LANE_CONTEXT_TOKENS) } else { w };
+        w.max(16_000)
+    }
+
     pub fn is_master(&self) -> bool {
         self.role == AgentRole::Master
     }

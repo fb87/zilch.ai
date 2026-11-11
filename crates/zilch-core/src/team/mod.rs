@@ -256,7 +256,7 @@ impl MasterHooks {
         }
         let mut s = format!(
             "Specification documents (maintained by the user and the spec lane, in parallel with you): {}\n\
-             Implement from {} and {} — they are your requirements; do not plan from spec.md directly.",
+             When the user asks to build from the spec or the plan, implement from {} and {} (never from spec.md); otherwise ignore them.",
             st.describe(&store.dir),
             store.path(Doc::Plan).display(),
             store.path(Doc::Design).display()
@@ -269,7 +269,9 @@ impl MasterHooks {
         let mtime = std::fs::metadata(store.path(Doc::Plan)).and_then(|m| m.modified()).ok();
         let mut seen = self.plan_seen.lock().unwrap();
         if seen.is_some() && mtime != *seen {
-            s.push_str("\nNOTE: plan.md was updated since you last looked; re-read it and adjust the TODO list if needed.");
+            s.push_str(
+                "\nNOTE: plan.md was updated since you last looked; if you are implementing it, re-read it and adjust the TODO list.",
+            );
         }
         *seen = mtime;
         Some(s)
@@ -820,7 +822,7 @@ impl Team {
             agent.llm = self.shared.providers.get(&b.provider)?;
             // Compaction follows the new model's context window (the configured one when back).
             agent.context_tokens = match self.shared.meter.info(&b.key()).and_then(|i| i.context) {
-                Some(ctx) if b != p.binding => ctx as usize,
+                Some(ctx) if b != p.binding => p.context_for(Some(ctx)),
                 _ => p.context_tokens,
             };
             agent.binding = b;
