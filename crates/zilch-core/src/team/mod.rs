@@ -433,7 +433,7 @@ impl Team {
             task_failures: Mutex::default(),
             model_overrides: Mutex::default(),
             cost_acked: Mutex::default(),
-            repo_overview: repo_map.overview(REPO_OVERVIEW_CHARS),
+            repo_overview: if cfg.repo_map { repo_map.overview(REPO_OVERVIEW_CHARS) } else { String::new() },
             repo_map: Arc::new(std::sync::Mutex::new(repo_map)),
             cfg,
         });
@@ -469,7 +469,7 @@ impl Team {
                 agent_id: "master",
                 tools: &names,
                 workers: &workers,
-                repo_overview: Some(&shared.repo_overview),
+                repo_overview: Some(shared.repo_overview.as_str()).filter(|o| !o.is_empty()),
             },
         );
         let ctx = Arc::new(
@@ -506,7 +506,13 @@ impl Team {
         let snames = sreg.names();
         let spec_system = prompt::build(
             &sprof,
-            &PromptEnv { cwd: &shared.cfg.cwd, agent_id: "spec", tools: &snames, workers: &[], repo_overview: Some(&shared.repo_overview) },
+            &PromptEnv {
+                cwd: &shared.cfg.cwd,
+                agent_id: "spec",
+                tools: &snames,
+                workers: &[],
+                repo_overview: Some(shared.repo_overview.as_str()).filter(|o| !o.is_empty()),
+            },
         );
         let spec_cancel = CancelCell::default();
         let sctx = Arc::new(

@@ -139,6 +139,9 @@ pub struct FileConfig {
     pub spec_dir: Option<String>,
     /// Columns the rendered markdown answer is indented by (default 2, 0 = off).
     pub markdown_indent: Option<usize>,
+    /// Put the repository map's overview in the lane agents' prompts (default true; the repo_map
+    /// tool works either way).
+    pub repo_map: Option<bool>,
     pub approval: Option<ApprovalMode>,
     pub sandbox: Option<bool>,
     pub bash_env_passthrough: Option<Vec<String>>,
@@ -188,6 +191,8 @@ pub struct Config {
     pub spec_dir: PathBuf,
     /// Columns the rendered markdown answer is indented by in the terminal (0 = off).
     pub markdown_indent: usize,
+    /// The repository overview goes into the master's and spec master's prompts.
+    pub repo_map: bool,
     pub approval: ApprovalMode,
     /// Confine file tools to the workspace (default true).
     pub sandbox: bool,
@@ -337,6 +342,7 @@ impl Config {
             max_workers: ov.max_workers.or(fc.max_workers).unwrap_or(4).max(1),
             spec_dir: cwd.join(ov.spec_dir.clone().or(fc.spec_dir).unwrap_or_else(|| "specs".into())),
             markdown_indent: fc.markdown_indent.unwrap_or(2).min(8),
+            repo_map: fc.repo_map.unwrap_or(true),
             approval: ov.approval.or(fc.approval).unwrap_or_default(),
             sandbox: fc.sandbox.unwrap_or(true),
             bash_env_passthrough: fc.bash_env_passthrough.unwrap_or_default(),
@@ -407,6 +413,7 @@ fn merge_file(dst: &mut FileConfig, src: FileConfig, base: &Path) {
     merge_opt(&mut dst.max_workers, src.max_workers);
     merge_opt(&mut dst.spec_dir, src.spec_dir);
     merge_opt(&mut dst.markdown_indent, src.markdown_indent);
+    merge_opt(&mut dst.repo_map, src.repo_map);
     merge_opt(&mut dst.approval, src.approval);
     merge_opt(&mut dst.sandbox, src.sandbox);
     merge_opt(&mut dst.bash_env_passthrough, src.bash_env_passthrough);

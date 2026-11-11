@@ -71,6 +71,7 @@ reasonable place for `api_key = "…"` (a custom `$XDG_CONFIG_HOME` location is 
 max_workers = 4
 approval = "plan"
 markdown_indent = 2                # indent of rendered answers in the terminal (0 = off)
+repo_map = true                    # module overview of the repository in the lead agents' prompts
 
 [providers.openai]                 # exists by default
 base_url = "https://api.openai.com/v1"
