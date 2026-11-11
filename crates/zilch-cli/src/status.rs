@@ -55,7 +55,12 @@ impl Highlighter for StatusHelper {
     fn highlight_prompt<'b, 's: 'b, 'p: 'b>(&'s self, prompt: &'p str, default: bool) -> Cow<'b, str> {
         // Only our two-row prompt carries a status row (approval questions etc. are left alone).
         match prompt.strip_prefix('\n') {
-            Some(rest) if default && !self.0.accepting.load(Ordering::SeqCst) => Cow::Owned(format!("\r\x1b[2K{}\n{rest}", self.0.text())),
+            // Autowrap (DECAWM) is off while the row is drawn: a terminal that draws some glyph wider
+            // than we counted cuts the row at the edge instead of wrapping it, which would leave a stale
+            // copy of the row behind on every redraw.
+            Some(rest) if default && !self.0.accepting.load(Ordering::SeqCst) => {
+                Cow::Owned(format!("\r\x1b[2K\x1b[?7l{}\x1b[?7h\n{rest}", self.0.text()))
+            }
             _ => Cow::Borrowed(prompt),
         }
     }

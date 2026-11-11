@@ -845,7 +845,9 @@ fn clip(s: &str, width: usize) -> String {
             c if c.is_control() => continue,
             c => c,
         };
-        let w = ch.width().unwrap_or(0);
+        // Ambiguous-width glyphs (▸, ⧉, …) are drawn two columns wide by some terminals and fonts:
+        // count them as two so the row still fits there.
+        let w = ch.width().unwrap_or(0).max(ch.width_cjk().unwrap_or(0));
         if cols + w > max - 1 {
             out.push('…');
             out.push_str(RESET);
