@@ -436,9 +436,12 @@ impl RepoMap {
         let head = format!("{project}{} source files, {} lines.\n", self.files.len(), fmt_lines(total_lines));
         // Richest first: every directory with a line per documented file; else directories only,
         // opened where the code is.
-        let rich = self.render_overview(deepest, true);
-        if head.len() + rich.len() <= max_chars {
-            return format!("{head}{rich}");
+        // (A line per file cannot fit when there are more files than budget/20 characters each.)
+        if self.files.len() <= max_chars / 20 {
+            let rich = self.render_overview(deepest, true);
+            if head.len() + rich.len() <= max_chars {
+                return format!("{head}{rich}");
+            }
         }
         format!("{head}{}", self.frontier_overview(max_chars.saturating_sub(head.len())))
     }
@@ -531,7 +534,11 @@ impl RepoMap {
             lines.sort();
             lines.into_iter().map(|(_, l)| l).collect()
         };
+        // Lengths are tracked as entries come and go; the listing is rendered once, at the end
+        // (re-rendering for every candidate took 44 s on the kernel).
+        let len = |e: &Entry| cached(e).1.len();
         let mut entries = open("");
+        let mut used: usize = entries.iter().map(len).sum();
         let mut stuck: std::collections::HashSet<String> = Default::default();
         loop {
             // The biggest subtree that can still be opened.
@@ -543,38 +550,57 @@ impl RepoMap {
                 })
                 .max_by_key(|d| total[d].0);
             let Some(dir) = pick else { break };
-            let others: Vec<Entry> = entries.iter().filter(|e| **e != Entry::Tree(dir.clone())).cloned().collect();
-            let mut next = others.clone();
-            next.extend(open(&dir));
-            if render(&next).len() <= budget {
-                entries = next;
-                continue;
-            }
-            // Too many children to list them all: list the biggest ones, summarize the rest in one line.
+            let me = Entry::Tree(dir.clone());
+            let base = used - len(&me);
+            let here: Vec<Entry> = if direct.contains_key(&dir) { vec![Entry::Here(dir.clone())] } else { vec![] };
+            let here_len: usize = here.iter().map(len).sum();
             let mut children: Vec<String> = kids[&dir].clone();
             children.sort_by_key(|c| std::cmp::Reverse(total[c].0));
-            let mut opened = false;
-            for k in (2..children.len()).rev() {
-                let mut next = others.clone();
-                next.extend(children[..k].iter().cloned().map(Entry::Tree));
-                next.push(Entry::Rest(dir.clone(), children[k..].to_vec()));
-                if direct.contains_key(&dir) {
-                    next.push(Entry::Here(dir.clone()));
+            let child_lens: Vec<usize> = children.iter().map(|c| len(&Entry::Tree(c.clone()))).collect();
+            let all = base + here_len + child_lens.iter().sum::<usize>();
+            let replacement: Option<(Vec<Entry>, usize)> = if all <= budget {
+                Some((children.iter().cloned().map(Entry::Tree).chain(here.clone()).collect(), all))
+            } else {
+                // Too many children to list them all: the biggest ones, and the rest in one line.
+                let mut best = None;
+                let mut prefix = 0;
+                for k in 0..children.len().saturating_sub(1) {
+                    prefix += child_lens[k];
+                    if k + 1 < 2 {
+                        continue;
+                    }
+                    let rest = Entry::Rest(dir.clone(), children[k + 1..].to_vec());
+                    let total_len = base + here_len + prefix + len(&rest);
+                    if total_len > budget {
+                        break; // longer prefixes only grow
+                    }
+                    let mut v: Vec<Entry> = children[..=k].iter().cloned().map(Entry::Tree).collect();
+                    v.push(rest);
+                    v.extend(here.clone());
+                    best = Some((v, total_len));
                 }
-                if render(&next).len() <= budget {
-                    entries = next;
-                    opened = true;
-                    break;
+                best
+            };
+            match replacement {
+                Some((add, new_len)) => {
+                    entries.retain(|e| *e != me);
+                    entries.extend(add);
+                    used = new_len;
                 }
-            }
-            if !opened {
-                stuck.insert(dir);
+                None => {
+                    stuck.insert(dir);
+                }
             }
         }
         render(&entries)
     }
 
     fn render_overview(&self, depth: usize, with_files: bool) -> String {
+        // Each directory's own files, grouped once.
+        let mut by_dir: BTreeMap<&str, Vec<&FileEntry>> = BTreeMap::new();
+        for f in &self.files {
+            by_dir.entry(parent(&f.path)).or_default().push(f);
+        }
         // Directory (cut at `depth` levels) → (files, lines, file names).
         let mut dirs: BTreeMap<String, (usize, usize, Vec<String>)> = BTreeMap::new();
         for f in &self.files {
@@ -603,7 +629,7 @@ impl RepoMap {
             };
             if with_files {
                 // Documented files get their own line; the rest stay named in the directory line.
-                let here: Vec<&FileEntry> = self.files.iter().filter(|f| parent(&f.path) == dir).collect();
+                let here: Vec<&FileEntry> = by_dir.get(dir.as_str()).cloned().unwrap_or_default();
                 let undocumented: Vec<&str> =
                     here.iter().filter(|f| f.doc.is_none()).map(|f| f.path.rsplit('/').next().unwrap_or(&f.path)).collect();
                 let dir_line = match self.dir_doc(dir) {
