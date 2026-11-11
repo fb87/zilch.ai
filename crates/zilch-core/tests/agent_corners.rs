@@ -273,3 +273,27 @@ async fn idle_compaction_keeps_the_history_when_the_model_does_not_write_a_diges
     assert!(a.compact_idle(0.05).await.is_none());
     assert_eq!(a.history, before);
 }
+
+#[tokio::test]
+async fn reasoning_from_earlier_turns_is_not_resent() {
+    let dir = tempfile::tempdir().unwrap();
+    // Turn 1: one tool call, then an answer; both replies carry reasoning.
+    let think = |t: &str| LlmEvent::ReasoningDelta(t.into());
+    let rec = Arc::new(Recording(
+        Mutex::new(vec![]),
+        Mutex::new(vec![
+            vec![think("plan A"), call(0, "glob", "{\"pattern\":\"*.x\"}")],
+            vec![think("plan B"), LlmEvent::TextDelta("one".into())],
+            vec![LlmEvent::TextDelta("two".into())],
+        ]),
+    ));
+    let mut a = agent(dir.path(), vec![]);
+    a.llm = rec.clone();
+    a.run("first").await.unwrap();
+    // Within turn 1 the reasoning went back with the tool result (providers need that).
+    assert_eq!(rec.0.lock().unwrap()[1].messages[2].reasoning_content.as_deref(), Some("plan A"));
+    a.run("second").await.unwrap();
+    // Turn 2's request carries no reasoning from turn 1.
+    let req = &rec.0.lock().unwrap()[2];
+    assert!(req.messages.iter().all(|m| m.reasoning_content.is_none()), "{:?}", req.messages);
+}

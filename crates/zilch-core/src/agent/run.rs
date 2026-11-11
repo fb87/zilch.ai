@@ -80,6 +80,11 @@ impl Agent {
 
     async fn run_turn(&mut self, input: &str) -> Result<String> {
         let cancel = self.ctx.cancel.current();
+        // A model's reasoning is needed back only within the tool loop of the turn that produced it;
+        // from earlier turns it is just resent tokens. Dropped once per turn (one cache miss).
+        for m in &mut self.history {
+            m.reasoning_content = None;
+        }
         self.history.push(Message::user(input));
         let mut reminded = false;
         let mut supervisor = Supervisor::new(self.loop_limit);
@@ -134,9 +139,11 @@ impl Agent {
             let mut messages = Vec::with_capacity(self.history.len() + 2);
             messages.push(Message::system(&self.system));
             messages.extend(self.history.iter().cloned());
-            if let Some(extra) = self.hooks.as_ref().and_then(|h| h.context()) {
+            let extra = self.hooks.as_ref().and_then(|h| h.context());
+            if let Some(extra) = &extra {
                 messages.push(Message::user(format!("<system-context>\n{extra}\n</system-context>")));
             }
+            self.emit(EventKind::RequestParts(super::compact::breakdown(&self.system, &self.history, extra.as_deref(), &specs)));
             let req = ChatRequest { binding: self.binding.clone(), messages, tools: specs, session: Some(self.session.clone()) };
             // Strict caps: refuse to SEND a request that would exceed the token or dollar budget,
             // instead of noticing after the fact.

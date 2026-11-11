@@ -1,7 +1,7 @@
 #[cfg(test)]
 use super::sandbox::native_available;
 use super::sandbox::{self, BashSandbox};
-use super::{arg_opt_u64, arg_str, truncate_output, Tool, ToolCtx};
+use super::{arg_opt_u64, arg_str, compress_output, truncate_output, Tool, ToolCtx};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -142,7 +142,7 @@ impl Tool for Bash {
             // Something still holds the pipe open; the output we have is what matters.
         }
         let buf = std::mem::take(&mut *collected.lock().unwrap());
-        let out = truncate_output(&String::from_utf8_lossy(&buf), 30_000);
+        let out = truncate_output(&compress_output(&String::from_utf8_lossy(&buf)), 30_000);
         Ok(match status {
             Ok(Ok(s)) => format!("{out}\n[exit code: {}]", s.code().map_or("signal".into(), |c| c.to_string())),
             Ok(Err(e)) => format!("{out}\n[error: {e}]"),

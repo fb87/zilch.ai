@@ -47,6 +47,9 @@ pub enum EventKind {
         id: String,
         model: String,
     },
+    /// Estimated tokens per part of the request about to be sent (system, tools, user, assistant
+    /// text, reasoning, `tool:<name>` outputs, context), to see where input tokens go.
+    RequestParts(Vec<(String, u64)>),
     /// `cost` is USD for this response when the model's price is known.
     Usage {
         model: String,

@@ -40,6 +40,8 @@ pub struct Screen {
     pub cost: BTreeMap<(String, String), f64>,
     /// Model requests made this session (one per usage report).
     pub requests: u64,
+    /// Estimated input tokens per request part, summed over the session (see EventKind::RequestParts).
+    pub parts: BTreeMap<String, u64>,
     /// Animate the status panel with cursor movement (off in the REPL: the input line is live).
     pub live_panel: bool,
     /// Lane-aware output (REPL): only the active lane streams; the other one is summarized.
@@ -105,6 +107,7 @@ impl Screen {
             busy: BTreeMap::new(),
             started: Instant::now(),
             requests: 0,
+            parts: BTreeMap::new(),
             delegations: BTreeMap::new(),
             worker_text: HashMap::new(),
             usage: BTreeMap::new(),
@@ -708,6 +711,11 @@ impl Screen {
                     self.line(&msg);
                 }
             }
+            EventKind::RequestParts(parts) => {
+                for (k, n) in parts {
+                    *self.parts.entry(k).or_default() += n;
+                }
+            }
             EventKind::Usage { model, usage, cost } => {
                 self.requests += 1;
                 let key = (ev.agent, model);
@@ -760,7 +768,22 @@ impl Screen {
         if let Some(sum) = self.session_summary() {
             s.push_str(&format!("\n  {sum}"));
         }
+        if let Some(parts) = self.parts_report() {
+            s.push_str(&format!("\n  {parts}"));
+        }
         s
+    }
+
+    /// Where the input tokens went (estimated), biggest first: "history: tool:read_file 41% · …".
+    pub fn parts_report(&self) -> Option<String> {
+        let total: u64 = self.parts.values().sum();
+        if total == 0 {
+            return None;
+        }
+        let mut v: Vec<(&String, &u64)> = self.parts.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1));
+        let shown: Vec<String> = v.iter().map(|(k, n)| format!("{k} {}%", (**n * 100 + total / 2) / total)).collect();
+        Some(format!("Input by part (estimated, ~{} tokens): {}", fmt_tokens(total), shown.join(" · ")))
     }
 
     /// One line for the whole session: requests, input (cached share), output, cost and duration.

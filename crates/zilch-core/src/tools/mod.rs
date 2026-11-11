@@ -357,6 +357,63 @@ pub fn worker_tools() -> ToolRegistry {
     r
 }
 
+/// Command output as the model should see it: progress noise out, everything else in. Removes ANSI
+/// escapes and carriage-return redraws (progress bars), drops lines that are reliably noise (build
+/// progress like `Compiling x`, passing-test lines like `test a ... ok`), counts what was dropped,
+/// and collapses runs of identical lines. Errors, warnings, failures, summaries and anything not
+/// recognised stay. Short outputs are returned as they are.
+pub fn compress_output(s: &str) -> String {
+    use std::sync::OnceLock;
+    static ANSI: OnceLock<regex::Regex> = OnceLock::new();
+    static NOISE: OnceLock<Vec<(&'static str, regex::Regex)>> = OnceLock::new();
+    if s.len() < 2_000 {
+        return s.to_string();
+    }
+    let ansi = ANSI.get_or_init(|| regex::Regex::new(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07").expect("valid"));
+    let noise = NOISE.get_or_init(|| {
+        let r = |s: &str| regex::Regex::new(s).expect("valid");
+        vec![
+            ("build progress", r(r"^\s+(Compiling|Checking|Downloaded|Downloading|Fresh|Updating|Locking|Adding|Blocking|Documenting|Installing|Unpacking|Packaging|Verifying|Archiving|Removing)\s")),
+            ("package downloads", r(r"^(Collecting|Downloading|Requirement already satisfied|Using cached|Obtaining)\b")),
+            ("passing tests", r(r"^test \S.* \.\.\. (ok|ignored)$|^\S+::\S+ PASSED|^--- PASS: |^=== (RUN|PAUSE|CONT)\s|^\s+✓ |^ok \d+ ")),
+            ("progress", r(r"^\s*\d{1,3}(\.\d+)?%\s*$|^\s*\[[=#>\- ]{5,}\]\s*(\d{1,3}%)?\s*$|^[\w/.\-]+\.py [.sx]+\s*(\[\s*\d+%\])?$")),
+        ]
+    });
+    let mut dropped: std::collections::BTreeMap<&str, usize> = Default::default();
+    let mut out: Vec<String> = Vec::new();
+    let mut repeat = 0usize;
+    for raw in s.lines() {
+        // A progress bar redraws itself with \r: only its last state counts.
+        let line = raw.rsplit('\r').next().unwrap_or(raw);
+        let line = ansi.replace_all(line, "");
+        if let Some((kind, _)) = noise.iter().find(|(_, re)| re.is_match(&line)) {
+            *dropped.entry(kind).or_default() += 1;
+            continue;
+        }
+        // Runs of blank lines collapse to one, silently.
+        if line.trim().is_empty() && out.last().is_some_and(|l| l.trim().is_empty()) {
+            continue;
+        }
+        if out.last().is_some_and(|l| *l == line && !line.trim().is_empty()) {
+            repeat += 1;
+            continue;
+        }
+        if repeat > 0 {
+            out.push(format!("[previous line repeated {repeat} more times]"));
+            repeat = 0;
+        }
+        out.push(line.into_owned());
+    }
+    if repeat > 0 {
+        out.push(format!("[previous line repeated {repeat} more times]"));
+    }
+    if !dropped.is_empty() {
+        let what: Vec<String> = dropped.iter().map(|(k, n)| format!("{n} {k}")).collect();
+        out.push(format!("[omitted as noise: {} lines]", what.join(", ")));
+    }
+    out.join("\n")
+}
+
 /// Keep the head and tail of long outputs.
 pub fn truncate_output(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -404,5 +461,48 @@ mod tests {
         let s = "a".repeat(100) + &"b".repeat(100);
         let t = truncate_output(&s, 60);
         assert!(t.starts_with("aaaa") && t.ends_with("bbbb") && t.contains("truncated"));
+    }
+}
+
+#[cfg(test)]
+mod compress_tests {
+    use super::*;
+
+    #[test]
+    fn build_and_test_noise_goes_errors_and_summaries_stay() {
+        let mut log = String::new();
+        for i in 0..120 {
+            log.push_str(&format!("   Compiling crate{i} v0.1.{i}\n"));
+        }
+        log.push_str("warning: unused variable: `x`\n --> src/lib.rs:3:9\n");
+        for i in 0..200 {
+            log.push_str(&format!("test tests::case_{i} ... ok\n"));
+        }
+        log.push_str("test tests::broken ... FAILED\n\nfailures:\n\n---- tests::broken stdout ----\nthread 'main' panicked at src/lib.rs:9:5\n\n\n\n");
+        log.push_str("\x1b[32mdownloading\x1b[0m\r 10%\r 55%\r100% done\n");
+        log.push_str("test result: FAILED. 200 passed; 1 failed\n");
+        let out = compress_output(&log);
+        for keep in [
+            "warning: unused variable",
+            "--> src/lib.rs:3:9",
+            "test tests::broken ... FAILED",
+            "panicked at src/lib.rs:9:5",
+            "test result: FAILED. 200 passed; 1 failed",
+            "100% done",
+        ] {
+            assert!(out.contains(keep), "kept: {keep}\n{out}");
+        }
+        assert!(!out.contains("Compiling crate7") && !out.contains("case_42 ... ok") && !out.contains("\x1b["));
+        assert!(out.contains("[omitted as noise: 120 build progress, 200 passing tests lines]"), "{out}");
+        assert!(!out.contains("\n\n\n"), "blank runs collapse");
+        assert!(out.len() < log.len() / 5, "{} of {}", out.len(), log.len());
+    }
+
+    #[test]
+    fn short_output_is_untouched_and_repeats_collapse() {
+        assert_eq!(compress_output("   Compiling x v1\nok\n"), "   Compiling x v1\nok\n");
+        let long = "retrying connection\n".repeat(300);
+        let out = compress_output(&long);
+        assert_eq!(out, "retrying connection\n[previous line repeated 299 more times]");
     }
 }
