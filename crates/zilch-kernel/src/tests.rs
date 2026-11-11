@@ -198,7 +198,7 @@ fn capabilities_confine_writes_to_owned_paths_and_commands_to_developers() {
             }
         }))
     });
-    // The architect also tries a command and a write outside docs/ before planning.
+    // The main agent tries a command and writes before planning: it may do neither.
     struct Arch(DevScript);
     impl Recipes for Arch {
         fn architect(&self, _: TicketId, _: &str) -> Box<dyn Agent> {
@@ -212,7 +212,7 @@ fn capabilities_confine_writes_to_owned_paths_and_commands_to_developers() {
                     let r: Vec<String> = wake.iter().map(SyscallResult::text).collect();
                     assert!(r[0].contains("may not run commands"), "{}", r[0]);
                     assert!(r[1].contains("permission denied"), "{}", r[1]);
-                    assert_eq!(r[2], "ok");
+                    assert!(r[2].contains("permission denied") && r[2].contains("(none)"), "{}", r[2]);
                     StepResult::Syscalls(vec![Syscall::SubmitPlan { tasks: vec![task("T1", &[], &["src/mine.rs"])] }])
                 }
                 _ => StepResult::Exit(ExitStatus::ok(wake[0].text())),

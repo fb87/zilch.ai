@@ -53,16 +53,11 @@ fn an_order_is_planned_approved_cooked_in_parallel_and_served() {
                 return vec![LlmEvent::TextDelta(reply.into()), usage];
             }
             return match last_tool_result(req) {
-                None => vec![
-                    call(0, "write_file", json!({"path":"docs/requirements.md","content":"- a, b and c exist\n"})),
-                    call(1, "write_file", json!({"path":"docs/design.md","content":"one file per task\n"})),
-                    usage,
-                ],
                 Some(r) if r.starts_with("All tasks finished") => {
                     assert!(r.contains("[T3] Write c — Done"), "{r}");
                     vec![LlmEvent::TextDelta("Summary: a, b and c were written.".into()), usage]
                 }
-                Some(_) => vec![
+                _ => vec![
                     call(0, "submit_plan", json!({"tasks":[
                         {"id":"T1","title":"Write a","task":"Create a.txt containing A.","owned_paths":["a.txt"],"acceptance":["a.txt exists"]},
                         {"id":"T2","title":"Write b","task":"Create b.txt containing B.","owned_paths":["b.txt"]},
@@ -135,7 +130,7 @@ fn an_order_is_planned_approved_cooked_in_parallel_and_served() {
         ("A".into(), "B".into(), "AB".into()),
         "b.txt is T2's, T1's write was refused"
     );
-    assert!(read("docs/requirements.md").contains("a, b and c") && read("docs/plan.json").contains("\"T3\""));
+    assert!(!ws.join("docs").exists(), "the main agent leaves no files in the project");
 
     // T1 and T2 ran at the same time; T3 only after both finished.
     let seen = seen.lock().unwrap();

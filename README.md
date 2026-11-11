@@ -21,7 +21,7 @@ plain `std` threads.
                                           │ process table · scheduler + timer tick · supervisor
             ┌─────────────────────────────┼───────────────────────────────┐
      main agent (code lane)        spec agent (spec lane)        subagents, explorers
-     docs only · plans · explore   spec.md / design / plan       owned paths · read-only
+     no writes · plans · explore   spec.md / design / plan       owned paths · read-only
             └──── syscalls ──▶ driver pools: LLM (HTTP) · files/search/git · bash (sandbox)
 ```
 
@@ -47,7 +47,8 @@ OPENAI_BASE_URL=http://localhost:11434/v1 zilch --model qwen2.5-coder   # Ollama
 
 How an order flows:
 1. The main agent explores the code (several read-only **explorers** can investigate in parallel).
-2. It updates `docs/requirements.md` and `docs/design.md`, and calls `submit_plan`.
+2. It works out the requirements and design and calls `submit_plan`; it writes no files itself, so
+   your project gets no planning documents (approved plans are kept with the session, outside it).
 3. You see the tasks grouped into parallel waves: `y` approves, `n` rejects, anything else is
    feedback. A stray Enter never approves.
 4. The kernel runs the plan as a dependency graph: independent tasks at once on their own
@@ -147,7 +148,7 @@ crates/zilch          the `zilch` binary: REPL, status row, plan/command questio
   calls and tool calls are syscalls that run on driver pools (commands on their own pool), several
   per step in parallel, so step workers never wait on the network. Long calls send heartbeats, so
   slow is not mistaken for stuck.
-- **Capabilities.** The main agent writes only `docs/`, the spec agent only its spec documents,
+- **Capabilities.** The main agent writes nothing, the spec agent only its spec documents,
   a subagent only its task's `owned_paths`, explorers nothing; only subagents run commands.
 - **Supervisor** (code only, no extra model calls). Loops are compared after removing what changes
   from run to run (durations, timestamps, temp paths, addresses): the same call with the same result

@@ -111,7 +111,7 @@ pub trait Drivers: Send + Sync + 'static {
     }
     /// Run a `Complete` or `Tool` syscall to completion (blocking; honour `ctx.cancel`).
     fn run(&self, ctx: &DriverCtx, call: Syscall) -> SyscallResult;
-    /// Persist an approved plan (e.g. `docs/plan.json`).
+    /// Keep a record of an approved plan (outside the project).
     fn save_plan(&self, _ticket: TicketId, _tasks: &[PlanTask]) {}
     /// A process is gone: drop whatever the drivers kept for it.
     fn release(&self, _pid: Pid) {}
@@ -770,7 +770,8 @@ impl Kernel {
                     },
                     _ => (
                         self.recipes.architect(ticket, &message),
-                        Caps { write: vec!["docs/**".into()], write_any: false, exec: false },
+                        // The main agent writes nothing: it plans, its subagents write.
+                        Caps { write: vec![], write_any: false, exec: false },
                         "main agent",
                     ),
                 };

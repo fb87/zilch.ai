@@ -18,7 +18,8 @@ use zilch_ipc::{KernelEvent, Pid, PlanTask, Syscall, SyscallResult, TicketId, To
 use zilch_kernel::{Access, DriverCtx, Drivers};
 
 /// Tools of each group (the kernel's capabilities restrict their writes further).
-pub const ARCHITECT_TOOLS: &[&str] = &["read_file", "write_file", "edit_file", "glob", "grep", "git"];
+/// The main agent reads and plans; it never writes files (its subagents do).
+pub const ARCHITECT_TOOLS: &[&str] = &["read_file", "glob", "grep", "git"];
 pub const DEVELOPER_TOOLS: &[&str] = &["read_file", "write_file", "edit_file", "glob", "grep", "git", "bash"];
 /// The spec lane: read the code, write only the documents of the spec directory.
 pub const SPEC_TOOLS: &[&str] = &["read_file", "glob", "grep", "git", "write_doc", "edit_doc", "release_spec"];
@@ -171,11 +172,15 @@ impl Drivers for DriverSet {
         }
     }
 
-    fn save_plan(&self, _ticket: TicketId, tasks: &[PlanTask]) {
-        let dir = self.cwd.join("docs");
+    /// Approved plans are kept beside the session file (`<session dir>/plans/<session>-<ticket>.json`),
+    /// never in the project; without a session nothing is written.
+    fn save_plan(&self, ticket: TicketId, tasks: &[PlanTask]) {
+        let Some(session) = self.session_file.lock().unwrap().clone() else { return };
+        let (Some(dir), Some(stem)) = (session.parent(), session.file_stem()) else { return };
+        let dir = dir.join("plans");
         let _ = std::fs::create_dir_all(&dir);
         if let Ok(json) = serde_json::to_string_pretty(&serde_json::json!({ "tasks": tasks })) {
-            let _ = std::fs::write(dir.join("plan.json"), json + "\n");
+            let _ = std::fs::write(dir.join(format!("{}-{ticket}.json", stem.to_string_lossy())), json + "\n");
         }
     }
 
