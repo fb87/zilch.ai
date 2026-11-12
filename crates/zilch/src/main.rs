@@ -39,6 +39,9 @@ struct Cli {
     /// Nothing asks: plans approved, commands run (same as --approval auto).
     #[arg(long)]
     yolo: bool,
+    /// Outside sources for this session: fetch_source, web_fetch (and web_search if configured).
+    #[arg(long)]
+    web: bool,
     /// ask (plans and commands) | plan (plans; default) | auto (nothing).
     #[arg(long, value_name = "MODE")]
     approval: Option<String>,
@@ -455,8 +458,12 @@ fn main() {
 
 fn run(cli: Cli) -> anyhow::Result<i32> {
     let cwd = std::env::current_dir()?;
-    let ov =
-        Overrides { model: cli.model.clone(), architect_model: cli.architect_model.clone(), developer_model: cli.developer_model.clone() };
+    let ov = Overrides {
+        model: cli.model.clone(),
+        architect_model: cli.architect_model.clone(),
+        developer_model: cli.developer_model.clone(),
+        web: cli.web.then_some(true),
+    };
     let cfg = Config::load(&cwd, &ov)?;
     // Prices and context sizes from the providers (best effort, a few seconds at most), the
     // session caps, and a client for every usable provider (so /model can switch).
@@ -464,7 +471,8 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
     *meter.catalog.write().unwrap() = cfg.discover_catalog();
     let mut drivers = DriverSet::new(&cwd, cfg.policy.clone(), cfg.backends())
         .with_costs(meter.clone(), cfg.max_session_tokens)
-        .with_spec_dir(cfg.spec_dir.clone());
+        .with_spec_dir(cfg.spec_dir.clone())
+        .with_web(&cfg.web);
     let providers = drivers.providers();
     if cli.doctor {
         return Ok(doctor(&cfg, &meter, &cwd));
