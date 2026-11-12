@@ -302,6 +302,8 @@ impl View {
                 match group {
                     Group::Architecture => format!("  {d}+ {pid} main agent{r}"),
                     Group::Spec => format!("  {d}+ {pid} spec agent{r}"),
+                    // Dispatched subagents and explorers say what they are in their title.
+                    _ if ["answer:", "plan:", "explore:"].iter().any(|p| title.starts_with(p)) => format!("  {cy}+{r} {pid} {b}{title}{r}"),
                     _ => format!("  {cy}+{r} {pid} {} {b}{title}{r}", group.name()),
                 }
             }

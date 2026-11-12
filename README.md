@@ -200,12 +200,14 @@ With `--web` or `[web] enabled = true`, every agent can look outside the workspa
   Archives are unpacked by zilch itself (no links, no `..`, size caps); clones are shallow and keep
   no `.git`.
 - `web_fetch`: one page as plain text (links kept as `[text](url)`), 20k characters per call.
-- `web_search`: only with a search service.
+- `web_search`: DuckDuckGo's HTML results by default, with no key or setup. That page is not an API
+  and can answer with a bot check now and then; for a dependable service, set SearXNG or Brave.
 
 ```toml
 [web]
 enabled = true
-search = "searxng"                  # or "brave" (key in BRAVE_API_KEY, or search_api_key_env)
+search = "searxng"                  # default "duckduckgo"; or "brave" (key in BRAVE_API_KEY,
+                                    # or search_api_key_env); "none" turns search off
 search_url = "http://localhost:8888" # a SearXNG instance with the JSON format enabled
 ```
 

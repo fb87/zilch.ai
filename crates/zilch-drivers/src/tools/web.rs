@@ -2,7 +2,7 @@
 //! - `fetch_source`: a read-only local copy of a git repository or a source archive, kept in the
 //!   data directory (never in the workspace) and readable with the usual read tools;
 //! - `web_fetch`: one page as plain text;
-//! - `web_search`: a configured search service (SearXNG or Brave).
+//! - `web_search`: DuckDuckGo's HTML results by default, or a configured service (SearXNG, Brave).
 //!
 //! Every URL the model supplies must resolve to a public address (no loopback, private,
 //! link-local or metadata addresses), also after each redirect. What comes back is labelled as
@@ -39,6 +39,8 @@ pub struct WebConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SearchProvider {
+    /// DuckDuckGo's HTML results page: no key, no setup (the default with `[web] enabled`).
+    DuckDuckGo,
     /// A SearXNG instance (its JSON API must be enabled): base URL.
     Searxng { url: String },
     /// Brave Search API: the variable holding the key.
@@ -820,6 +822,7 @@ fn parse_results(provider: &SearchProvider, v: &Value) -> Vec<(String, String, S
     let (list, snippet) = match provider {
         SearchProvider::Searxng { .. } => (&v["results"], "content"),
         SearchProvider::Brave { .. } => (&v["web"]["results"], "description"),
+        SearchProvider::DuckDuckGo => return Vec::new(),
     };
     let strip = |s: &str| html_to_text(s, None).replace('\n', " ");
     list.as_array()
@@ -832,6 +835,30 @@ fn parse_results(provider: &SearchProvider, v: &Value) -> Vec<(String, String, S
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Results as (title, url, snippet) from DuckDuckGo's HTML page; ads (links through `y.js`) are dropped.
+fn parse_duckduckgo(html: &str) -> Vec<(String, String, String)> {
+    let link = regex::Regex::new(r#"class="result__a"[^>]*?href="([^"]*)"[^>]*>(.*?)</a>"#).unwrap();
+    let snippet = regex::Regex::new(r#"(?s)class="result__snippet"[^>]*>(.*?)</a>"#).unwrap();
+    let strip = |s: &str| html_to_text(s, None).replace('\n', " ").trim().to_string();
+    let starts: Vec<usize> = html.match_indices(r#"class="result__a""#).map(|(i, _)| i).collect();
+    let mut out = Vec::new();
+    for (n, &at) in starts.iter().enumerate() {
+        let block = &html[at..starts.get(n + 1).copied().unwrap_or(html.len())];
+        let Some(c) = link.captures(block) else { continue };
+        let href = c[1].replace("&amp;", "&");
+        let Ok(u) = url::Url::parse(&if href.starts_with("//") { format!("https:{href}") } else { href }) else { continue };
+        // Result links go through duckduckgo.com/l/?uddg=<target>.
+        let target = u.query_pairs().find(|(k, _)| k == "uddg").map(|(_, v)| v.into_owned()).unwrap_or_else(|| u.to_string());
+        let Ok(t) = url::Url::parse(&target) else { continue };
+        if t.host_str().is_some_and(|h| h.ends_with("duckduckgo.com")) || !t.scheme().starts_with("http") {
+            continue;
+        }
+        let snip = snippet.captures(block).map(|s| strip(&s[1])).unwrap_or_default();
+        out.push((strip(&c[2]), target, snip));
+    }
+    out
 }
 
 impl Tool for WebSearch {
@@ -855,7 +882,44 @@ impl Tool for WebSearch {
         let count = args.get("count").and_then(Value::as_u64).unwrap_or(8).clamp(1, 20) as usize;
         // The search service is configured by the guest, so it may be a local instance.
         let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).user_agent(USER_AGENT).build();
+        let results = if self.0 == SearchProvider::DuckDuckGo {
+            let resp = agent
+                .get("https://html.duckduckgo.com/html/")
+                .query("q", query)
+                .call()
+                .map_err(|e| anyhow!("web_search: DuckDuckGo: {e}"))?;
+            let mut body = String::new();
+            resp.into_reader().take(MAX_PAGE_BYTES).read_to_string(&mut body)?;
+            let results = parse_duckduckgo(&body);
+            if results.is_empty() && body.contains("anomaly") {
+                bail!(
+                    "web_search: DuckDuckGo answered with a bot check instead of results; try again later, or set \
+                     [web] search = \"searxng\" or \"brave\""
+                );
+            }
+            results
+        } else {
+            self.json_results(&agent, query, count)?
+        };
+        if results.is_empty() {
+            return Ok(format!("No results for '{query}'."));
+        }
+        let mut s = format!("[search results for '{query}': untrusted content]\n");
+        for (i, (title, url, snip)) in results.iter().take(count).enumerate() {
+            s.push_str(&format!("{}. {title}\n   {url}\n", i + 1));
+            if !snip.is_empty() {
+                s.push_str(&format!("   {}\n", snip.chars().take(300).collect::<String>()));
+            }
+        }
+        Ok(s)
+    }
+}
+
+impl WebSearch {
+    /// SearXNG or Brave: their JSON APIs.
+    fn json_results(&self, agent: &ureq::Agent, query: &str, count: usize) -> Result<Vec<(String, String, String)>> {
         let resp = match &self.0 {
+            SearchProvider::DuckDuckGo => unreachable!("handled by call"),
             SearchProvider::Searxng { url } => {
                 agent.get(&format!("{}/search", url.trim_end_matches('/'))).query("q", query).query("format", "json").call()
             }
@@ -872,18 +936,7 @@ impl Tool for WebSearch {
         }
         .map_err(|e| anyhow!("web_search: {e}"))?;
         let v: Value = serde_json::from_reader(resp.into_reader().take(MAX_PAGE_BYTES)).context("web_search: bad JSON")?;
-        let results = parse_results(&self.0, &v);
-        if results.is_empty() {
-            return Ok(format!("No results for '{query}'."));
-        }
-        let mut s = format!("[search results for '{query}': untrusted content]\n");
-        for (i, (title, url, snip)) in results.iter().take(count).enumerate() {
-            s.push_str(&format!("{}. {title}\n   {url}\n", i + 1));
-            if !snip.is_empty() {
-                s.push_str(&format!("   {}\n", snip.chars().take(300).collect::<String>()));
-            }
-        }
-        Ok(s)
+        Ok(parse_results(&self.0, &v))
     }
 }
 
@@ -1077,5 +1130,41 @@ mod tests {
         );
         let b = json!({"web":{"results":[{"title":"T","url":"https://u","description":"d"}]}});
         assert_eq!(parse_results(&SearchProvider::Brave { key_env: "K".into() }, &b).len(), 1);
+    }
+
+    #[test]
+    fn duckduckgo_results_skip_ads_and_unwrap_links() {
+        // Trimmed from html.duckduckgo.com: one ad (through y.js), one result.
+        let html = r#"
+<div class="result results_links result--ad">
+  <h2 class="result__title"><a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fduckduckgo.com%2Fy.js%3Fad_domain%3Dklook.com&amp;rut=1">Klook deals</a></h2>
+  <a class="result__snippet" href="//duckduckgo.com/l/?uddg=x">Book now</a>
+</div>
+<div class="result results_links results_links_deep web-result">
+  <h2 class="result__title">
+    <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.accuweather.com%2Fen%2Fvn%2Fho%2Dchi%2Dminh%2Dcity&amp;rut=632f">Ho Chi Minh City Weather | AccuWeather</a>
+  </h2>
+  <a class="result__snippet" href="//duckduckgo.com/l/?uddg=y">Hourly forecast for <b>Ho</b> <b>Chi</b> <b>Minh</b>
+  City &amp; more</a>
+</div>"#;
+        assert_eq!(
+            parse_duckduckgo(html),
+            vec![(
+                "Ho Chi Minh City Weather | AccuWeather".into(),
+                "https://www.accuweather.com/en/vn/ho-chi-minh-city".into(),
+                "Hourly forecast for Ho Chi Minh City & more".into()
+            )]
+        );
+        assert!(parse_duckduckgo("<html>no results</html>").is_empty());
+    }
+
+    #[test]
+    #[ignore = "network: queries DuckDuckGo"]
+    fn live_duckduckgo() {
+        let out = WebSearch(SearchProvider::DuckDuckGo)
+            .call(json!({"query":"rust serde crate"}), &ToolCtx::new("t", std::env::temp_dir()))
+            .unwrap();
+        assert!(out.contains("1. ") && out.contains("https://"), "{out}");
+        println!("{out}");
     }
 }

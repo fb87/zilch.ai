@@ -182,7 +182,7 @@ struct FileConfig {
     expensive_model_spend: Option<f64>,
     spec_dir: Option<String>,
     approval: Option<String>,
-    /// Outside sources: `[web] enabled = true`, `search = "searxng" | "brave"`, `search_url`, `search_api_key_env`.
+    /// Outside sources: `[web] enabled = true`, `search = "duckduckgo" (default) | "searxng" | "brave" | "none"`, `search_url`, `search_api_key_env`.
     web: Option<WebCfg>,
     /// Daemon sessions: a shell command run when a question waits and no client is attached
     /// (env: ZILCH_WORKSPACE, ZILCH_TICKET, ZILCH_QUESTION).
@@ -209,7 +209,8 @@ impl WebCfg {
     fn resolve(&self, flag: Option<bool>, env: &BTreeMap<String, String>) -> Result<WebConfig> {
         let enabled = flag.or(self.enabled).unwrap_or(false);
         let search = match self.search.as_deref().map(str::trim) {
-            None | Some("") | Some("none") => None,
+            None | Some("duckduckgo") => Some(SearchProvider::DuckDuckGo),
+            Some("") | Some("none") => None,
             Some("searxng") => match &self.search_url {
                 Some(u) if u.starts_with("http") => Some(SearchProvider::Searxng { url: u.clone() }),
                 _ => bail!("[web] search = \"searxng\" needs search_url = \"https://…\" (an instance with the JSON format enabled)"),
@@ -217,13 +218,16 @@ impl WebCfg {
             Some("brave") => {
                 Some(SearchProvider::Brave { key_env: self.search_api_key_env.clone().unwrap_or_else(|| "BRAVE_API_KEY".into()) })
             }
-            Some(other) => bail!("[web] search = \"{other}\": supported are \"searxng\" and \"brave\""),
+            Some(other) => {
+                bail!("[web] search = \"{other}\": supported are \"duckduckgo\" (the default), \"searxng\", \"brave\" and \"none\"")
+            }
         };
         if let (true, Some(SearchProvider::Brave { key_env })) = (enabled, &search) {
             if env.get(key_env).is_none_or(|v| v.is_empty()) {
                 bail!("[web] search = \"brave\": set {key_env} (or search_api_key_env)");
             }
         }
+        let search = if enabled { search } else { None };
         Ok(WebConfig { enabled, search })
     }
 }
@@ -695,14 +699,18 @@ developer = 500000
         let names =
             |c: &Config| crate::DriverSet::new(dir.path(), c.policy.clone(), HashMap::new()).with_web(&c.web).specs(crate::EXPLORER_TOOLS);
         assert!(!names(&c).iter().any(|t| t.function.name.starts_with("web") || t.function.name == "fetch_source"));
-        // --web: fetch_source and web_fetch, no search without a provider.
+        // --web: fetch_source, web_fetch and web_search (DuckDuckGo unless another service is set).
         let c = load(&env, &Overrides { web: Some(true), ..Default::default() }).unwrap();
         let tools: Vec<String> = names(&c).into_iter().map(|t| t.function.name).collect();
         assert!(
-            tools.contains(&"fetch_source".into()) && tools.contains(&"web_fetch".into()) && !tools.contains(&"web_search".into()),
+            tools.contains(&"fetch_source".into()) && tools.contains(&"web_fetch".into()) && tools.contains(&"web_search".into()),
             "{tools:?}"
         );
         assert_eq!(c.policy.read_roots, vec![crate::tools::web::sources_dir()]);
+        assert_eq!(c.web.search, Some(SearchProvider::DuckDuckGo));
+        write("[web]\nenabled = true\nsearch = \"none\"\n");
+        let c = load(&env, &Overrides::default()).unwrap();
+        assert!(c.web.search.is_none() && !names(&c).iter().any(|t| t.function.name == "web_search"));
         // Search providers.
         write("[web]\nenabled = true\nsearch = \"searxng\"\nsearch_url = \"http://127.0.0.1:8888\"\n");
         let c = load(&env, &Overrides::default()).unwrap();
