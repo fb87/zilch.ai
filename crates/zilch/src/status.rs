@@ -63,7 +63,10 @@ impl Highlighter for StatusHelper {
         // Only our two-row prompt carries a status row (approval questions etc. are left alone).
         match prompt.strip_prefix('\n') {
             Some(rest) if default && !self.bar.accepting.load(Ordering::SeqCst) => {
-                Cow::Owned(format!("\r\x1b[2K{}\n{rest}", self.bar.text()))
+                // Autowrap (DECAWM) is off while the row is drawn: a terminal that draws some glyph wider
+                // than counted cuts the row instead of wrapping it (a wrapped row stays behind as a
+                // stale copy on every redraw).
+                Cow::Owned(format!("\r\x1b[2K\x1b[?7l{}\x1b[?7h\n{rest}", self.bar.text()))
             }
             _ => Cow::Borrowed(prompt),
         }

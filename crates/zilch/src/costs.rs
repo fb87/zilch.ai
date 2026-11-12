@@ -19,6 +19,11 @@ pub struct Costs {
     spend: f64,
     /// Tokens per (who, model): who is "main" or "subagents".
     usage: Mutex<BTreeMap<(String, String), Usage>>,
+    /// Model requests this session, and estimated input tokens per request part (see
+    /// KernelEvent::RequestParts).
+    requests: std::sync::atomic::AtomicU64,
+    parts: Mutex<BTreeMap<String, u64>>,
+    started: std::time::Instant,
     /// Warning steps the guest acknowledged / already announced: model → (minutes step, spend step).
     acked: Mutex<HashMap<String, (u64, u64)>>,
     announced: Mutex<HashMap<String, (u64, u64)>>,
@@ -43,29 +48,82 @@ impl Costs {
             minutes: minutes.max(1),
             spend: spend.max(0.01),
             usage: Mutex::default(),
+            requests: Default::default(),
+            parts: Mutex::default(),
+            started: std::time::Instant::now(),
             acked: Mutex::default(),
             announced: Mutex::default(),
         }
     }
 
     pub fn record(&self, who: &str, model: &str, u: Usage) {
+        self.requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         *self.usage.lock().unwrap().entry((who.to_string(), model.to_string())).or_default() += u;
     }
 
-    /// `/usage`: tokens and cost per agent and model, then the session total.
+    pub fn record_parts(&self, parts: &[(String, u64)]) {
+        let mut m = self.parts.lock().unwrap();
+        for (k, n) in parts {
+            *m.entry(k.clone()).or_default() += n;
+        }
+    }
+
+    /// One line for the whole session: requests, input (cached share), output, cost and duration;
+    /// None before the first model request.
+    pub fn session_summary(&self) -> Option<String> {
+        let n = self.requests.load(std::sync::atomic::Ordering::Relaxed);
+        if n == 0 {
+            return None;
+        }
+        let mut t = Usage::default();
+        for u in self.usage.lock().unwrap().values() {
+            t += *u;
+        }
+        let secs = self.started.elapsed().as_secs();
+        Some(format!(
+            "Session: {n} model requests · {} in ({}) · {} out · ${:.4} · {}m{:02}s",
+            fmt_tokens(t.prompt_tokens),
+            cached_share(t.cached_tokens, t.prompt_tokens),
+            fmt_tokens(t.completion_tokens),
+            self.meter.spent(),
+            secs / 60,
+            secs % 60
+        ))
+    }
+
+    /// Where the input tokens went (estimated), biggest first.
+    pub fn parts_report(&self) -> Option<String> {
+        let parts = self.parts.lock().unwrap();
+        let total: u64 = parts.values().sum();
+        if total == 0 {
+            return None;
+        }
+        let mut v: Vec<(&String, &u64)> = parts.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1));
+        let shown: Vec<String> = v.iter().map(|(k, n)| format!("{k} {}%", (**n * 100 + total / 2) / total)).collect();
+        Some(format!("Input by part (estimated, ~{} tokens): {}", fmt_tokens(total), shown.join(" · ")))
+    }
+
+    /// `/usage`: tokens (with the cached share) and cost per agent and model, the session total, the
+    /// session line and where the input went.
     pub fn report(&self) -> String {
         let usage = self.usage.lock().unwrap();
         if usage.is_empty() {
             return "No model calls yet.".into();
         }
-        let mut s = format!("{:<10} {:<36} {:>10} {:>10} {:>10}\n", "AGENT", "MODEL", "PROMPT", "OUTPUT", "USD");
+        let mut s = format!("{:<10} {:<36} {:>10} {:>11} {:>10} {:>10}\n", "AGENT", "MODEL", "PROMPT", "CACHED", "OUTPUT", "USD");
         for ((who, model), u) in usage.iter() {
             let cost = self.meter.info(model).and_then(|i| i.cost(u)).map_or("?".to_string(), |c| format!("{c:.4}"));
-            s.push_str(&format!("{who:<10} {model:<36} {:>10} {:>10} {cost:>10}\n", u.prompt_tokens, u.completion_tokens));
+            let cached = cached_share(u.cached_tokens, u.prompt_tokens).replace(" cached", "");
+            s.push_str(&format!("{who:<10} {model:<36} {:>10} {cached:>11} {:>10} {cost:>10}\n", u.prompt_tokens, u.completion_tokens));
         }
         let (p, c) = usage.values().fold((0, 0), |(p, c), u| (p + u.prompt_tokens, c + u.completion_tokens));
         let cap = self.meter.limit_usd.map(|l| format!(" of ${l:.2} cap")).unwrap_or_default();
-        s.push_str(&format!("{:<47} {p:>10} {c:>10} {:>10}{cap}", "total", format!("{:.4}", self.meter.spent())));
+        s.push_str(&format!("{:<47} {p:>10} {:>11} {c:>10} {:>10}{cap}", "total", "", format!("{:.4}", self.meter.spent())));
+        drop(usage);
+        for line in [self.session_summary(), self.parts_report()].into_iter().flatten() {
+            s.push_str(&format!("\n{line}"));
+        }
         s
     }
 
@@ -146,6 +204,23 @@ impl Costs {
     }
 }
 
+/// 950 → "950", 12_345 → "12.3k", 2_500_000 → "2.50M".
+pub fn fmt_tokens(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => format!("{:.1}k", n as f64 / 1e3),
+        _ => format!("{:.2}M", n as f64 / 1e6),
+    }
+}
+
+/// "62% cached" ("0% cached" when nothing came from a cache).
+pub fn cached_share(cached: u64, prompt: u64) -> String {
+    if prompt == 0 {
+        return "-".into();
+    }
+    format!("{}% cached", (cached * 100 / prompt).min(100))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +245,17 @@ mod tests {
         c.record("main", "p/cheap", u);
         let r = c.report();
         assert!(r.contains("main") && r.contains("p/cheap") && r.contains("1.0000") && r.contains("total"), "{r}");
+    }
+
+    #[test]
+    fn usage_shows_the_cached_share_the_session_line_and_where_input_went() {
+        let c = costs();
+        c.record("main", "p/cheap", Usage { prompt_tokens: 1_000, completion_tokens: 50, cached_tokens: 800 });
+        c.record_parts(&[("tools".into(), 600), ("system".into(), 300), ("user".into(), 100)]);
+        let r = c.report();
+        assert!(r.contains("CACHED") && r.contains("80%"), "{r}");
+        assert!(r.contains("Session: 1 model requests · 1.0k in (80% cached) · 50 out"), "{r}");
+        assert!(r.contains("Input by part (estimated, ~1.0k tokens): tools 60% · system 30% · user 10%"), "{r}");
     }
 
     #[test]

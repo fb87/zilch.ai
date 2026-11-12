@@ -173,6 +173,7 @@ impl Drivers for DriverSet {
         match call {
             Syscall::Complete(req) => {
                 self.note_request(ctx.pid, &req);
+                ctx.bus.publish(zilch_ipc::KernelEvent::RequestParts { pid: ctx.pid, parts: llm::request_parts(&req) });
                 let Some(backend) = self.backends.get(&req.binding.provider) else {
                     return SyscallResult::Failed(format!("unknown provider '{}'", req.binding.provider));
                 };

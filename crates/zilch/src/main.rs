@@ -140,6 +140,9 @@ impl View {
 
     /// Keep the status row's picture of live processes up to date.
     fn track(&self, ev: &KernelEvent) {
+        if let KernelEvent::RequestParts { parts, .. } = ev {
+            self.costs.record_parts(parts);
+        }
         if let KernelEvent::Usage { pid, model, prompt_tokens, completion_tokens, cached_tokens } = ev {
             let who = match self.procs.lock().unwrap().get(pid).map(|(g, _)| *g) {
                 Some(Group::Architecture) => "main",
@@ -316,6 +319,7 @@ impl View {
             | KernelEvent::State { .. }
             | KernelEvent::TextDelta { .. }
             | KernelEvent::Usage { .. }
+            | KernelEvent::RequestParts { .. }
             | KernelEvent::SyscallDone { .. } => return None,
         })
     }
@@ -640,6 +644,9 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 }
                 KernelEvent::TicketServed { ok, .. } => {
                     kernel.shutdown();
+                    for line in [view.costs.session_summary(), view.costs.parts_report()].into_iter().flatten() {
+                        eprintln!("{line}");
+                    }
                     return Ok(if *ok { 0 } else { 1 });
                 }
                 _ => {}
@@ -923,6 +930,9 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             c if c.starts_with('/') => println!("Unknown command {c}. /help lists them."),
             _ => kernel.send(Cmd::OrderTo(*view.lane.lock().unwrap(), input.to_string())),
         }
+    }
+    for line in [view.costs.session_summary(), view.costs.parts_report()].into_iter().flatten() {
+        println!("{}{line}{}", view.c(DIM), view.c(RESET));
     }
     kernel.shutdown();
     Ok(0)

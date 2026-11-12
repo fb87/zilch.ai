@@ -300,6 +300,12 @@ pub enum KernelEvent {
         #[serde(default, skip_serializing_if = "is_zero_u64")]
         cached_tokens: u64,
     },
+    /// Estimated tokens per part of a model request about to be sent (system, tools, user,
+    /// assistant, reasoning, `tool:<name>` outputs), to see where input tokens go.
+    RequestParts {
+        pid: Pid,
+        parts: Vec<(String, u64)>,
+    },
     /// The kernel needs the guest: a plan to approve, or (approval = "ask") a command to allow.
     /// Answer with the CLI's `Answer` command.
     Question {
