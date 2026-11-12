@@ -46,9 +46,10 @@ OPENAI_BASE_URL=http://localhost:11434/v1 zilch --model qwen2.5-coder   # Ollama
 ```
 
 How an order flows:
-1. The main agent dispatches it with a self-contained brief: a question, explanation or check to the
-   read-only **answerer** (its report comes back and the main agent replies; no plan, nothing to
-   approve), a change to the **planner**.
+1. An order the conversation already answers ("which file was that?", "thanks") gets a direct
+   reply. Anything else the main agent dispatches with a self-contained brief: a question,
+   explanation or check to the read-only **answerer** (its report comes back and the main agent
+   replies; no plan, nothing to approve), a change to the **planner**.
 2. The planner reads what the change touches (read-only **explorers** can investigate a large
    codebase in parallel) and calls `submit_plan`. Nobody writes planning documents into your
    project (approved plans are kept with the session, outside it).
@@ -90,6 +91,7 @@ spec_dir = "specs"                 # the spec lane's documents
 loop_limit = 3                     # supervisor: repeats before a nudge (0 = off)
 max_session_cost = 5.0             # USD cap, checked before each model call
 max_session_tokens = 2_000_000
+repo_map = true                    # repository overview in the prompts of the agents that read code
 
 [providers.openai]                 # exists by default
 base_url = "https://api.openai.com/v1"
@@ -113,6 +115,8 @@ context_tokens = 64000             # compaction starts at 75%
 [roles.coder]                      # the subagents (also [roles.developer])
 provider = "opencode"
 model = "qwen3.8-flash"
+reasoning_effort = "low"           # thinking models: fewer output tokens on small tasks
+price_cached = 0.003               # USD / 1M cached input tokens, when the provider lists none
 system_prompt = "Prefer small diffs."
 prompt_mode = "append"             # append (default) | replace; or system_prompt_file = "…"
 
@@ -162,11 +166,28 @@ crates/zilch          the `zilch` binary: REPL, status row, plan/command questio
   restarted or killed. Processes waiting on each other's mailboxes are woken instead of hanging.
 - **Scheduling.** Tasks can carry a `priority` (0 urgent … 3 background); waiting work ages upward;
   per-process step and token budgets; `[quotas]` per group.
-- **Context.** Subagents and explorers start fresh per task. The resident agents compact their
-  history at 75% of their budget: old tool output is shortened first, then older turns are
-  summarized.
+- **Context.** Subagents and explorers start fresh per task. A resident main agent compacts while
+  idle: right after an order is served (past 40% of its budget) and again once the provider has
+  likely dropped its cache (5 min, past 20%), into a digest of the finished orders; the digest
+  request reuses its cached prefix. At 75% during an order, old tool output is shortened first,
+  then older turns are summarized.
 - **Events.** Everything the kernel does is an event; the JSONL log (`<data dir>/zilch/logs/`, mode
   0600) records every syscall result, which is what a replay needs.
+
+## Finding code, spending fewer tokens
+
+- **Repository map.** A module overview (every source directory with its purpose, each documented
+  file) goes into the prompts of the agents that read code. `repo_map` lists a directory's or
+  file's definitions with line numbers; `find_definition` finds where a function or type is
+  defined. Extracted from the code itself (doc comments, READMEs, manifests, per-language
+  patterns), no model calls; cached in the data directory for large trees and refreshed where it
+  changed.
+- **Search and reads.** `grep` searches in parallel like ripgrep. Re-reading unchanged lines, or an
+  identical `grep` / `glob` with the same result, returns a short note instead of the text again;
+  a file over 1,500 lines read without a range returns its outline first.
+- **Less resent.** Command output loses build progress and passing-test lines; reasoning from
+  earlier orders is not sent again; every developer instance shares one prompt, so the provider's
+  cache serves them all; Anthropic requests carry cache markers (it caches nothing without them).
 
 ## Lanes
 
@@ -197,9 +218,12 @@ saved. `/clear` starts a fresh session; the old one stays resumable.
 ## Costs and models
 
 At startup zilch reads each provider's `{base}/models` (OpenCode and OpenRouter publish prices and
-context windows); `price_in` / `price_out` on a role override them, `discover = false` on a
-provider skips the lookup. `/usage` shows tokens and USD per agent and model, the status row the
-session's spend; the caps stop a call before it would exceed them. `/model` switches a group for
+context windows, and OpenCode its cache price and peak-hour multipliers); `price_in` / `price_out` /
+`price_cached` on a role override them, `discover = false` on a provider skips the lookup. Cached
+input is billed at the cache price. `/usage` shows tokens (with the share served from the
+provider's cache) and USD per agent and model, a session line and where the input went (system,
+tools, history, each tool's output); the session line is also printed on exit and after `-p`. The
+status row shows the session's spend; the caps stop a call before it would exceed them. `/model` switches a group for
 the session. A model whose output price is at least `expensive_model_price` (default 10 USD/1M) and
 that has been in use for `expensive_model_minutes` (30) or cost `expensive_model_spend` ($2)
 pulses in the status row until `/ack` (next step) or until no group uses it.
@@ -244,6 +268,10 @@ whose address zilch writes to `.zilch/ipc`. See [`editor/nvim/README.md`](editor
 cargo test     # offline: kernel behaviour with scripted agents, tools, protocols, end-to-end orders
                # with a scripted model on real files, sessions, the editor link
 ```
+
+`bench/run.sh <label> [runs] [model]` measures what orders cost (requests, input, cached and
+output tokens, time, tests passing) on fixed scenarios in a copy of `examples/ledger-demo`;
+`bench/report.sh` compares labels. Compare before and after a change with several runs each.
 
 Pushing a `v*` tag builds and tests Linux (gnu + static musl, x86_64 + aarch64) and macOS (Intel +
 Apple Silicon) binaries and publishes them with `SHA256SUMS`.
