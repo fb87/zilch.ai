@@ -35,6 +35,12 @@ pub struct DriverSet {
     tools: ToolRegistry,
     locks: FileLocks,
     hashes: Mutex<HashMap<Pid, ReadHashes>>,
+    /// Per process: what read_file / grep / glob showed it that is still in its context.
+    shown: Mutex<HashMap<Pid, tools::Shown>>,
+    /// Per process: size of its last model request (messages, characters). A smaller next request
+    /// means history was removed (compaction, a restart with a summary, dropped reasoning), so
+    /// what it was shown may be gone: its `shown` memory is cleared.
+    last_request: Mutex<HashMap<Pid, (usize, usize)>>,
     backends: HashMap<String, Arc<dyn Backend>>,
     /// Where the main agent's conversation is saved (None = no sessions).
     session_file: Mutex<Option<PathBuf>>,
@@ -52,6 +58,8 @@ impl DriverSet {
             tools: tools::all_tools(),
             locks: FileLocks::default(),
             hashes: Mutex::default(),
+            shown: Mutex::default(),
+            last_request: Mutex::default(),
             backends,
             session_file: Mutex::new(None),
             meter: Arc::new(CostMeter::new(None)),
@@ -101,8 +109,22 @@ impl DriverSet {
         self.tools.specs(names)
     }
 
+    /// Remember the size of a process's model request; when it is smaller than its previous one,
+    /// forget what read_file / grep / glob showed it (those outputs may no longer be in its context).
+    fn note_request(&self, pid: Pid, req: &zilch_ipc::ChatRequest) {
+        let chars: usize = req.messages.iter().map(|m| m.content.as_ref().map_or(0, String::len)).sum();
+        let now = (req.messages.len(), chars);
+        let shrank = self.last_request.lock().unwrap().insert(pid, now).is_some_and(|(n, c)| now.0 < n || now.1 < c);
+        if shrank {
+            if let Some(s) = self.shown.lock().unwrap().get(&pid) {
+                s.lock().unwrap().clear();
+            }
+        }
+    }
+
     fn tool_ctx(&self, ctx: &DriverCtx) -> ToolCtx {
         let hashes = self.hashes.lock().unwrap().entry(ctx.pid).or_default().clone();
+        let shown = self.shown.lock().unwrap().entry(ctx.pid).or_default().clone();
         ToolCtx {
             agent_id: ctx.pid.to_string(),
             cwd: self.cwd.clone(),
@@ -110,6 +132,7 @@ impl DriverSet {
             cancel: ctx.cancel.clone(),
             locks: self.locks.clone(),
             read_hashes: hashes,
+            shown,
             progress: None,
             alive: Some(ctx.alive.clone()),
         }
@@ -124,6 +147,7 @@ impl Drivers for DriverSet {
     fn run(&self, ctx: &DriverCtx, call: Syscall) -> SyscallResult {
         match call {
             Syscall::Complete(req) => {
+                self.note_request(ctx.pid, &req);
                 let Some(backend) = self.backends.get(&req.binding.provider) else {
                     return SyscallResult::Failed(format!("unknown provider '{}'", req.binding.provider));
                 };
@@ -186,6 +210,8 @@ impl Drivers for DriverSet {
 
     fn release(&self, pid: Pid) {
         self.hashes.lock().unwrap().remove(&pid);
+        self.shown.lock().unwrap().remove(&pid);
+        self.last_request.lock().unwrap().remove(&pid);
     }
 
     fn save_session(&self, lane: zilch_ipc::Group, snapshot: &Value) {
@@ -193,5 +219,41 @@ impl Drivers for DriverSet {
             let field = if lane == zilch_ipc::Group::Spec { "spec" } else { "snapshot" };
             let _ = session::save_field(&path, &self.cwd, field, snapshot);
         }
+    }
+}
+
+#[cfg(test)]
+mod shown_tests {
+    use super::*;
+    use zilch_ipc::llm::{ChatRequest, LlmEvent, Message, ModelBinding};
+    use zilch_ipc::EventBus;
+    use zilch_kernel::CancelToken;
+
+    #[test]
+    fn a_repeated_grep_is_a_note_until_the_process_history_shrinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (0..30).map(|i| format!("fn item_{i}() {{}} // needle\n")).collect();
+        std::fs::write(dir.path().join("a.rs"), body).unwrap();
+        let llm: Arc<dyn Backend> = Arc::new(llm::fake::ScriptedLlm::new(|_| vec![LlmEvent::TextDelta("ok".into())]));
+        let d = DriverSet::new(dir.path(), ToolPolicy { sandbox: false, ..Default::default() }, [("fake".to_string(), llm)].into());
+        let (cancel, bus) = (CancelToken::new(), EventBus::new());
+        let ctx = DriverCtx { pid: 7, ticket: 1, cancel: &cancel, bus: &bus, alive: Arc::new(|| {}) };
+        let grep = || Syscall::Tool { call_id: "c".into(), name: "grep".into(), args: serde_json::json!({"pattern":"needle"}) };
+        let ask = |n: usize| {
+            let messages = (0..n).map(|i| Message::user(format!("turn {i}"))).collect();
+            Syscall::Complete(ChatRequest {
+                binding: ModelBinding { provider: "fake".into(), ..Default::default() },
+                messages,
+                tools: vec![],
+                session: None,
+            })
+        };
+        d.run(&ctx, ask(4));
+        assert!(d.run(&ctx, grep()).text().contains("a.rs:1:"));
+        assert!(d.run(&ctx, grep()).text().starts_with("[same result as your earlier identical grep"));
+        d.run(&ctx, ask(6)); // history grew: the earlier output is still there
+        assert!(d.run(&ctx, grep()).text().starts_with("[same result"));
+        d.run(&ctx, ask(2)); // history shrank (compaction): send it again
+        assert!(d.run(&ctx, grep()).text().contains("a.rs:1:"));
     }
 }

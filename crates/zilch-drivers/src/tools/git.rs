@@ -67,19 +67,16 @@ impl Tool for GitTool {
         "git"
     }
     fn description(&self) -> String {
-        "Read-only git. `status`: changed files and branch. `diff`: uncommitted changes (`staged` for the index, \
-         `rev` to compare with a commit or range like `main..HEAD`, `stat` for a summary). `log`: recent commits \
-         (`limit`, default 20). `show`: one commit (`rev`, default HEAD). `path` limits any of them to a file or directory."
-            .into()
+        "Read-only git: status, diff (uncommitted; `staged`, `rev` e.g. main..HEAD, `stat`), log, show.".into()
     }
     fn schema(&self) -> Value {
         json!({"type":"object","properties":{
             "command":{"type":"string","enum":["status","diff","log","show"]},
             "path":{"type":"string","description":"Limit to this file or directory"},
-            "rev":{"type":"string","description":"Commit, branch or range (diff, log, show)"},
-            "staged":{"type":"boolean","default":false},
-            "stat":{"type":"boolean","default":false,"description":"Summary of changed files instead of the patch"},
-            "limit":{"type":"integer","description":"log: number of commits (default 20)"}
+            "rev":{"type":"string","description":"Commit, branch or range"},
+            "staged":{"type":"boolean"},
+            "stat":{"type":"boolean","description":"Changed-file summary instead of the patch"},
+            "limit":{"type":"integer","description":"log: commits (default 20)"}
         },"required":["command"]})
     }
     fn summarize(&self, args: &Value) -> String {

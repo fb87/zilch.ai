@@ -6,7 +6,7 @@
 #[cfg(test)]
 use super::sandbox::native_available;
 use super::sandbox::{self, BashSandbox};
-use super::{arg_opt_u64, arg_str, truncate_output, Tool, ToolCtx};
+use super::{arg_opt_u64, arg_str, compress_output, truncate_output, Tool, ToolCtx};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::Read;
@@ -157,7 +157,7 @@ impl Tool for Bash {
         let _ = child.wait();
         std::thread::sleep(Duration::from_millis(20));
         let buf = std::mem::take(&mut *collected.lock().unwrap());
-        let out = truncate_output(&String::from_utf8_lossy(&buf), 30_000);
+        let out = truncate_output(&compress_output(&String::from_utf8_lossy(&buf)), 30_000);
         Ok(match outcome {
             Ok(s) => format!("{out}\n[exit code: {}]", s.code().map_or("signal".into(), |c| c.to_string())),
             Err(e) => format!("{out}\n[{e}]"),

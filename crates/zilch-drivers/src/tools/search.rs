@@ -59,7 +59,7 @@ impl Tool for GlobTool {
             } else if total > MAX_FILES {
                 out.push_str(&format!("\n[{} more files not shown]", total - MAX_FILES));
             }
-            Ok(out)
+            Ok(super::repeat_note(ctx, "glob", &args, &out).unwrap_or(out))
         }
     }
 }
@@ -85,41 +85,58 @@ impl Tool for GrepTool {
         args.get("pattern").and_then(Value::as_str).unwrap_or("?").to_string()
     }
     fn call(&self, args: Value, ctx: &ToolCtx) -> Result<String> {
-        let re = regex::RegexBuilder::new(arg_str(&args, "pattern")?).case_insensitive(arg_bool(&args, "case_insensitive")).build()?;
+        let re =
+            regex::bytes::RegexBuilder::new(arg_str(&args, "pattern")?).case_insensitive(arg_bool(&args, "case_insensitive")).build()?;
         let filter = arg_opt_str(&args, "glob").map(Glob::new).transpose()?.map(|g| g.compile_matcher());
         let root = ctx.resolve_checked(arg_opt_str(&args, "path").unwrap_or("."), false)?;
         let cwd = ctx.cwd.clone();
-        {
-            let mut out = Vec::new();
-            let mut total = 0usize;
-            for p in walk(root) {
-                ctx.alive();
-                if let Some(f) = &filter {
+        let alive = ctx.alive.clone();
+        // Like ripgrep: walk in parallel, and test each whole file once (the regex engine's literal
+        // prefilters make that fast) before splitting a matching file into lines.
+        let found = std::sync::Mutex::new(Vec::<(String, usize, String)>::new());
+        WalkBuilder::new(&root).hidden(true).git_ignore(true).require_git(false).build_parallel().run(|| {
+            let (re, filter, cwd, found, alive) = (&re, &filter, &cwd, &found, &alive);
+            Box::new(move |entry| {
+                let Ok(e) = entry else { return ignore::WalkState::Continue };
+                if !e.file_type().is_some_and(|t| t.is_file()) {
+                    return ignore::WalkState::Continue;
+                }
+                if let Some(a) = alive {
+                    a(); // heartbeat for the kernel (rate-limited there)
+                }
+                let p = e.path();
+                let rel = p.strip_prefix(cwd).unwrap_or(p).to_string_lossy().into_owned();
+                if let Some(f) = filter {
                     let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    let rel = p.strip_prefix(&cwd).unwrap_or(&p).to_string_lossy().into_owned();
                     if !f.is_match(&name) && !f.is_match(&rel) {
-                        continue;
+                        return ignore::WalkState::Continue;
                     }
                 }
-                let Ok(text) = std::fs::read_to_string(&p) else { continue };
-                let rel = p.strip_prefix(&cwd).unwrap_or(&p).to_string_lossy().into_owned();
-                for (i, line) in text.lines().enumerate() {
+                let Ok(bytes) = std::fs::read(p) else { return ignore::WalkState::Continue };
+                if bytes.iter().take(8000).any(|b| *b == 0) || !re.is_match(&bytes) {
+                    return ignore::WalkState::Continue; // binary, or no match anywhere in the file
+                }
+                let mut mine = Vec::new();
+                for (i, line) in bytes.split(|b| *b == b'\n').enumerate() {
                     if re.is_match(line) {
-                        total += 1;
-                        if out.len() < MAX_MATCHES {
-                            let l = if line.len() > 300 { &line[..line.floor_char_boundary(300)] } else { line };
-                            out.push(format!("{rel}:{}: {}", i + 1, l.trim_end()));
-                        }
+                        let text = String::from_utf8_lossy(line);
+                        let text = if text.len() > 300 { text[..text.floor_char_boundary(300)].to_string() } else { text.into_owned() };
+                        mine.push((rel.clone(), i + 1, text.trim_end().to_string()));
                     }
                 }
-            }
-            let mut s = out.join("\n");
-            if total == 0 {
-                s = "No matches".into();
-            } else if total > MAX_MATCHES {
-                s.push_str(&format!("\n[{} more matches not shown]", total - MAX_MATCHES));
-            }
-            Ok(s)
+                found.lock().unwrap().extend(mine);
+                ignore::WalkState::Continue
+            })
+        });
+        let mut hits = found.into_inner().unwrap();
+        hits.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+        let total = hits.len();
+        let mut s = hits.iter().take(MAX_MATCHES).map(|(p, n, t)| format!("{p}:{n}: {t}")).collect::<Vec<_>>().join("\n");
+        if total == 0 {
+            s = "No matches".into();
+        } else if total > MAX_MATCHES {
+            s.push_str(&format!("\n[{} more matches not shown]", total - MAX_MATCHES));
         }
+        Ok(super::repeat_note(ctx, "grep", &args, &s).unwrap_or(s))
     }
 }

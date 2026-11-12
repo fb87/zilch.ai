@@ -10,9 +10,8 @@ impl Tool for EditFile {
         "edit_file"
     }
     fn description(&self) -> String {
-        "Replace an exact string in a file. `old_string` must match exactly (including whitespace) and be unique \
-         unless `replace_all` is true. Read the file first. For several changes to the same file pass `edits` \
-         (a list of {old_string, new_string, replace_all?}) instead: they apply in order, all or none, in one call."
+        "Replace an exact, unique string in a file (read it first; whitespace counts; `replace_all` for every \
+         occurrence). Several changes to one file: one call with `edits`, applied in order, all or none."
             .into()
     }
     fn schema(&self) -> Value {
@@ -20,12 +19,12 @@ impl Tool for EditFile {
             "path":{"type":"string"},
             "old_string":{"type":"string"},
             "new_string":{"type":"string"},
-            "replace_all":{"type":"boolean","default":false},
-            "edits":{"type":"array","description":"Several replacements in one call, applied in order (instead of old_string/new_string)",
+            "replace_all":{"type":"boolean"},
+            "edits":{"type":"array","description":"Instead of old_string/new_string",
                 "items":{"type":"object","properties":{
                     "old_string":{"type":"string"},
                     "new_string":{"type":"string"},
-                    "replace_all":{"type":"boolean","default":false}
+                    "replace_all":{"type":"boolean"}
                 },"required":["old_string","new_string"]}}
         },"required":["path"]})
     }
