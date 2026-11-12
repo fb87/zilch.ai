@@ -281,8 +281,13 @@ impl RepoMap {
         if let Some(map) = cache_file(root).and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<RepoMap>(&b).ok()) {
             return (map, true);
         }
+        // Only a tree that takes a while to scan is worth caching: small ones rebuild in milliseconds,
+        // and every cached tree leaves a file in the data directory.
+        let t = std::time::Instant::now();
         let map = Self::build(root);
-        map.save(root);
+        if t.elapsed() >= CACHE_WORTHWHILE {
+            map.save(root);
+        }
         (map, false)
     }
 
@@ -292,6 +297,7 @@ impl RepoMap {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
+        sweep_old_caches(path.parent());
         if let Ok(bytes) = serde_json::to_vec(self) {
             let tmp = path.with_extension("tmp");
             if std::fs::write(&tmp, bytes).is_ok() {
@@ -995,5 +1001,22 @@ mod approx_tests {
         assert_eq!(approx_lines(2_217_000), "~2200k");
         // Adding a few lines to a 4k-line directory does not change its overview line.
         assert_eq!(approx_lines(4_123), approx_lines(4_190));
+    }
+}
+
+/// A tree is cached only when scanning it took at least this long.
+const CACHE_WORTHWHILE: std::time::Duration = std::time::Duration::from_millis(300);
+/// Cached maps of workspaces not opened for this long are deleted.
+const CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+
+/// Delete cached maps not written for CACHE_MAX_AGE (best effort).
+fn sweep_old_caches(dir: Option<&Path>) {
+    let Some(dir) = dir else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > CACHE_MAX_AGE);
+        if old && e.path().extension().is_some_and(|x| x == "json") {
+            let _ = std::fs::remove_file(e.path());
+        }
     }
 }

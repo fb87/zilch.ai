@@ -441,3 +441,38 @@ async fn instances_of_a_profile_share_their_prompt_prefix() {
     sizes("master", master);
     sizes("coder", firsts[0]);
 }
+
+/// Between requests, when the master's history is compacted, the repository overview in its
+/// system prompt follows the tree (a file added since the session started shows up).
+#[tokio::test]
+async fn compaction_between_requests_refreshes_the_repository_overview() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.rs"), "//! Alpha module.\npub fn a() {}\n").unwrap();
+    // ~35k tokens of reading (1,400 lines, under read_file's outline threshold): past 40% of the budget.
+    let big: String = (0..1_400).map(|i| format!("{i:05} {}\n", "x".repeat(94))).collect();
+    std::fs::write(dir.path().join(".zilch-big.txt"), big).unwrap();
+    let script: Box<Script> = Box::new(|req| {
+        let last = req.messages.last().unwrap().text().to_string();
+        if last.starts_with("[compaction]") {
+            return vec![text("- read a big file")];
+        }
+        match assistant_turns(req) {
+            0 => vec![call("c0", "read_file", json!({"path":".zilch-big.txt"}))],
+            _ => vec![text("read it")],
+        }
+    });
+    let (team, _, _, _) = setup(dir.path(), 2, script);
+    let team = Arc::new(team);
+    let start = team.prompt_of("master").await.unwrap();
+    assert!(start.contains("Alpha module") && !start.contains("Beta module"), "{start}");
+    team.run("read the big file").await.unwrap();
+    // A file appears after the session started; the next safe point picks it up.
+    std::fs::write(dir.path().join("src/b.rs"), "//! Beta module.\npub fn b() {}\n").unwrap();
+    team.after_turn();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !team.prompt_of("master").await.unwrap().contains("Beta module") {
+        assert!(Instant::now() < deadline, "overview not refreshed:\n{}", team.prompt_of("master").await.unwrap());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

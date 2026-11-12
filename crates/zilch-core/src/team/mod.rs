@@ -54,7 +54,7 @@ pub struct TeamShared {
     pub repo_map: Arc<std::sync::Mutex<crate::repomap::RepoMap>>,
     /// The map's overview in the lane agents' system prompts: a snapshot, so their cached prompt
     /// prefix stays the same while workers edit files.
-    pub repo_overview: String,
+    pub repo_overview: std::sync::Mutex<String>,
 }
 
 impl TeamShared {
@@ -439,7 +439,7 @@ impl Team {
             task_failures: Mutex::default(),
             model_overrides: Mutex::default(),
             cost_acked: Mutex::default(),
-            repo_overview: if cfg.repo_map { repo_map.overview(REPO_OVERVIEW_CHARS) } else { String::new() },
+            repo_overview: std::sync::Mutex::new(if cfg.repo_map { repo_map.overview(REPO_OVERVIEW_CHARS) } else { String::new() }),
             repo_map: Arc::new(std::sync::Mutex::new(repo_map)),
             cfg,
         });
@@ -456,6 +456,7 @@ impl Team {
                 .ok();
         }
 
+        let overview = shared.repo_overview.lock().unwrap().clone();
         // Master: read-only tools + coordination tools, nothing mutating (enforced again here).
         let mut reg = tools::worker_tools().filter(|t| !t.mutating() && READONLY_TOOLS.contains(&t.name()));
         reg.register(Arc::new(tools::todo_tools::TodoWrite(shared.clone())));
@@ -473,7 +474,7 @@ impl Team {
                 agent_id: "master",
                 tools: &names,
                 workers: &workers,
-                repo_overview: Some(shared.repo_overview.as_str()).filter(|o| !o.is_empty()),
+                repo_overview: Some(overview.as_str()).filter(|o| !o.is_empty()),
             },
         );
         let ctx = Arc::new(
@@ -515,7 +516,7 @@ impl Team {
                 agent_id: "spec",
                 tools: &snames,
                 workers: &[],
-                repo_overview: Some(shared.repo_overview.as_str()).filter(|o| !o.is_empty()),
+                repo_overview: Some(overview.as_str()).filter(|o| !o.is_empty()),
             },
         );
         let spec_cancel = CancelCell::default();
@@ -626,19 +627,50 @@ impl Team {
     /// Call after a code-lane request finished: compacts the master's finished work in the
     /// background, so the next request starts from a smaller history (see COMPACT_AFTER_TURN).
     /// A request arriving meanwhile waits for it.
+    /// After a compaction rewrote the master's history (so its cached prefix is gone anyway), bring
+    /// the repository overview in its system prompt up to date, if the tree changed meanwhile.
+    async fn refresh_overview(&self, master: &mut Agent) {
+        if !self.shared.cfg.repo_map {
+            return;
+        }
+        let (map, cwd) = (self.shared.repo_map.clone(), self.shared.cfg.cwd.clone());
+        let fresh = tokio::task::spawn_blocking(move || {
+            let mut m = map.lock().unwrap();
+            m.refresh(&cwd, "");
+            m.overview(REPO_OVERVIEW_CHARS)
+        })
+        .await
+        .unwrap_or_default();
+        let mut current = self.shared.repo_overview.lock().unwrap();
+        if fresh.is_empty() || *current == fresh || !master.system.contains(current.trim_end()) {
+            return;
+        }
+        master.system = master.system.replacen(current.trim_end(), fresh.trim_end(), 1);
+        *current = fresh;
+    }
+
     pub fn after_turn(self: &Arc<Self>) {
         let me = self.clone();
         let turn = me.turns.load(std::sync::atomic::Ordering::SeqCst);
         tokio::spawn(async move {
-            let done = me.master.lock().await.compact_idle(COMPACT_AFTER_TURN).await.is_some();
+            let done = {
+                let mut m = me.master.lock().await;
+                let done = m.compact_idle(COMPACT_AFTER_TURN).await.is_some();
+                if done {
+                    me.refresh_overview(&mut m).await;
+                }
+                done
+            };
             if !done {
                 tokio::time::sleep(CACHE_TTL).await;
                 if me.turns.load(std::sync::atomic::Ordering::SeqCst) != turn {
                     return; // a newer request took over; its own after_turn decides
                 }
-                if me.master.lock().await.compact_idle(COMPACT_WHEN_COLD).await.is_none() {
+                let mut m = me.master.lock().await;
+                if m.compact_idle(COMPACT_WHEN_COLD).await.is_none() {
                     return;
                 }
+                me.refresh_overview(&mut m).await;
             }
             let _ = me.save().await;
         });
@@ -961,7 +993,12 @@ impl Team {
     /// The fully composed system prompt of the master, a live instance, or a profile (as it would be spawned).
     pub async fn prompt_of(&self, name: &str) -> Option<String> {
         if name == "master" {
-            return Some(self.master_system.clone());
+            // The live prompt (its repository overview is refreshed between requests); the one it
+            // started with while the master is busy.
+            return Some(match self.master.try_lock() {
+                Ok(m) => m.system.clone(),
+                Err(_) => self.master_system.clone(),
+            });
         }
         if name == "spec" {
             return Some(self.spec_system.clone());

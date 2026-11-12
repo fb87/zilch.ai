@@ -504,7 +504,7 @@ async fn repl(
         // A pending question (approval / plan review) takes the line as its answer when its
         // prompt was showing. Slash commands still run (e.g. /code to look before answering).
         if inbox.pending() && !line.trim_start().starts_with('/') {
-            if asked.is_some() {
+            if asked.is_some() || inbox.is_answer(&line) {
                 inbox.answer(&line).await;
                 continue;
             }

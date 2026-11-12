@@ -85,6 +85,19 @@ impl Inbox {
         }
     }
 
+    /// Is `line` nothing but an answer to the waiting question (empty, y / n / a, approve, reject …)?
+    /// Such a line answers it even when it was typed at the lane's prompt: a question arriving while
+    /// the line editor already waits does not change the prompt on screen, and an empty line or a
+    /// lone "y" cannot be an order.
+    pub fn is_answer(&self, line: &str) -> bool {
+        let l = line.trim().to_lowercase();
+        match self.queue.lock().unwrap().front().map(|a| &a.reply) {
+            Some(Reply::Approval(_)) => matches!(l.as_str(), "y" | "yes" | "n" | "no" | "a" | "always"),
+            Some(Reply::Plan(_)) => matches!(l.as_str(), "" | "a" | "y" | "yes" | "approve" | "r" | "n" | "no" | "reject"),
+            None => false,
+        }
+    }
+
     /// Answer the oldest question with the user's input line. Returns false if none was pending.
     pub async fn answer(&self, line: &str) -> bool {
         let Some(ask) = self.queue.lock().unwrap().pop_front() else { return false };
@@ -208,6 +221,35 @@ mod tests {
         }
         inbox.answer("please split task 2").await;
         assert_eq!(h.await.unwrap(), PlanDecision::Feedback("please split task 2".into()));
+    }
+
+    #[tokio::test]
+    async fn answer_words_answer_a_question_that_arrived_while_the_lane_prompt_was_up() {
+        let screen = Screen::new(Box::new(std::io::sink()), -1, false, false, true);
+        let inbox = Inbox::new(screen);
+        assert!(!inbox.is_answer(""), "nothing waiting");
+        let rev = ReplReviewer(inbox.clone());
+        let h = tokio::spawn(async move { rev.review("s", &[], &[]).await });
+        while !inbox.pending() {
+            tokio::task::yield_now().await;
+        }
+        // A plain Enter, y or r answers the plan; a sentence is not taken as an answer this way.
+        for w in ["", "y", "Approve", "r", " no "] {
+            assert!(inbox.is_answer(w), "{w:?}");
+        }
+        assert!(!inbox.is_answer("add a --verbose flag"));
+        inbox.answer("").await;
+        assert_eq!(h.await.unwrap(), PlanDecision::Approve);
+        // For a command approval an empty line is not an answer (it would deny).
+        let a = ReplApprover(inbox.clone());
+        let req = ApprovalRequest { agent: "coder#1".into(), tool: "bash".into(), summary: "x".into() };
+        let h = tokio::spawn(async move { a.approve(&req).await });
+        while !inbox.pending() {
+            tokio::task::yield_now().await;
+        }
+        assert!(!inbox.is_answer("") && inbox.is_answer("y") && inbox.is_answer("a"));
+        inbox.answer("y").await;
+        assert_eq!(h.await.unwrap(), Decision::Allow);
     }
 
     #[tokio::test]
