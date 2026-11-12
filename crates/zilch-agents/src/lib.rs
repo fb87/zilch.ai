@@ -29,8 +29,9 @@ pub const PLANNER_PROMPT: &str = include_str!("../prompts/planner.md");
 pub fn dispatch_spec() -> ToolSpec {
     ToolSpec::new(
         "dispatch",
-        "Hand the guest's order to one subagent and wait for its report. agent \"answer\": questions, explanations, \
-         checks, anything conversational. agent \"plan\": any change to the project (it plans, the guest approves, \
+        "Hand the guest's order to one subagent and wait for its report (an order answerable from the conversation \
+         alone needs no dispatch). agent \"answer\": questions, explanations, checks that need the code. agent \"plan\": \
+         any change to the project (it plans, the guest approves, \
          developers carry it out). The brief is all the subagent sees: the request word for word plus the session \
          context it needs.",
         json!({"type":"object","properties":{
