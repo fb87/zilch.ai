@@ -487,3 +487,33 @@ fn developers_share_their_prompt_prefix_and_tool_sizes_are_printed() {
     sizes("answerer", &first(&mut book.subagent(1, "answer", "brief").unwrap()));
     sizes("developer", &a);
 }
+
+#[test]
+fn an_idle_wake_compacts_a_long_history_and_then_waits_again() {
+    let idle = |body: &str| SyscallResult::Message(zilch_ipc::Msg { from: 0, kind: zilch_ipc::MsgKind::Idle, body: body.into() });
+    let reply = |t: &str| SyscallResult::Completion { message: Message::assistant(t), usage: Usage::default(), cut: false };
+    let view = AcbView { pid: 1, ticket: 1, group: Group::Architecture, steps: 0, notes: vec![] };
+    let served = |text: &str| {
+        let mut a =
+            LlmAgent::new(ModelBinding::default(), "s".into(), "Order #1: read".into(), vec![], "x".into()).resident().with_budget(16_000);
+        a.step(&view, vec![]);
+        assert!(matches!(a.step(&view, vec![reply(text)]), StepResult::Syscalls(c) if matches!(c[0], Syscall::Serve { .. })));
+        a
+    };
+    // Small history: nothing to do, keep waiting.
+    let mut small = served("short answer");
+    assert!(matches!(small.step(&view, vec![idle("now")]), StepResult::Syscalls(c) if matches!(c[0], Syscall::Recv)));
+    // Past 40% of the budget: the digest request (own prefix + instruction), then wait again.
+    let mut big = served(&format!("long: {}", "z".repeat(30_000)));
+    let StepResult::Syscalls(c) = big.step(&view, vec![idle("now")]) else { panic!() };
+    let Syscall::Complete(req) = &c[0] else { panic!("expected the digest request, got {c:?}") };
+    assert_eq!(req.messages[1].text(), "Order #1: read");
+    assert!(req.messages.last().unwrap().text().starts_with("[compaction]"));
+    assert!(matches!(big.step(&view, vec![reply("- read a lot")]), StepResult::Syscalls(c) if matches!(c[0], Syscall::Recv)));
+    // The next order goes out on top of the digest.
+    let order = SyscallResult::Message(zilch_ipc::Msg { from: 0, kind: zilch_ipc::MsgKind::Guest, body: "Order #2: next".into() });
+    let StepResult::Syscalls(c) = big.step(&view, vec![order]) else { panic!() };
+    let Syscall::Complete(req) = &c[0] else { panic!() };
+    assert!(req.messages[1].text().starts_with("<conversation-summary>") && req.messages[1].text().contains("read a lot"));
+    assert!(compact::estimate_tokens("", &req.messages, &[]) < 10_000);
+}

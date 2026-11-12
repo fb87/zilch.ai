@@ -201,6 +201,8 @@ pub fn splice(history: &[Message], cut: usize, summary: &str) -> Vec<Message> {
 /// Between orders: a resident agent whose history passed this share of its budget is digested
 /// before the next order goes to the model (see `digest_request`).
 pub const DIGEST_AT: f64 = 0.40;
+/// ...and, idle long enough that the provider has likely dropped its prompt cache, past this share.
+pub const DIGEST_WHEN_COLD: f64 = 0.20;
 
 const DIGEST_INSTRUCTION: &str = "[compaction] Do not call any tool and do not continue the work. Write a digest of \
 this whole conversation so far, to replace it: you will continue from the digest alone. One short block per \

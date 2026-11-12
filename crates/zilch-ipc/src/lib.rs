@@ -57,6 +57,10 @@ pub enum MsgKind {
     Cancel,
     /// Extra input from the guest (`@pid …` / `@group …` at the prompt).
     Guest,
+    /// From the kernel to a lane's resident agent waiting for its next order: it is idle, a
+    /// good moment to compact (body "now": just served; "cold": idle long enough that the
+    /// provider has likely dropped its prompt cache). Answer with `Recv` to keep waiting.
+    Idle,
 }
 
 /// A note passed between cooks. Large payloads live in files; messages carry text.

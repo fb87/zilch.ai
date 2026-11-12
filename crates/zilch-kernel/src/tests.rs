@@ -595,6 +595,9 @@ struct Main {
 
 impl Agent for Main {
     fn step(&mut self, view: &AcbView, wake: Vec<SyscallResult>) -> StepResult {
+        if idle_wake(&wake) {
+            return StepResult::Syscalls(vec![Syscall::Recv]); // nothing to compact: keep waiting
+        }
         let mut seen = self.seen.lock().unwrap();
         seen.extend(view.notes.iter().cloned());
         for w in &wake {
@@ -1181,4 +1184,69 @@ fn a_repeated_dispatch_in_one_step_runs_once() {
     assert!(ok && summary == "Report from the answer subagent:\nbecause", "{summary}");
     let spawned = run.seen.iter().filter(|e| matches!(e, KernelEvent::Spawned { title, .. } if title.starts_with("answer"))).count();
     assert_eq!(spawned, 1);
+}
+
+/// An idle wake from the kernel (a served resident agent may compact; scripted ones just wait).
+fn idle_wake(wake: &[SyscallResult]) -> bool {
+    !wake.is_empty() && wake.iter().all(|r| matches!(r, SyscallResult::Message(m) if m.kind == zilch_ipc::MsgKind::Idle))
+}
+
+#[test]
+fn a_served_main_agent_is_woken_when_idle_and_an_order_waits_for_its_compaction() {
+    // Records the idle wakes it gets; on "cold" it compacts (a slow model call) before waiting again.
+    struct Main(Arc<Mutex<Vec<String>>>);
+    impl Agent for Main {
+        fn step(&mut self, _: &AcbView, wake: Vec<SyscallResult>) -> StepResult {
+            if idle_wake(&wake) {
+                let body = wake[0].text();
+                self.0.lock().unwrap().push(body.clone());
+                if body.contains("cold") {
+                    return StepResult::Syscalls(vec![tool("slow", json!({}))]); // "compacting"
+                }
+                return StepResult::Syscalls(vec![Syscall::Recv]);
+            }
+            match wake.first().map(SyscallResult::text) {
+                Some(t) if t == "done after 400ms" => StepResult::Syscalls(vec![Syscall::Recv]), // compaction finished
+                Some(t) => StepResult::Syscalls(vec![Syscall::Serve { summary: format!("answered: {t}") }]),
+                None => StepResult::Syscalls(vec![Syscall::Serve { summary: "answered: first".into() }]),
+            }
+        }
+    }
+    struct B(Arc<Mutex<Vec<String>>>);
+    impl Recipes for B {
+        fn architect(&self, _: TicketId, _: &str) -> Box<dyn Agent> {
+            Box::new(Main(self.0.clone()))
+        }
+        fn developer(&self, _: TicketId, _: &PlanTask, _: &str) -> Box<dyn Agent> {
+            worker()(&task("w", &[], &[]))
+        }
+    }
+    let wakes: Arc<Mutex<Vec<String>>> = Arc::default();
+    let bus = Arc::new(EventBus::new());
+    let events = bus.subscribe(10_000);
+    let k = start(
+        KernelConfig { idle_cold: Duration::from_millis(300), ..cfg() },
+        Arc::new(FakeDrivers::default()),
+        Arc::new(B(wakes.clone())),
+        bus,
+    );
+    let mut run = Run { k, events, seen: vec![] };
+    run.k.send(Cmd::Order("hi".into()));
+    assert_eq!(served_ticket(&mut run).0, 1);
+    // "now" right away, "cold" after idle_cold — once each.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while wakes.lock().unwrap().len() < 2 {
+        assert!(Instant::now() < deadline, "{:?}", wakes.lock().unwrap());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // An order sent while it compacts becomes the next order and is delivered once it waits again.
+    let how = run.k.tell(zilch_ipc::Target::Group(Group::Architecture), "next please").unwrap();
+    assert!(how.contains("order #2"), "{how}");
+    let (t, ok, s) = served_ticket(&mut run);
+    assert!(t == 2 && ok && s.contains("next please"), "{s}");
+    std::thread::sleep(Duration::from_millis(400));
+    let w = wakes.lock().unwrap().clone();
+    // Each served order gets one "now" and, idle past idle_cold, one "cold".
+    assert_eq!(w.iter().filter(|b| b.ends_with("now")).count(), 2, "{w:?}");
+    assert_eq!(w.iter().filter(|b| b.ends_with("cold")).count(), 2, "{w:?}");
 }

@@ -78,6 +78,8 @@ enum Phase {
     Compacting(usize),
     /// Resident only: waiting for the digest of the history before the new order (`held_order`).
     Digesting,
+    /// Resident only: compacting while idle (the kernel woke it between orders); then it waits again.
+    IdleDigesting,
 }
 
 /// A model-driven process.
@@ -318,6 +320,33 @@ impl Agent for LlmAgent {
                 }
                 self.just_compacted = true;
                 None
+            }
+            Phase::AwaitInput
+                if !wake.is_empty()
+                    && wake.iter().all(|r| matches!(r, SyscallResult::Message(m) if m.kind == zilch_ipc::MsgKind::Idle)) =>
+            {
+                // Idle between orders: compact now if worthwhile ("cold": the provider has likely
+                // dropped its cache, so even a smaller history is worth it), then wait again.
+                let cold = wake.iter().any(|r| matches!(r, SyscallResult::Message(m) if m.body == "cold"));
+                let share = if cold { compact::DIGEST_WHEN_COLD } else { compact::DIGEST_AT };
+                if self.messages.len() >= 2
+                    && (compact::estimate_tokens(&self.system, &self.messages, &self.tools) as f64) >= self.budget as f64 * share
+                {
+                    let binding = self.binding.read().unwrap().clone();
+                    let req = compact::digest_request(&binding, Some(self.session.clone()), &self.system, &self.tools, &self.messages);
+                    self.phase = Phase::IdleDigesting;
+                    return StepResult::Syscalls(vec![Syscall::Complete(req)]);
+                }
+                return StepResult::Syscalls(vec![Syscall::Recv]);
+            }
+            Phase::IdleDigesting => {
+                if let Some(SyscallResult::Completion { message, .. }) = wake.into_iter().next() {
+                    if !message.text().trim().is_empty() && message.tool_calls.is_empty() {
+                        self.messages = compact::digest_splice(&self.messages, message.text());
+                    }
+                }
+                self.phase = Phase::AwaitInput;
+                return StepResult::Syscalls(vec![Syscall::Recv]);
             }
             Phase::AwaitInput => {
                 // The next order (or a note) from the guest. A model's reasoning is needed back only

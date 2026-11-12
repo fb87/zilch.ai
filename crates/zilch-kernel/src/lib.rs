@@ -154,6 +154,9 @@ pub struct KernelConfig {
     /// Model calls a process may make per task (a resident agent: per order), like zilch's
     /// max_steps; raw kernel steps are capped at 4× this as a safety net.
     pub max_steps: u32,
+    /// How long a served, idle resident agent waits before its "cold" idle wake (about when
+    /// providers drop a prompt cache).
+    pub idle_cold: Duration,
     /// Per-process token budget (None = unlimited).
     pub max_tokens: Option<u64>,
     /// Approve plans without asking (tests, --yes).
@@ -182,6 +185,7 @@ impl Default for KernelConfig {
             hang_ticks: 3000, // 5 minutes at 100 ms
             loop_limit: supervisor::DEFAULT_LOOP_LIMIT,
             max_steps: 80,
+            idle_cold: Duration::from_secs(5 * 60),
             max_tokens: None,
             auto_approve: false,
             age_ticks: 50,
@@ -516,6 +520,8 @@ pub struct Kernel {
     mains: BTreeMap<Group, Pid>,
     /// Orders waiting for their lane's agent to finish its current one: (ticket, lane, text).
     pending_orders: VecDeque<(TicketId, Group, String)>,
+    /// Lanes whose resident agent was served and is idle: (tick it was served, idle wakes sent).
+    idle_lanes: BTreeMap<Group, (u64, u8)>,
     /// Parent of the main agent's token: cancelled only on shutdown.
     session_cancel: CancelToken,
     /// Explorations in progress: explorer pid → (the agent that asked, which question).
@@ -623,6 +629,7 @@ impl Kernel {
             next_qid: 1,
             mains: BTreeMap::new(),
             pending_orders: VecDeque::new(),
+            idle_lanes: BTreeMap::new(),
             session_cancel: CancelToken::new(),
             explorers: BTreeMap::new(),
             dispatched: BTreeMap::new(),
@@ -808,6 +815,7 @@ impl Kernel {
         }
         let Some(i) = self.pending_orders.iter().position(|(_, l, _)| *l == lane) else { return };
         let (ticket, _, text) = self.pending_orders.remove(i).expect("found");
+        self.idle_lanes.remove(&lane);
         if let Some(a) = self.acbs.get_mut(&main) {
             a.ticket = ticket;
             // A resident agent's budget is per order.
@@ -823,12 +831,39 @@ impl Kernel {
         self.wake_parked(main, SyscallResult::Message(Msg { from: CLI_PID, kind: MsgKind::Guest, body: order_message(ticket, &text) }));
     }
 
-    /// The lane's resident agent is waiting for the next order (its last one is served).
+    /// Wake idle resident agents so they can compact while nobody waits: once right after an order
+    /// was served ("now"), and once when the provider has likely dropped its prompt cache ("cold").
+    fn idle_wakes(&mut self, tick: u64) {
+        let cold_ticks = (self.cfg.idle_cold.as_millis() / self.cfg.tick.as_millis().max(1)) as u64;
+        let due: Vec<(Group, &'static str)> = self
+            .idle_lanes
+            .iter()
+            .filter_map(|(lane, (served, sent))| match sent {
+                0 => Some((*lane, "now")),
+                1 if tick.saturating_sub(*served) >= cold_ticks => Some((*lane, "cold")),
+                _ => None,
+            })
+            .collect();
+        for (lane, body) in due {
+            let Some(main) = self.mains.get(&lane).copied() else { continue };
+            let waiting = self.acbs.get(&main).is_some_and(|a| a.state == State::Blocked(Block::Recv) && a.parked_slot.is_some());
+            if !waiting || self.pending_orders.iter().any(|(_, l, _)| *l == lane) {
+                continue; // busy, or an order is about to arrive
+            }
+            if let Some(e) = self.idle_lanes.get_mut(&lane) {
+                e.1 += 1;
+            }
+            self.wake_parked(main, SyscallResult::Message(Msg { from: 0, kind: MsgKind::Idle, body: body.into() }));
+        }
+    }
+
+    /// The lane's resident agent has served its last order: waiting for the next one, or compacting
+    /// while idle (a new order then waits until it parks again).
     fn main_idle(&self, lane: Group) -> bool {
         self.mains
             .get(&lane)
             .and_then(|m| self.acbs.get(m))
-            .is_some_and(|a| a.state == State::Blocked(Block::Recv) && self.tickets.get(&a.ticket).is_none_or(|t| t.served))
+            .is_some_and(|a| a.state.alive() && self.tickets.get(&a.ticket).is_none_or(|t| t.served))
     }
 
     /// The guest cancelled an order: its subagents stop, the order ends unserved, and the lane's
@@ -886,6 +921,7 @@ impl Kernel {
         if let Some(a) = self.acbs.get_mut(&pid) {
             a.parked_slot = Some(idx);
         }
+        self.idle_lanes.insert(lane, (self.tick, 0));
         self.set_state(pid, State::Blocked(Block::Recv));
         self.feed_main(lane);
     }
@@ -1172,6 +1208,11 @@ impl Kernel {
                                 a.parked_slot = Some(idx);
                             }
                             self.set_state(pid, State::Blocked(Block::Recv));
+                            // A lane's resident agent waiting again (after an idle compaction): hand
+                            // it any order that arrived meanwhile.
+                            if let Some(lane) = self.mains.iter().find(|(_, m)| **m == pid).map(|(l, _)| *l) {
+                                self.feed_main(lane);
+                            }
                         }
                     }
                 }
@@ -1848,6 +1889,7 @@ impl Kernel {
 
     fn on_tick(&mut self) {
         let tick = self.tick;
+        self.idle_wakes(tick);
         // Hung processes: no progress for hang_ticks while running or waiting on I/O. Commands
         // have their own timeout and are left to the exec driver.
         let mut interrupt = Vec::new();
