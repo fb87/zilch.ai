@@ -578,6 +578,7 @@ pub fn html_to_text(html: &str, base: Option<&url::Url>) -> String {
                 out.push(' ');
             }
             (h, true) if h.len() == 2 && h.starts_with('h') && h.as_bytes()[1].is_ascii_digit() => out.push_str("\n\n"),
+            ("a", false) if pre > 0 => {} // code keeps the link text only
             ("a", false) => {
                 let href = attr(tag, "href").unwrap_or_default();
                 let href = href.trim();
@@ -987,7 +988,7 @@ mod tests {
             <h1>Install</h1><p>Run   the <code>tool</code> with <a href="/guide#a">the guide</a>.</p>
             <script>alert(1)</script><ul><li>one</li><li>two &lt;3</li></ul>
             <pre>fn main() {
-    x();
+    x(<a href="/x">X</a>);
 }</pre><footer>© me</footer></body></html>"#;
         let base = url::Url::parse("https://example.org/docs/").unwrap();
         let t = html_to_text(html, Some(&base));
@@ -995,7 +996,7 @@ mod tests {
         assert!(t.contains("# Install"), "{t}");
         assert!(t.contains("Run the `tool` with [the guide](https://example.org/guide#a)."), "{t}");
         assert!(t.contains("- one\n- two <3"), "{t}");
-        assert!(t.contains("fn main() {\n    x();\n}"), "{t}");
+        assert!(t.contains("fn main() {\n    x(X);\n}"), "{t}");
         assert!(!t.contains("alert") && !t.contains("Home") && !t.contains("© me") && !t.contains(".x{}"), "{t}");
     }
 
@@ -1041,6 +1042,30 @@ mod tests {
         // Without the read root it is outside the workspace.
         let plain = ToolCtx::new("t", ws.path().to_path_buf());
         assert!(fs::ReadFile.call(json!({"path": file}), &plain).is_err());
+    }
+
+    /// Needs the network: `cargo test -p zilch-drivers live_outside_sources -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_outside_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::new("t", root.path().to_path_buf());
+        let t = std::time::Instant::now();
+        let (dir, v, reused) = fetch_into(root.path(), "https://github.com/BurntSushi/termcolor", None, false, &ctx).unwrap();
+        println!("git: {} [{v}] {:?}", dir.display(), t.elapsed());
+        assert!(!reused && dir.join("src/lib.rs").exists() && !dir.join(".git").exists());
+        assert!(fetch_into(root.path(), "https://github.com/BurntSushi/termcolor", None, false, &ctx).unwrap().2, "reused");
+        let (dir, v, _) = fetch_into(root.path(), "https://github.com/BurntSushi/termcolor.git", Some("1.4.1"), false, &ctx).unwrap();
+        println!("tag: {} [{v}]", dir.display());
+        assert!(dir.ends_with("termcolor@1.4.1"));
+        let (dir, v, _) = fetch_into(root.path(), "https://static.crates.io/crates/itoa/itoa-1.0.11.crate", None, false, &ctx).unwrap();
+        println!("crate: {} [{v}]", dir.display());
+        assert!(dir.join("Cargo.toml").exists() && dir.join("src/lib.rs").exists(), "single top directory used as the root");
+        println!("{}", super::super::repomap_tool::outside_overview(&dir, 600));
+        let (u, text) = fetch_page("https://doc.rust-lang.org/std/vec/struct.Vec.html", &|| {}).unwrap();
+        println!("page {u}: {} chars\n{}", text.chars().count(), text.chars().take(600).collect::<String>());
+        assert!(text.contains("Vec"));
+        assert!(fetch_page("http://169.254.169.254/latest/meta-data/", &|| {}).is_err());
     }
 
     #[test]
