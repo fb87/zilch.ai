@@ -198,6 +198,51 @@ pub fn splice(history: &[Message], cut: usize, summary: &str) -> Vec<Message> {
     out
 }
 
+/// Between orders: a resident agent whose history passed this share of its budget is digested
+/// before the next order goes to the model (see `digest_request`).
+pub const DIGEST_AT: f64 = 0.40;
+
+const DIGEST_INSTRUCTION: &str = "[compaction] Do not call any tool and do not continue the work. Write a digest of \
+this whole conversation so far, to replace it: you will continue from the digest alone. One short block per \
+request the user made: what was asked, what was done (files changed, results, test outcomes), decisions and the \
+user's preferences, and anything left open. Then the facts about the codebase you will need again (paths, names, \
+conventions). Terse bullet points; no raw tool output.";
+
+/// The digest request: the agent's own prefix (its system prompt, history and tools, exactly as it
+/// last sent them) plus one instruction, so a caching provider serves almost all of the input from
+/// its cache.
+pub fn digest_request(
+    binding: &ModelBinding,
+    session: Option<String>,
+    system: &str,
+    tools: &[ToolSpec],
+    history: &[Message],
+) -> ChatRequest {
+    let mut messages = Vec::with_capacity(history.len() + 2);
+    messages.push(Message::system(system));
+    messages.extend(history.iter().cloned());
+    messages.push(Message::user(DIGEST_INSTRUCTION));
+    ChatRequest {
+        binding: ModelBinding { max_tokens: Some(binding.max_tokens.unwrap_or(4_000).min(4_000)), ..binding.clone() },
+        messages,
+        tools: tools.to_vec(),
+        session,
+    }
+}
+
+/// The history after a digest: the digest, then the last request and reply verbatim (so a
+/// follow-up like "and the other one?" keeps its referent).
+pub fn digest_splice(history: &[Message], digest: &str) -> Vec<Message> {
+    let last_user = history.iter().rposition(|m| m.role == Role::User && !m.text().starts_with("<conversation-summary>"));
+    let last_reply = history.iter().rev().find(|m| m.role == Role::Assistant && m.tool_calls.is_empty() && !m.text().is_empty());
+    let mut text = format!("<conversation-summary>\nEarlier conversation, compacted:\n{}\n", digest.trim());
+    if let (Some(u), Some(r)) = (last_user, last_reply) {
+        text.push_str(&format!("\nThe last request (verbatim):\n{}\n\nYour reply to it (verbatim):\n{}\n", history[u].text(), r.text()));
+    }
+    text.push_str("</conversation-summary>");
+    vec![Message::user(text), Message::assistant("Understood. Continuing from that summary.")]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

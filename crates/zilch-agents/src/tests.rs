@@ -398,11 +398,39 @@ fn reasoning_from_an_earlier_order_is_not_resent() {
 #[test]
 fn the_agents_that_read_code_get_the_repository_overview() {
     let b = ModelBinding::default();
-    let mut book = Book::new(b.clone(), b, vec![], vec![], std::path::Path::new("/tmp"));
+    let book = Book::new(b.clone(), b, vec![], vec![], std::path::Path::new("/tmp"));
     assert!(!book.subagent_prompt("plan").unwrap().contains("Repository map"), "no overview, no section");
-    book.repo_overview = "src/ — the parser (3 files, ~400 lines)\n".into();
+    *book.repo_overview.write().unwrap() = "src/ — the parser (3 files, ~400 lines)\n".into();
     for p in [book.subagent_prompt("plan").unwrap(), book.subagent_prompt("answer").unwrap(), book.system_prompt(Group::Spec)] {
         assert!(p.contains("## Repository map") && p.contains("src/ — the parser"), "{p}");
     }
     assert!(!book.system_prompt(Group::Architecture).contains("Repository map"), "the main agent only routes");
+}
+
+#[test]
+fn between_orders_a_long_history_is_digested_through_its_cached_prefix_first() {
+    let mut a =
+        LlmAgent::new(ModelBinding::default(), "s".into(), "Order #1: read".into(), vec![], "x".into()).resident().with_budget(16_000);
+    let view = AcbView { pid: 1, ticket: 1, group: Group::Architecture, steps: 0, notes: vec![] };
+    a.step(&view, vec![]);
+    let reply = |t: &str| SyscallResult::Completion { message: Message::assistant(t), usage: Usage::default(), cut: false };
+    // Order 1 ends with a long reply: the history is past 40% of the 16k budget.
+    let big = format!("Here is all of it: {}", "z".repeat(30_000));
+    let StepResult::Syscalls(c) = a.step(&view, vec![reply(&big)]) else { panic!() };
+    assert!(matches!(&c[0], Syscall::Serve { .. }));
+    // Order 2 arrives: first the digest request, with the agent's own prefix and the order held back.
+    let order = SyscallResult::Message(zilch_ipc::Msg { from: 0, kind: zilch_ipc::MsgKind::Guest, body: "Order #2: and now?".into() });
+    let StepResult::Syscalls(c) = a.step(&view, vec![order]) else { panic!() };
+    let Syscall::Complete(req) = &c[0] else { panic!() };
+    let texts: Vec<&str> = req.messages.iter().map(|m| m.text()).collect();
+    assert_eq!(texts[0], "s");
+    assert_eq!(texts[1], "Order #1: read");
+    assert!(texts.last().unwrap().starts_with("[compaction]") && !texts.iter().any(|t| t.contains("Order #2")), "{texts:?}");
+    // The digest arrives: the order goes out on top of it, the long reply is gone.
+    let StepResult::Syscalls(c) = a.step(&view, vec![reply("- order 1: read everything")]) else { panic!() };
+    let Syscall::Complete(req) = &c[0] else { panic!() };
+    let texts: Vec<&str> = req.messages.iter().map(|m| m.text()).collect();
+    assert!(texts[1].starts_with("<conversation-summary>") && texts[1].contains("order 1: read everything"), "{texts:?}");
+    assert_eq!(*texts.last().unwrap(), "Order #2: and now?");
+    assert!(compact::estimate_tokens("", &req.messages, &[]) < 10_000, "the long reply is not resent");
 }

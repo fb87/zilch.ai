@@ -81,6 +81,8 @@ enum Phase {
     AwaitInput,
     /// Waiting for the summary of `history[..cut]`.
     Compacting(usize),
+    /// Resident only: waiting for the digest of the history before the new order (`held_order`).
+    Digesting,
 }
 
 /// A model-driven process.
@@ -108,6 +110,10 @@ pub struct LlmAgent {
     budget: usize,
     /// The history was just compacted: send the next request without checking again.
     just_compacted: bool,
+    /// Resident only: a new order just arrived (it may first digest the history, see DIGEST_AT).
+    order_start: bool,
+    /// The new order, held while the history is digested.
+    held_order: Option<Message>,
 }
 
 impl LlmAgent {
@@ -127,6 +133,8 @@ impl LlmAgent {
             failures: 0,
             budget: 128_000,
             just_compacted: false,
+            order_start: false,
+            held_order: None,
         }
     }
 
@@ -156,6 +164,18 @@ impl LlmAgent {
 
     /// Ask the model, compacting the history first if it outgrew the budget.
     fn ask(&mut self) -> StepResult {
+        // Between orders: digest a history past DIGEST_AT before the new order goes out. The request
+        // reuses the prefix the last order sent, so a caching provider serves its input from cache.
+        if std::mem::take(&mut self.order_start) && self.messages.len() >= 3 {
+            let older = &self.messages[..self.messages.len() - 1];
+            if (compact::estimate_tokens(&self.system, older, &self.tools) as f64) >= self.budget as f64 * compact::DIGEST_AT {
+                self.held_order = self.messages.pop();
+                let binding = self.binding.read().unwrap().clone();
+                let req = compact::digest_request(&binding, Some(self.session.clone()), &self.system, &self.tools, &self.messages);
+                self.phase = Phase::Digesting;
+                return StepResult::Syscalls(vec![Syscall::Complete(req)]);
+            }
+        }
         if !std::mem::take(&mut self.just_compacted) {
             let plan = compact::prepare(
                 &self.binding.read().unwrap().clone(),
@@ -283,6 +303,17 @@ impl Agent for LlmAgent {
                 }
                 None => Some(StepResult::Exit(ExitStatus::failed("[the model call returned nothing]\nSTATUS: failed"))),
             },
+            Phase::Digesting => {
+                // The digest (on failure, or a reply with tool calls, the history is kept as is).
+                if let Some(SyscallResult::Completion { message, .. }) = wake.into_iter().next() {
+                    if !message.text().trim().is_empty() && message.tool_calls.is_empty() {
+                        self.messages = compact::digest_splice(&self.messages, message.text());
+                        self.just_compacted = true;
+                    }
+                }
+                self.messages.extend(self.held_order.take());
+                None
+            }
             Phase::Compacting(cut) => {
                 // The summary of the older turns (on failure the elided history is kept as is).
                 if let Some(SyscallResult::Completion { message, .. }) = wake.into_iter().next() {
@@ -307,6 +338,7 @@ impl Agent for LlmAgent {
                     };
                     self.messages.push(Message::user(text));
                 }
+                self.order_start = true;
                 None
             }
             Phase::AwaitTools => {
@@ -361,8 +393,9 @@ pub struct Book {
     /// Environment section shared by every prompt (workspace, OS, date, AGENTS.md).
     pub environment: String,
     /// The repository map's overview (empty: none), in the prompts of the agents that read code:
-    /// answerer, planner, spec agent. Taken once per session, so their cached prompt prefix stays.
-    pub repo_overview: String,
+    /// answerer, planner, spec agent. Refreshed between orders only when the tree changed, so their
+    /// cached prompt prefix stays valid.
+    pub repo_overview: std::sync::RwLock<String>,
     /// Context budget of the resident main agent in tokens (compaction starts at 75%).
     pub main_context_tokens: usize,
     /// A saved conversation for the next main agent to continue (`-c`), used once.
@@ -398,7 +431,7 @@ impl Book {
             read_tools,
             developer_tools,
             environment: environment(cwd),
-            repo_overview: String::new(),
+            repo_overview: Default::default(),
             main_context_tokens: 64_000,
             resume: std::sync::Mutex::new(None),
             spec_tools: vec![],
@@ -452,12 +485,13 @@ impl Book {
     /// The prompt of a subagent the main agent dispatches to ("answer" or "plan").
     /// The overview section of a prompt (empty without an overview).
     fn map_section(&self) -> String {
-        if self.repo_overview.is_empty() {
+        let overview = self.repo_overview.read().unwrap();
+        if overview.is_empty() {
             return String::new();
         }
         format!(
             "\n## Repository map (taken at session start)\nEvery source directory with its purpose and size, and each documented file. Trust it for WHERE code lives: go to the directories and files it names instead of searching the whole tree; `repo_map` on a directory or file lists its definitions with line numbers (always current); `find_definition` finds where a named function or type is defined; grep within those directories for text and usages. Search the whole tree only when the map does not cover the topic. Read the actual lines before relying on details: this overview is a snapshot.\n{}\n",
-            self.repo_overview.trim_end()
+            overview.trim_end()
         )
     }
 

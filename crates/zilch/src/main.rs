@@ -99,6 +99,8 @@ struct View {
     live: Mutex<BTreeMap<Pid, Live>>,
     /// A short message shown in the status row for a few seconds.
     note: Mutex<Option<(String, Instant)>>,
+    /// Run when an order is served (brings the repository overview up to date).
+    on_served: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     started: Instant,
     /// Usage, prices, the high-cost warning.
     costs: Arc<costs::Costs>,
@@ -184,7 +186,10 @@ impl View {
             }
             // The resident main agent outlives every order.
             KernelEvent::TicketServed { ticket, .. } => {
-                live.retain(|_, l| l.ticket != *ticket || matches!(l.group, Group::Architecture | Group::Spec))
+                live.retain(|_, l| l.ticket != *ticket || matches!(l.group, Group::Architecture | Group::Spec));
+                if let Some(f) = self.on_served.get() {
+                    f();
+                }
             }
             _ => {}
         }
@@ -511,7 +516,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
     }
     book.explorer_tools = drivers.specs(zilch_drivers::EXPLORER_TOOLS);
     if cfg.repo_map {
-        book.repo_overview = drivers.repo_overview(10_000);
+        *book.repo_overview.write().unwrap() = drivers.repo_overview(10_000);
     }
     // Prompt overrides and custom subagent profiles from the roles.
     for (g, o) in &cfg.prompts {
@@ -577,6 +582,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         open: Mutex::default(),
         live: Mutex::default(),
         note: Mutex::default(),
+        on_served: Default::default(),
         started: Instant::now(),
         costs: Arc::new(costs::Costs::new(
             meter.clone(),
@@ -612,6 +618,18 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
     );
     let banner = if session_note.is_empty() { banner } else { format!("{banner}\n{}{session_note}{r}", view.c(CYAN)) };
     let drivers = Arc::new(drivers);
+    if cfg.repo_map {
+        // Between orders: the next planner / answerer / spec agent sees the current tree (the text
+        // changes only when the tree did, so their cached prompt prefix otherwise stays valid).
+        let (d, b) = (drivers.clone(), book.clone());
+        let _ = view.on_served.set(Box::new(move || {
+            let fresh = d.repo_overview(10_000);
+            let mut current = b.repo_overview.write().unwrap();
+            if *current != fresh {
+                *current = fresh;
+            }
+        }));
+    }
     let kernel = zilch_kernel::start(kcfg, drivers.clone(), book.clone(), bus);
 
     if let Some(order) = &cli.prompt {
