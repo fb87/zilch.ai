@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/zilch", "crates/zilch-ipc", "crates/zilch-kernel", "crates/zilch-drivers", "crates/zilch-agents"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 authors = ["Si Dao"]
