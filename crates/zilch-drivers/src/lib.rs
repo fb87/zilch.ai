@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod llm;
+pub mod repomap;
 pub mod session;
 pub mod tools;
 
@@ -19,15 +20,30 @@ use zilch_kernel::{Access, DriverCtx, Drivers};
 
 /// Tools of each group (the kernel's capabilities restrict their writes further).
 /// The main agent reads and plans; it never writes files (its subagents do).
-pub const ARCHITECT_TOOLS: &[&str] = &["read_file", "glob", "grep", "git"];
-pub const DEVELOPER_TOOLS: &[&str] = &["read_file", "write_file", "edit_file", "glob", "grep", "git", "bash"];
+pub const ARCHITECT_TOOLS: &[&str] = &["read_file", "repo_map", "find_definition", "glob", "grep", "git"];
+pub const DEVELOPER_TOOLS: &[&str] =
+    &["read_file", "write_file", "edit_file", "repo_map", "find_definition", "glob", "grep", "git", "bash"];
 /// The spec lane: read the code, write only the documents of the spec directory.
-pub const SPEC_TOOLS: &[&str] = &["read_file", "glob", "grep", "git", "write_doc", "edit_doc", "release_spec"];
+pub const SPEC_TOOLS: &[&str] =
+    &["read_file", "repo_map", "find_definition", "glob", "grep", "git", "write_doc", "edit_doc", "release_spec"];
 /// Explorers: read-only.
-pub const EXPLORER_TOOLS: &[&str] = &["read_file", "glob", "grep", "git"];
+pub const EXPLORER_TOOLS: &[&str] = &["read_file", "repo_map", "find_definition", "glob", "grep", "git"];
 
 /// Per-process content hashes of files read (stale-edit detection).
 type ReadHashes = Arc<Mutex<HashMap<PathBuf, String>>>;
+
+/// The workspace's map: from the disk cache brought up to date (only changed files are read), else a
+/// scan. Up to date before anyone takes the overview, so it does not flip between sessions (a
+/// provider cache miss); the refreshed cache is saved in the background.
+fn load_repo_map(cwd: &Path) -> repomap::RepoMap {
+    let (mut map, from_cache) = repomap::RepoMap::load_or_build(cwd);
+    if from_cache {
+        map.refresh(cwd, "");
+        let (snapshot, cwd) = (map.clone(), cwd.to_path_buf());
+        std::thread::Builder::new().name("zilch-repomap".into()).spawn(move || snapshot.save(&cwd)).ok();
+    }
+    map
+}
 
 pub struct DriverSet {
     cwd: PathBuf,
@@ -41,6 +57,8 @@ pub struct DriverSet {
     /// means history was removed (compaction, a restart with a summary, dropped reasoning), so
     /// what it was shown may be gone: its `shown` memory is cleared.
     last_request: Mutex<HashMap<Pid, (usize, usize)>>,
+    /// The repository map behind repo_map / find_definition and the lead agents' overview.
+    repo_map: Arc<Mutex<repomap::RepoMap>>,
     backends: HashMap<String, Arc<dyn Backend>>,
     /// Where the main agent's conversation is saved (None = no sessions).
     session_file: Mutex<Option<PathBuf>>,
@@ -60,6 +78,7 @@ impl DriverSet {
             hashes: Mutex::default(),
             shown: Mutex::default(),
             last_request: Mutex::default(),
+            repo_map: Arc::new(Mutex::new(load_repo_map(cwd))),
             backends,
             session_file: Mutex::new(None),
             meter: Arc::new(CostMeter::new(None)),
@@ -109,6 +128,11 @@ impl DriverSet {
         self.tools.specs(names)
     }
 
+    /// The repository overview for the lead agents' prompts (about `max_chars` long), up to date.
+    pub fn repo_overview(&self, max_chars: usize) -> String {
+        self.repo_map.lock().unwrap().overview(max_chars)
+    }
+
     /// Remember the size of a process's model request; when it is smaller than its previous one,
     /// forget what read_file / grep / glob showed it (those outputs may no longer be in its context).
     fn note_request(&self, pid: Pid, req: &zilch_ipc::ChatRequest) {
@@ -133,6 +157,7 @@ impl DriverSet {
             locks: self.locks.clone(),
             read_hashes: hashes,
             shown,
+            repo_map: Some(self.repo_map.clone()),
             progress: None,
             alive: Some(ctx.alive.clone()),
         }

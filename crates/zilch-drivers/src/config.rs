@@ -169,6 +169,8 @@ struct FileConfig {
     bash_protect_git: Option<bool>,
     max_workers: Option<usize>,
     loop_limit: Option<usize>,
+    /// Repository overview in the prompts of the agents that read code (default true).
+    repo_map: Option<bool>,
     max_task_tokens: Option<u64>,
     /// Token quota per group: `[quotas] architect = 200000, developer = 2000000`.
     quotas: Option<BTreeMap<String, u64>>,
@@ -208,6 +210,8 @@ pub struct Config {
     pub io_threads: usize,
     pub max_steps: u32,
     pub loop_limit: Option<usize>,
+    /// The repository overview goes into the answerer's, planner's and spec agent's prompts.
+    pub repo_map: bool,
     pub max_task_tokens: Option<u64>,
     /// Token quota per group (`[quotas]`).
     pub group_tokens: BTreeMap<Group, u64>,
@@ -301,6 +305,7 @@ impl Config {
             merge_opt(&mut fc.bash_protect_git, layer.bash_protect_git);
             merge_opt(&mut fc.max_workers, layer.max_workers);
             merge_opt(&mut fc.loop_limit, layer.loop_limit);
+            merge_opt(&mut fc.repo_map, layer.repo_map);
             merge_opt(&mut fc.max_task_tokens, layer.max_task_tokens);
             merge_opt(&mut fc.max_session_tokens, layer.max_session_tokens);
             merge_opt(&mut fc.max_session_cost, layer.max_session_cost);
@@ -446,6 +451,7 @@ impl Config {
             io_threads,
             max_steps: architect.max_steps.or(developer.max_steps).unwrap_or(80) as u32,
             loop_limit: fc.loop_limit,
+            repo_map: fc.repo_map.unwrap_or(true),
             max_task_tokens: fc.max_task_tokens,
             env: env.clone(),
         };

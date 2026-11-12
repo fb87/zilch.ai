@@ -394,3 +394,15 @@ fn reasoning_from_an_earlier_order_is_not_resent() {
     assert!(req.messages.iter().all(|m| m.reasoning_content.is_none()), "{:?}", req.messages);
     assert!(req.messages.iter().any(|m| m.text() == "Hello!"), "the reply itself stays");
 }
+
+#[test]
+fn the_agents_that_read_code_get_the_repository_overview() {
+    let b = ModelBinding::default();
+    let mut book = Book::new(b.clone(), b, vec![], vec![], std::path::Path::new("/tmp"));
+    assert!(!book.subagent_prompt("plan").unwrap().contains("Repository map"), "no overview, no section");
+    book.repo_overview = "src/ — the parser (3 files, ~400 lines)\n".into();
+    for p in [book.subagent_prompt("plan").unwrap(), book.subagent_prompt("answer").unwrap(), book.system_prompt(Group::Spec)] {
+        assert!(p.contains("## Repository map") && p.contains("src/ — the parser"), "{p}");
+    }
+    assert!(!book.system_prompt(Group::Architecture).contains("Repository map"), "the main agent only routes");
+}

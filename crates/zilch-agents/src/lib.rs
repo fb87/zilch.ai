@@ -360,6 +360,9 @@ pub struct Book {
     pub developer_tools: Vec<ToolSpec>,
     /// Environment section shared by every prompt (workspace, OS, date, AGENTS.md).
     pub environment: String,
+    /// The repository map's overview (empty: none), in the prompts of the agents that read code:
+    /// answerer, planner, spec agent. Taken once per session, so their cached prompt prefix stays.
+    pub repo_overview: String,
     /// Context budget of the resident main agent in tokens (compaction starts at 75%).
     pub main_context_tokens: usize,
     /// A saved conversation for the next main agent to continue (`-c`), used once.
@@ -395,6 +398,7 @@ impl Book {
             read_tools,
             developer_tools,
             environment: environment(cwd),
+            repo_overview: String::new(),
             main_context_tokens: 64_000,
             resume: std::sync::Mutex::new(None),
             spec_tools: vec![],
@@ -435,9 +439,10 @@ impl Book {
                 format!("{}\n{}", with_override(MAIN_PROMPT, self.prompts.get(&Group::Architecture)), self.environment)
             }
             Group::Spec => format!(
-                "{}\n- Spec directory: {}\n{}",
+                "{}\n- Spec directory: {}\n{}{}",
                 with_override(SPEC_PROMPT, self.prompts.get(&Group::Spec)),
                 self.spec_dir,
+                self.map_section(),
                 self.environment
             ),
             _ => format!("{}\n{}", with_override(DEVELOPER_PROMPT, self.prompts.get(&Group::Development)), self.environment),
@@ -445,9 +450,20 @@ impl Book {
     }
 
     /// The prompt of a subagent the main agent dispatches to ("answer" or "plan").
+    /// The overview section of a prompt (empty without an overview).
+    fn map_section(&self) -> String {
+        if self.repo_overview.is_empty() {
+            return String::new();
+        }
+        format!(
+            "\n## Repository map (taken at session start)\nEvery source directory with its purpose and size, and each documented file. Trust it for WHERE code lives: go to the directories and files it names instead of searching the whole tree; `repo_map` on a directory or file lists its definitions with line numbers (always current); `find_definition` finds where a named function or type is defined; grep within those directories for text and usages. Search the whole tree only when the map does not cover the topic. Read the actual lines before relying on details: this overview is a snapshot.\n{}\n",
+            self.repo_overview.trim_end()
+        )
+    }
+
     pub fn subagent_prompt(&self, agent: &str) -> Option<String> {
         match agent {
-            "answer" => Some(format!("{ANSWERER_PROMPT}\n{}", self.environment)),
+            "answer" => Some(format!("{ANSWERER_PROMPT}{}\n{}", self.map_section(), self.environment)),
             "plan" => {
                 let profiles = if self.profiles.is_empty() {
                     String::new()
@@ -467,7 +483,7 @@ impl Book {
                 } else {
                     String::new()
                 };
-                Some(format!("{PLANNER_PROMPT}{profiles}{spec}\n{}", self.environment))
+                Some(format!("{PLANNER_PROMPT}{profiles}{spec}{}\n{}", self.map_section(), self.environment))
             }
             _ => None,
         }

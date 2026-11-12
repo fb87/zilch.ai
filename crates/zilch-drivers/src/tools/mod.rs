@@ -6,6 +6,7 @@ pub mod bash;
 pub mod edit;
 pub mod fs;
 pub mod git;
+pub mod repomap_tool;
 pub mod sandbox;
 #[cfg(target_os = "linux")]
 pub mod sandbox_linux;
@@ -125,6 +126,8 @@ pub struct ToolCtx {
     /// also identical grep/glob calls (see `repeat_note`). Kept per process by the driver set and
     /// forgotten when its history shrinks (compaction, restart, dropped reasoning).
     pub shown: Shown,
+    /// The workspace's repository map (None: repo_map / find_definition scan per call).
+    pub repo_map: Option<Arc<Mutex<crate::repomap::RepoMap>>>,
     /// Live output of long commands (latest line), for the process table.
     pub progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
     /// Heartbeat to the kernel while a long call is still working (see `DriverCtx::alive`).
@@ -141,6 +144,7 @@ impl ToolCtx {
             locks: FileLocks::default(),
             read_hashes: Arc::default(),
             shown: Arc::default(),
+            repo_map: None,
             progress: None,
             alive: None,
         }
@@ -270,6 +274,8 @@ pub fn all_tools() -> ToolRegistry {
     r.register(Arc::new(edit::EditFile));
     r.register(Arc::new(search::GlobTool));
     r.register(Arc::new(search::GrepTool));
+    r.register(Arc::new(repomap_tool::RepoMapTool));
+    r.register(Arc::new(repomap_tool::FindDefinition));
     r.register(Arc::new(git::GitTool));
     r.register(Arc::new(bash::Bash));
     r
