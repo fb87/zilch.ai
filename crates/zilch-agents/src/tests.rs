@@ -434,3 +434,56 @@ fn between_orders_a_long_history_is_digested_through_its_cached_prefix_first() {
     assert_eq!(*texts.last().unwrap(), "Order #2: and now?");
     assert!(compact::estimate_tokens("", &req.messages, &[]) < 10_000, "the long reply is not resent");
 }
+
+/// Every developer instance sends the same system prompt and tools (only its brief differs), so a
+/// provider's prompt cache built by one serves the others. With --nocapture: each role's tool
+/// definitions and their sizes.
+#[test]
+fn developers_share_their_prompt_prefix_and_tool_sizes_are_printed() {
+    let dir = tempfile::tempdir().unwrap();
+    let drivers = DriverSet::new(dir.path(), ToolPolicy::default(), HashMap::new());
+    let mut book = Book::new(
+        ModelBinding::default(),
+        ModelBinding::default(),
+        drivers.specs(ARCHITECT_TOOLS),
+        drivers.specs(DEVELOPER_TOOLS),
+        dir.path(),
+    );
+    book.explorer_tools = drivers.specs(zilch_drivers::EXPLORER_TOOLS);
+    let view = AcbView { pid: 2, ticket: 1, group: Group::Development, steps: 0, notes: vec![] };
+    let first = |agent: &mut Box<dyn Agent>| {
+        let StepResult::Syscalls(c) = agent.step(&view, vec![]) else { panic!() };
+        let Syscall::Complete(req) = &c[0] else { panic!() };
+        req.clone()
+    };
+    let task = |id: &str, path: &str| PlanTask {
+        id: id.into(),
+        title: id.into(),
+        task: format!("edit {path}"),
+        depends_on: vec![],
+        owned_paths: vec![path.into()],
+        acceptance: vec![],
+        priority: None,
+        worker: None,
+    };
+    let a = first(&mut book.developer(1, &task("T1", "a.rs"), "plan"));
+    let b = first(&mut book.developer(1, &task("T2", "b.rs"), "plan"));
+    assert_eq!(a.messages[0].text(), b.messages[0].text(), "same system prompt for every developer");
+    assert_eq!(serde_json::to_string(&a.tools).unwrap(), serde_json::to_string(&b.tools).unwrap());
+    assert_ne!(a.messages[1].text(), b.messages[1].text(), "only the brief differs");
+
+    let sizes = |label: &str, req: &zilch_ipc::ChatRequest| {
+        let mut v: Vec<(usize, String)> =
+            req.tools.iter().map(|t| (serde_json::to_string(t).unwrap().len() / 4, t.function.name.clone())).collect();
+        v.sort_by(|x, y| y.cmp(x));
+        let total: usize = v.iter().map(|(n, _)| n).sum();
+        println!("{label}: tools ~{total} tokens, system prompt ~{} tokens", req.messages[0].text().len() / 4);
+        for (n, name) in v {
+            println!("  {name:<16} ~{n}");
+        }
+    };
+    sizes("main", &first(&mut book.architect(1, "Order #1: hi")));
+    sizes("planner", &first(&mut book.subagent(1, "plan", "brief").unwrap()));
+    sizes("answerer", &first(&mut book.subagent(1, "answer", "brief").unwrap()));
+    sizes("developer", &a);
+}
