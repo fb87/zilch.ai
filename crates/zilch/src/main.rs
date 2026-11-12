@@ -4,24 +4,27 @@
 
 mod completion;
 mod costs;
+mod daemon;
+mod front;
 mod ipc;
 #[allow(dead_code)] // ported whole from zilch-cli; streaming parts come later
 mod markdown;
+mod session;
 mod status;
 #[allow(dead_code)]
 mod wrap;
 
 use clap::Parser;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zilch_agents::Book;
 use zilch_drivers::config::{Config, Overrides};
-use zilch_drivers::{DriverSet, ARCHITECT_TOOLS, DEVELOPER_TOOLS};
-use zilch_ipc::{EventBus, Group, KernelEvent, Pid, TicketId};
-use zilch_kernel::{Cmd, KernelConfig, KernelHandle};
+
+use zilch_ipc::{Group, KernelEvent, Pid, TicketId};
+use zilch_kernel::KernelHandle;
 
 #[derive(Parser)]
 #[command(
@@ -31,53 +34,79 @@ use zilch_kernel::{Cmd, KernelConfig, KernelHandle};
 )]
 struct Cli {
     /// Place one order and exit when it is served.
-    #[arg(short = 'p', long = "prompt")]
+    #[arg(short = 'p', long = "prompt", global = true)]
     prompt: Option<String>,
     /// Approve plans without asking.
-    #[arg(long)]
+    #[arg(long, global = true)]
     yes: bool,
     /// Nothing asks: plans approved, commands run (same as --approval auto).
-    #[arg(long)]
+    #[arg(long, global = true)]
     yolo: bool,
     /// Outside sources for this session: fetch_source, web_fetch (and web_search if configured).
-    #[arg(long)]
+    #[arg(long, global = true)]
     web: bool,
     /// ask (plans and commands) | plan (plans; default) | auto (nothing).
-    #[arg(long, value_name = "MODE")]
+    #[arg(long, value_name = "MODE", global = true)]
     approval: Option<String>,
     /// Model for every group.
-    #[arg(long)]
+    #[arg(long, global = true)]
     model: Option<String>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     architect_model: Option<String>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     developer_model: Option<String>,
     /// Step workers (default: CPU cores).
-    #[arg(long)]
+    #[arg(long, global = true)]
     workers: Option<usize>,
     /// Write the event log here (default: <data dir>/zilch/logs/os-<time>.jsonl).
-    #[arg(long)]
+    #[arg(long, global = true)]
     log: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_log: bool,
     /// Continue the most recent session in this directory (the main agent remembers it).
-    #[arg(short = 'c', long = "continue")]
+    #[arg(short = 'c', long = "continue", global = true)]
     r#continue: bool,
     /// Do not save this session.
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_session: bool,
     /// Continue a specific session of this directory (ids from --sessions).
-    #[arg(long, value_name = "ID")]
+    #[arg(long, value_name = "ID", global = true)]
     resume: Option<String>,
     /// List the saved sessions of this directory and exit.
-    #[arg(long)]
+    #[arg(long, global = true)]
     sessions: bool,
     /// Show the resolved setup and ping every model, then exit.
-    #[arg(long)]
+    #[arg(long, global = true)]
     doctor: bool,
     /// Show every model call and syscall result.
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     verbose: bool,
+    /// With -p: the order goes to this daemon session (created for this directory if missing).
+    #[arg(long, value_name = "ID", global = true)]
+    session: Option<String>,
+    #[command(subcommand)]
+    cmd: Option<Sub>,
+}
+
+#[derive(clap::Subcommand)]
+enum Sub {
+    /// The zilch daemon: run (foreground, default) | start (background) | stop | status.
+    Daemon { action: Option<String> },
+    /// Create a session in the daemon (prints its id).
+    New {
+        /// The workspace (default: this directory).
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// The session's id (default: <directory name>-<n>).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// A REPL on a daemon session (default: this directory's, created if missing). /detach leaves it running.
+    Attach { id: Option<String> },
+    /// The daemon's sessions.
+    Ls,
+    /// End a daemon session (its conversation stays resumable).
+    Stop { id: String },
 }
 
 const BOLD: &str = "\x1b[1m";
@@ -277,7 +306,8 @@ impl View {
                 }
             }
             KernelEvent::SyscallIssued { pid, summary, .. } => {
-                if summary.starts_with("llm ") && !self.verbose {
+                // Model calls, and the resident agent waiting again after an idle wake, are not news.
+                if (summary.starts_with("llm ") || summary == "recv") && !self.verbose {
                     return None;
                 }
                 format!("    {d}{pid} ▸ {summary}{r}")
@@ -333,7 +363,20 @@ impl View {
     }
 }
 
+/// A width set by the client (the daemon has no terminal of its own; 0 = ask the terminal).
+static WIDTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn set_width(w: usize) {
+    if w > 0 {
+        WIDTH.store(w, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 fn terminal_width() -> usize {
+    let w = WIDTH.load(std::sync::atomic::Ordering::SeqCst);
+    if w > 0 {
+        return w;
+    }
     #[cfg(unix)]
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
@@ -348,11 +391,11 @@ fn terminal_width() -> usize {
     std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok()).unwrap_or(100)
 }
 
-fn open_log(cli: &Cli) -> Option<(PathBuf, std::fs::File)> {
-    if cli.no_log {
+fn open_log(log: Option<PathBuf>, no_log: bool) -> Option<(PathBuf, std::fs::File)> {
+    if no_log {
         return None;
     }
-    let path = cli.log.clone().or_else(|| {
+    let path = log.or_else(|| {
         let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         dirs::data_dir().map(|d| d.join("zilch").join("logs").join(format!("os-{secs}.jsonl")))
     })?;
@@ -431,6 +474,7 @@ Type an order to place it. While a plan waits for you: y approves, n rejects, an
 /redraw      clear the screen and re-render the last answer at the current width
 /help        this help
 /exit        quit (Ctrl-D)
+/detach      (daemon sessions, zilch attach) leave; the session keeps running · /stop ends it
 Tab completes commands, their arguments (groups, models, pids) and @ mentions.
 Ctrl-C cancels the newest open order.";
 
@@ -458,509 +502,154 @@ fn main() {
 
 fn run(cli: Cli) -> anyhow::Result<i32> {
     let cwd = std::env::current_dir()?;
-    let ov = Overrides {
+    let opts = |workspace: PathBuf, color: bool, editor_link: bool| session::SessionOpts {
+        workspace,
         model: cli.model.clone(),
         architect_model: cli.architect_model.clone(),
         developer_model: cli.developer_model.clone(),
-        web: cli.web.then_some(true),
+        web: cli.web,
+        approval: if cli.yes || cli.yolo { Some("auto".into()) } else { cli.approval.clone() },
+        workers: cli.workers,
+        log: cli.log.clone(),
+        no_log: cli.no_log,
+        r#continue: cli.r#continue,
+        resume: cli.resume.clone(),
+        no_session: cli.no_session,
+        verbose: cli.verbose,
+        color,
+        editor_link,
     };
-    let cfg = Config::load(&cwd, &ov)?;
-    // Prices and context sizes from the providers (best effort, a few seconds at most), the
-    // session caps, and a client for every usable provider (so /model can switch).
-    let meter = Arc::new(zilch_drivers::llm::catalog::CostMeter::new(cfg.max_session_cost));
-    *meter.catalog.write().unwrap() = cfg.discover_catalog();
-    let mut drivers = DriverSet::new(&cwd, cfg.policy.clone(), cfg.backends())
-        .with_costs(meter.clone(), cfg.max_session_tokens)
-        .with_spec_dir(cfg.spec_dir.clone())
-        .with_web(&cfg.web);
-    let providers = drivers.providers();
-    if cli.doctor {
-        return Ok(doctor(&cfg, &meter, &cwd));
-    }
-    let configured = (cfg.architect.clone(), cfg.developer.clone());
-    // Sessions: the main agent's conversation is saved after every served order; -c continues the
-    // most recent one of this directory.
-    let sessions =
-        (!cli.no_session).then(zilch_drivers::session::default_root).flatten().map(|r| zilch_drivers::session::dir_for(&r, &cwd));
-    let mut resumed: Option<(PathBuf, Vec<zilch_ipc::Message>)> = None;
-    let mut session_note = String::new();
-    let mut session_path: Option<PathBuf> = None;
-    if let Some(dir) = &sessions {
-        if cli.sessions {
-            println!("{}", sessions_list(dir, None));
+    let tty = std::io::stdout().is_terminal();
+    match &cli.cmd {
+        Some(Sub::Daemon { action }) => {
+            return match action.as_deref().unwrap_or("run") {
+                "run" => {
+                    if daemon::run()? {
+                        Ok(0)
+                    } else {
+                        eprintln!("a zilch daemon already runs ({})", ipc::daemon_endpoint());
+                        Ok(1)
+                    }
+                }
+                "start" => daemon::start().map(|_| 0),
+                "stop" => {
+                    daemon::request(&daemon::Up::Shutdown)?;
+                    println!("zilch daemon stopped");
+                    Ok(0)
+                }
+                "status" => {
+                    if !daemon::running() {
+                        println!("no zilch daemon is running");
+                        return Ok(1);
+                    }
+                    let sessions = match daemon::request(&daemon::Up::List)? {
+                        daemon::Down::Ok { sessions, .. } => sessions,
+                        _ => vec![],
+                    };
+                    println!("zilch daemon running ({}), {} session(s)", ipc::daemon_endpoint(), sessions.len());
+                    Ok(0)
+                }
+                other => anyhow::bail!("zilch daemon {other}: use run | start | stop | status"),
+            };
+        }
+        Some(Sub::New { workspace, name }) => {
+            let ws = workspace.clone().unwrap_or_else(|| cwd.clone());
+            let ws = if ws.is_absolute() { ws } else { cwd.join(ws) };
+            match daemon::request(&daemon::Up::New { opts: opts(ws, true, true), name: name.clone() })? {
+                daemon::Down::Ok { id, .. } => {
+                    let id = id.unwrap_or_default();
+                    println!("{id}\n(zilch attach {id} to talk to it; zilch -p \"…\" --session {id} for one order)");
+                }
+                other => anyhow::bail!("unexpected answer: {other:?}"),
+            }
             return Ok(0);
         }
-        let earlier = match &cli.resume {
-            Some(id) => {
-                let p = dir.join(format!("{id}.json"));
-                if !p.exists() {
-                    anyhow::bail!("no session '{id}' in this directory (see zilch --sessions)");
-                }
-                Some(p)
+        Some(Sub::Ls) => {
+            if let daemon::Down::Ok { sessions, .. } = daemon::request(&daemon::Up::List)? {
+                println!("{}", daemon::list_text(&sessions));
             }
-            None => cli.r#continue.then(|| zilch_drivers::session::latest(dir)).flatten(),
-        };
-        let loaded = earlier.as_ref().and_then(|p| zilch_drivers::session::load(p)).and_then(|v| zilch_agents::snapshot_messages(&v));
-        let path = match (earlier, loaded) {
-            (Some(p), Some(msgs)) => {
-                resumed = Some((p.clone(), msgs));
-                p
-            }
-            _ => {
-                if cli.r#continue || cli.resume.is_some() {
-                    session_note = "no earlier session in this directory; starting a new one".into();
-                }
-                zilch_drivers::session::new_path(dir)
-            }
-        };
-        session_path = Some(path.clone());
-        drivers = drivers.with_session_file(path);
-    }
-    let mut book =
-        Book::new(cfg.architect.clone(), cfg.developer.clone(), drivers.specs(ARCHITECT_TOOLS), drivers.specs(DEVELOPER_TOOLS), &cwd)
-            .with_spec(drivers.specs(zilch_drivers::SPEC_TOOLS), &cfg.spec_dir);
-    if let Some(t) = cfg.main_context_tokens {
-        book.main_context_tokens = t;
-    }
-    book.explorer_tools = drivers.specs(zilch_drivers::EXPLORER_TOOLS);
-    if cfg.repo_map {
-        *book.repo_overview.write().unwrap() = drivers.repo_overview(10_000);
-    }
-    // Prompt overrides and custom subagent profiles from the roles.
-    for (g, o) in &cfg.prompts {
-        book.prompts.insert(*g, (o.text.clone(), o.replace));
-    }
-    for p in &cfg.profiles {
-        let tools: Vec<&str> = p.tools.iter().map(String::as_str).collect();
-        book.profiles.push(zilch_agents::SubagentProfile {
-            name: p.name.clone(),
-            description: p.description.clone(),
-            binding: p.binding.clone(),
-            tools: drivers.specs(&tools),
-            prompt: p.prompt.as_ref().map(|o| (o.text.clone(), o.replace)),
-        });
-    }
-    let mut first_ticket = 1;
-    if let Some((path, msgs)) = &resumed {
-        let orders: Vec<&str> = msgs.iter().map(|m| m.text()).filter(|t| t.starts_with("Order #")).collect();
-        first_ticket = orders.iter().filter_map(|t| t[7..].split(':').next()?.parse::<u64>().ok()).max().unwrap_or(0) + 1;
-        let last: String = orders.last().map(|t| t.split_once(": ").map(|x| x.1).unwrap_or(t)).unwrap_or("").chars().take(70).collect();
-        let id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        session_note = format!("↺ continuing session {id}: {} order(s), last: {last}", orders.len());
-        *book.resume.lock().unwrap() = Some(msgs.clone());
-        // The spec lane's conversation too, when the session had one.
-        *book.resume_spec.lock().unwrap() = zilch_drivers::session::load_spec(path).and_then(|v| zilch_agents::snapshot_messages(&v));
-    }
-    let book = Arc::new(book);
-    let bus = Arc::new(EventBus::new());
-    let log = open_log(&cli);
-    if let Some((_, file)) = &log {
-        bus.set_log(Box::new(file.try_clone()?));
-    }
-    let events = bus.subscribe(4096);
-    let approval = if cli.yes || cli.yolo {
-        "auto".to_string()
-    } else {
-        match cli.approval.as_deref() {
-            Some(a @ ("ask" | "plan" | "auto")) => a.to_string(),
-            Some(other) => anyhow::bail!("invalid --approval '{other}' (ask | plan | auto)"),
-            None => cfg.approval.clone(),
+            return Ok(0);
         }
-    };
-    let defaults = KernelConfig::default();
-    let kcfg = KernelConfig {
-        workers: cli.workers.unwrap_or(defaults.workers),
-        io_threads: cfg.io_threads,
-        loop_limit: cfg.loop_limit.unwrap_or(defaults.loop_limit),
-        max_steps: cfg.max_steps,
-        max_tokens: cfg.max_task_tokens,
-        group_tokens: cfg.group_tokens.clone(),
-        first_ticket,
-        auto_approve: approval == "auto",
-        ask_commands: approval == "ask",
-        ..defaults
-    };
-    let color = std::io::stdout().is_terminal();
-    let view = Arc::new(View {
-        color,
-        verbose: cli.verbose,
-        procs: Mutex::default(),
-        questions: Mutex::default(),
-        commands: Mutex::default(),
-        open: Mutex::default(),
-        live: Mutex::default(),
-        note: Mutex::default(),
-        on_served: Default::default(),
-        started: Instant::now(),
-        costs: Arc::new(costs::Costs::new(
-            meter.clone(),
-            book.clone(),
-            cfg.expensive_model_price,
-            cfg.expensive_model_minutes,
-            cfg.expensive_model_spend,
-        )),
-        last_summary: Mutex::default(),
-        orders: Mutex::default(),
-        lane: Mutex::new(Group::Architecture),
-        lanes_of: Mutex::default(),
-    });
-    // A continued session's earlier orders count for /recap.
-    if let Some((_, msgs)) = &resumed {
-        let mut orders = view.orders.lock().unwrap();
-        for t in msgs.iter().map(|m| m.text()).filter(|t| t.starts_with("Order #")) {
-            let (num, text) = t[7..].split_once(": ").unwrap_or(("0", t));
-            orders.push((num.parse().unwrap_or(0), text.to_string(), Some("(earlier session)".into())));
+        Some(Sub::Stop { id }) => {
+            daemon::request(&daemon::Up::Stop { id: id.clone() })?;
+            println!("session {id} stopped (its conversation stays resumable)");
+            return Ok(0);
         }
-    }
-    let (d, r) = (view.c(DIM), view.c(RESET));
-    let (_, sandbox) = zilch_drivers::tools::sandbox::status(cfg.policy.bash_sandbox, cfg.policy.bash.network);
-    let banner = format!(
-        "{}zilch {}{} {d}· main {} · subagents {} · {} workers{r}\n{d}commands: {sandbox}{r}{}",
-        view.c(BOLD),
-        env!("CARGO_PKG_VERSION"),
-        r,
-        cfg.architect.key(),
-        cfg.developer.key(),
-        kcfg.workers,
-        log.as_ref().map(|(p, _)| format!("\n{d}event log: {}{r}", p.display())).unwrap_or_default()
-    );
-    let banner = if session_note.is_empty() { banner } else { format!("{banner}\n{}{session_note}{r}", view.c(CYAN)) };
-    let drivers = Arc::new(drivers);
-    if cfg.repo_map {
-        // Between orders: the next planner / answerer / spec agent sees the current tree (the text
-        // changes only when the tree did, so their cached prompt prefix otherwise stays valid).
-        let (d, b) = (drivers.clone(), book.clone());
-        let _ = view.on_served.set(Box::new(move || {
-            let fresh = d.repo_overview(10_000);
-            let mut current = b.repo_overview.write().unwrap();
-            if *current != fresh {
-                *current = fresh;
+        Some(Sub::Attach { id }) => {
+            // Attach to the session, or this directory's newest one, or a new one for it.
+            let up = daemon::Up::Attach {
+                id: id.clone(),
+                workspace: Some(cwd.clone()),
+                create: id.is_none().then(|| opts(cwd.clone(), true, true)),
+                replay: 200,
+                width: terminal_width(),
+            };
+            let (link, sid, banner) = daemon::Remote::attach(&up)?;
+            let leave = front::repl(link.clone(), &banner, 200, true)?;
+            link.detach();
+            match leave {
+                front::Leave::Stop => {
+                    daemon::request(&daemon::Up::Stop { id: sid.clone() })?;
+                    println!("session {sid} stopped");
+                }
+                _ => println!("detached; session {sid} keeps running (zilch attach {sid})"),
             }
-        }));
+            return Ok(0);
+        }
+        None => {}
     }
-    let kernel = zilch_kernel::start(kcfg, drivers.clone(), book.clone(), bus);
-
+    if cli.doctor {
+        let ov = Overrides {
+            model: cli.model.clone(),
+            architect_model: cli.architect_model.clone(),
+            developer_model: cli.developer_model.clone(),
+            web: cli.web.then_some(true),
+        };
+        let cfg = Config::load(&cwd, &ov)?;
+        let meter = zilch_drivers::llm::catalog::CostMeter::new(cfg.max_session_cost);
+        *meter.catalog.write().unwrap() = cfg.discover_catalog();
+        return Ok(doctor(&cfg, &meter, &cwd));
+    }
+    if cli.sessions {
+        let dir = zilch_drivers::session::default_root().map(|r| zilch_drivers::session::dir_for(&r, &cwd));
+        match dir {
+            Some(d) if !cli.no_session => println!("{}", sessions_list(&d, None)),
+            _ => println!("Sessions are off."),
+        }
+        return Ok(0);
+    }
+    // One order into a daemon session (created for this directory if missing).
+    if let (Some(order), Some(id)) = (&cli.prompt, &cli.session) {
+        let up = daemon::Up::Attach {
+            id: Some(id.clone()),
+            workspace: None,
+            create: Some(opts(cwd.clone(), true, true)),
+            replay: 0,
+            width: terminal_width(),
+        };
+        let (link, _, banner) = daemon::Remote::attach(&up)?;
+        let code = front::one_order(link.as_ref(), &banner, order)?;
+        link.detach();
+        return Ok(code);
+    }
+    if cli.session.is_some() {
+        anyhow::bail!("--session goes with -p (for a REPL on a daemon session: zilch attach <id>)");
+    }
+    // In this process.
+    let session = session::Session::open(&opts(cwd.clone(), tty, cli.prompt.is_none()))?;
+    let banner = session.banner.clone();
+    let link = Arc::new(session::Local::new(session));
     if let Some(order) = &cli.prompt {
-        eprintln!("{banner}");
-        kernel.send(Cmd::Order(order.clone()));
-        let stdin = std::io::stdin();
-        for env in events.iter() {
-            view.track(&env.event);
-            if let Some(s) = view.render(&env.event) {
-                println!("{s}");
-                let _ = std::io::stdout().flush();
-            }
-            for a in view.costs.announcements() {
-                println!("{}{a}{}", view.c(YELLOW), view.c(RESET));
-            }
-            match &env.event {
-                KernelEvent::Question { qid, command, .. } if approval != "auto" => {
-                    // Approval must be explicit; an empty line asks again, end of input rejects.
-                    let answer = loop {
-                        eprint!("{}", if *command { "allow? [y/n/a] › " } else { "plan? [y/n/feedback] › " });
-                        let mut line = String::new();
-                        if stdin.lock().read_line(&mut line)? == 0 {
-                            break "n".to_string();
-                        }
-                        if !line.trim().is_empty() {
-                            break line.trim().to_string();
-                        }
-                    };
-                    kernel.send(Cmd::Answer { qid: *qid, text: answer });
-                }
-                KernelEvent::TicketServed { ok, .. } => {
-                    kernel.shutdown();
-                    for line in [view.costs.session_summary(), view.costs.parts_report()].into_iter().flatten() {
-                        eprintln!("{line}");
-                    }
-                    return Ok(if *ok { 0 } else { 1 });
-                }
-                _ => {}
-            }
-        }
-        return Ok(1);
+        let code = front::one_order(link.as_ref(), &banner, order)?;
+        link.stop("served");
+        return Ok(code);
     }
-
-    println!("{banner}\n{d}Type an order, or /help.{r}");
-    // Tab lists the choices (commands, their arguments, @ mentions) instead of cycling through them.
-    let editor_cfg = rustyline::Config::builder().completion_type(rustyline::CompletionType::List).build();
-    let mut rl: rustyline::Editor<status::StatusHelper, rustyline::history::DefaultHistory> = rustyline::Editor::with_config(editor_cfg)?;
-    let mut printer = rl.create_external_printer()?;
-    // Completion from what is live now: process ids, and the models the providers list.
-    let (v_complete, m_complete) = (view.clone(), meter.clone());
-    let complete = move |line: &str, pos: usize| {
-        let pids = v_complete.live.lock().unwrap().keys().copied().collect();
-        let models = m_complete.catalog.read().unwrap().keys().filter_map(|k| k.split_once('/').map(|(_, m)| m.to_string())).collect();
-        completion::complete(line, pos, &completion::Live { pids, models })
-    };
-    // The live status row above the prompt (terminals only), redrawn while something runs.
-    let bar = color.then(|| Arc::new(status::StatusBar::default()));
-    // The helper is always set (completion works without colour too); the status row is only drawn
-    // for the two-row prompt used on terminals.
-    rl.set_helper(Some(status::StatusHelper { bar: bar.clone().unwrap_or_default(), complete: Some(Box::new(complete)) }));
-    if let Some(bar) = &bar {
-        status::spawn_refresher(bar.clone(), Box::new(rl.create_external_printer()?));
-        let (v, bar) = (view.clone(), bar.clone());
-        std::thread::Builder::new().name("zilch-status".into()).spawn(move || loop {
-            let (text, busy) = v.status_line();
-            bar.set(status::clip(&text, terminal_width()), busy);
-            std::thread::sleep(Duration::from_millis(100));
-        })?;
+    front::repl(link.clone(), &banner, 0, false)?;
+    let d = if tty { DIM } else { "" };
+    let r = if tty { RESET } else { "" };
+    for line in link.stop("the guest left") {
+        println!("{d}{line}{r}");
     }
-    // Editor link (Neovim: :ZilchSend): a selection plus a comment arrives over a local socket and
-    // becomes an order in the requested lane (or the active one).
-    let ipc_printer = Mutex::new(rl.create_external_printer()?);
-    let commander = kernel.commander();
-    let (v_submit, v_status, spec_dir) = (view.clone(), view.clone(), cfg.spec_dir.clone());
-    let hooks = Arc::new(ipc::Hooks {
-        submit: Box::new(move |lane, msg| {
-            let lane = match lane {
-                None => *v_submit.lane.lock().unwrap(),
-                Some("code") => Group::Architecture,
-                Some("spec") => Group::Spec,
-                Some(l) => return Err(format!("unknown lane '{l}' (code | spec)")),
-            };
-            let name = if lane == Group::Spec { "spec" } else { "code" };
-            let first: String = msg.lines().last().unwrap_or("").chars().take(100).collect();
-            let loc = msg.lines().next().and_then(|l| l.strip_prefix("[From the editor] ")).map(|l| format!(" {l}")).unwrap_or_default();
-            let echo = format!("{}◆ editor → {name} lane{loc}:{} {first}\n", v_submit.c(CYAN), v_submit.c(RESET));
-            let _ = rustyline::ExternalPrinter::print(&mut *ipc_printer.lock().unwrap(), echo);
-            commander.send(Cmd::OrderTo(lane, msg));
-            Ok(name.to_string())
-        }),
-        status: Box::new(move || {
-            let live = v_status.live.lock().unwrap();
-            let state = |g: Group| {
-                let busy = live.values().any(|l| l.group == g && (l.state == "running" || l.state == "blocked(io)"));
-                if busy {
-                    "working"
-                } else {
-                    "idle"
-                }
-            };
-            let active = if *v_status.lane.lock().unwrap() == Group::Spec { "spec" } else { "code" };
-            serde_json::json!({"ok": true, "active": active, "code": state(Group::Architecture), "spec": state(Group::Spec), "docs": spec_status(&spec_dir)})
-        }),
-    });
-    let _ipc = match ipc::serve(hooks, &cwd) {
-        Ok(Some(guard)) => {
-            println!("{}editor link: {} (Neovim: :ZilchSend){}", view.c(DIM), guard.endpoint, view.c(RESET));
-            Some(guard)
-        }
-        Ok(None) => {
-            println!("{}editor link: another zilch already serves this workspace; not listening{}", view.c(DIM), view.c(RESET));
-            None
-        }
-        Err(e) => {
-            println!("editor link unavailable: {e}");
-            None
-        }
-    };
-    let v = view.clone();
-    std::thread::Builder::new().name("zilch-view".into()).spawn(move || {
-        for env in events.iter() {
-            v.track(&env.event);
-            if let Some(s) = v.render(&env.event) {
-                if rustyline::ExternalPrinter::print(&mut printer, format!("{s}\n")).is_err() {
-                    break;
-                }
-            }
-            for a in v.costs.announcements() {
-                let _ = rustyline::ExternalPrinter::print(&mut printer, format!("{}{a}{}\n", v.c(YELLOW), v.c(RESET)));
-            }
-        }
-    })?;
-    loop {
-        // A line answers the plan only if the plan prompt was showing when it was typed.
-        let asked = view.question();
-        // With a status row the prompt is two rows; the first is filled with the status (status.rs).
-        let row = if bar.is_some() { "\n" } else { "" };
-        let prompt = match asked {
-            Some((q, _)) if view.commands.lock().unwrap().contains_key(&q) => format!("{row}allow? [y/n/a] › "),
-            Some((_, t)) => format!("{row}plan #{t}? [y/n/feedback] › "),
-            None => {
-                let spec = *view.lane.lock().unwrap() == Group::Spec;
-                match (bar.is_some(), spec) {
-                    (true, false) => format!("{row}⧉ › "),
-                    (true, true) => format!("{row}⌬ › "),
-                    (false, false) => "[code] › ".to_string(),
-                    (false, true) => "[spec] › ".to_string(),
-                }
-            }
-        };
-        if let Some(b) = &bar {
-            b.reading.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-        let read = rl.readline(&prompt);
-        if let Some(b) = &bar {
-            b.reading.store(false, std::sync::atomic::Ordering::SeqCst);
-        }
-        let line = match read {
-            Ok(l) => l,
-            Err(rustyline::error::ReadlineError::Interrupted) => {
-                match view.latest_open() {
-                    Some(t) => {
-                        kernel.send(Cmd::KillTicket(t));
-                        println!("⏹ cancelling order #{t}…");
-                    }
-                    None => println!("(Ctrl-D to quit)"),
-                }
-                continue;
-            }
-            Err(rustyline::error::ReadlineError::Eof) => break,
-            Err(e) => return Err(e.into()),
-        };
-        let input = line.trim();
-        // A question that arrived while this prompt was already drawn: a lone y / n / a is its answer
-        // (almost never meant as an order); anything longer still needs the question's prompt.
-        let short_answer = matches!(input.to_lowercase().as_str(), "y" | "yes" | "n" | "no" | "a" | "always");
-        let asked = asked.or_else(|| view.question().filter(|_| short_answer));
-        // The order may have ended (cancelled, killed) after this prompt was drawn.
-        let asked = asked.filter(|(_, t)| view.open.lock().unwrap().contains(t));
-        if let (Some(_), true) = (asked, input.is_empty()) {
-            // Approval must be explicit: a stray Enter does not approve the plan.
-            let msg = "still waiting for your answer: y, n, or (plans) feedback / (commands) a";
-            match &bar {
-                Some(_) => view.note(msg),
-                None => println!("({msg})"),
-            }
-            continue;
-        }
-        if let (Some((qid, _)), false) = (asked, input.starts_with('/') || input.starts_with('@')) {
-            view.questions.lock().unwrap().retain(|(q, _)| *q != qid);
-            view.commands.lock().unwrap().remove(&qid);
-            kernel.send(Cmd::Answer { qid, text: input.to_string() });
-            continue;
-        }
-        if input.is_empty() {
-            // Nothing to order: say so instead of silently doing nothing (the plan prompt, if one
-            // arrived meanwhile, shows from the next line on).
-            let msg = if view.question().is_some() { "empty input ignored — a plan is waiting" } else { "empty input ignored" };
-            match &bar {
-                Some(_) => view.note(msg),
-                None => println!("({msg})"),
-            }
-            continue;
-        }
-        let _ = rl.add_history_entry(input);
-        if let Some(rest) = input.strip_prefix('@') {
-            let (who, text) = rest.split_once(char::is_whitespace).map(|(w, t)| (w, t.trim())).unwrap_or((rest, ""));
-            let msg = match zilch_ipc::Target::parse(who) {
-                None => format!("@{who}: not a pid or group (architect, developer)"),
-                Some(_) if text.is_empty() => format!("@{who}: nothing to send"),
-                Some(target) => match kernel.tell(target, text) {
-                    Ok(how) => {
-                        println!("  {}✉ you → @{who}: {text}{}", view.c(DIM), view.c(RESET));
-                        format!("✉ {how}")
-                    }
-                    Err(e) => format!("@{who}: {e}"),
-                },
-            };
-            match &bar {
-                Some(_) => view.note(&msg),
-                None => println!("({msg})"),
-            }
-            continue;
-        }
-        let (cmd, arg) = input.split_once(' ').map(|(c, a)| (c, a.trim())).unwrap_or((input, ""));
-        match cmd {
-            "/exit" | "/quit" => break,
-            "/help" => println!("{HELP}"),
-            "/ps" => println!("{}", ps(&kernel)),
-            "/kill" => match arg.parse::<Pid>() {
-                Ok(pid) => kernel.send(Cmd::Kill(pid)),
-                Err(_) => println!("usage: /kill <pid>  (see /ps)"),
-            },
-            "/cancel" => match view.latest_open() {
-                Some(t) => kernel.send(Cmd::KillTicket(t)),
-                None => println!("No open order."),
-            },
-            "/spec" | "/code" => {
-                let lane = if cmd == "/spec" { Group::Spec } else { Group::Architecture };
-                *view.lane.lock().unwrap() = lane;
-                let msg = match lane {
-                    Group::Spec => format!("→ spec lane: requirements engineering (spec, design, plan). {}", spec_status(&cfg.spec_dir)),
-                    _ => "→ code lane: planning and implementation (works from the spec lane's design.md and plan.md).".to_string(),
-                };
-                println!("{}{msg}{}", view.c(CYAN), view.c(RESET));
-            }
-            "/status" => {
-                let lane = if *view.lane.lock().unwrap() == Group::Spec { "spec" } else { "code" };
-                println!("typing into: {lane} lane\n{}\n{}", ps(&kernel).lines().next().unwrap_or(""), spec_status(&cfg.spec_dir));
-            }
-            "/usage" => println!("{}", view.costs.report()),
-            "/sessions" => match &sessions {
-                Some(dir) => println!("{}", sessions_list(dir, session_path.as_ref())),
-                None => println!("Sessions are off (--no-session)."),
-            },
-            "/recap" => println!("{}", recap(&view, session_path.as_ref())),
-            "/clear" => {
-                // A fresh session: the main agent (and any order it is on) stops; the next order
-                // starts a new one with an empty context, saved to a new session file.
-                let residents: Vec<Pid> = view
-                    .live
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|(_, l)| matches!(l.group, Group::Architecture | Group::Spec))
-                    .map(|(p, _)| *p)
-                    .collect();
-                for pid in residents {
-                    kernel.send(Cmd::Kill(pid));
-                }
-                let old = session_path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned());
-                session_path = sessions.as_ref().map(|d| zilch_drivers::session::new_path(d));
-                drivers.set_session_file(session_path.clone());
-                view.orders.lock().unwrap().clear();
-                *view.last_summary.lock().unwrap() = None;
-                // A resumed conversation not yet handed to a main agent must not reach the new one.
-                *book.resume.lock().unwrap() = None;
-                *book.resume_spec.lock().unwrap() = None;
-                let resume = old.map(|id| format!(" (the previous one stays resumable: --resume {id})")).unwrap_or_default();
-                println!("Fresh session: the next order starts a new main agent with an empty context{resume}.");
-            }
-            "/models" => println!("{}", models_list(&book, &meter, &configured)),
-            "/model" => println!("{}", model_cmd(arg, &book, &meter, &providers, &configured)),
-            "/ack" => {
-                let msg = if view.costs.ack() == 0 {
-                    "no high-cost model warning to acknowledge"
-                } else {
-                    "high-cost model warning silenced until its next step"
-                };
-                match &bar {
-                    Some(_) => view.note(msg),
-                    None => println!("({msg})"),
-                }
-            }
-            "/prompt" => match arg {
-                a if a.starts_with("dev") => println!("{}", book.system_prompt(Group::Development)),
-                a if a.starts_with("plan") => println!("{}", book.subagent_prompt("plan").unwrap_or_default()),
-                a if a.starts_with("answer") => println!("{}", book.subagent_prompt("answer").unwrap_or_default()),
-                a if a.starts_with("spec") => println!("{}", book.system_prompt(Group::Spec)),
-                _ => println!("{}", book.system_prompt(Group::Architecture)),
-            },
-            "/about" => println!("{}", about(&cwd, &cfg.sources, session_path.as_ref())),
-            "/redraw" => {
-                if color {
-                    print!("\x1b[H\x1b[2J");
-                }
-                match view.last_summary.lock().unwrap().clone() {
-                    Some(s) => {
-                        let width = terminal_width().saturating_sub(2).max(20);
-                        println!("{}── last answer, redrawn at {width} columns ──{}", view.c(DIM), view.c(RESET));
-                        println!("{}", markdown::Markdown::new(color).with_indent(2).text(s.trim(), width));
-                    }
-                    None => println!("(no answer yet)"),
-                }
-            }
-            c if c.starts_with('/') => println!("Unknown command {c}. /help lists them."),
-            _ => kernel.send(Cmd::OrderTo(*view.lane.lock().unwrap(), input.to_string())),
-        }
-    }
-    for line in [view.costs.session_summary(), view.costs.parts_report()].into_iter().flatten() {
-        println!("{}{line}{}", view.c(DIM), view.c(RESET));
-    }
-    kernel.shutdown();
     Ok(0)
 }
 

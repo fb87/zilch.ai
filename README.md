@@ -239,6 +239,36 @@ zilch --no-session            # don't save
 Order numbers carry on in a continued session. Work on an order that was not served yet is not
 saved. `/clear` starts a fresh session; the old one stays resumable.
 
+## Daemon (optional)
+
+Plain `zilch` runs in its own process, as before. For sessions that outlive the terminal, one
+daemon per user hosts any number of them, each with its own workspace, config, kernel and costs:
+
+```sh
+zilch daemon start                 # in the background (log: <data dir>/zilch/logs/daemon.log)
+zilch attach                       # REPL on this directory's session (created if missing)
+zilch attach ledger-1              # ... or a named one; /detach leaves it running, /stop ends it
+zilch new --workspace ~/src/app --name app --web   # a session, from anywhere
+zilch -p "run the tests" --session app             # one order; prints its progress, exits when served
+zilch ls                           # id, state (idle, working, waiting for you), spend, clients
+zilch stop app                     # end a session (its conversation stays resumable with -c)
+zilch daemon stop                  # end them all
+```
+
+Attaching replays the session's recent output, then follows it live; any number of clients can
+attach at once. Orders keep running with nobody attached; a plan approval or command question
+then waits for the next client (`zilch ls` shows "waiting for you"). Nothing is approved for you
+unless the session was created with `--approval auto`; `on_question = "notify-send zilch
+\"$ZILCH_QUESTION\""` in the config runs a command when a question waits unattended
+(`ZILCH_WORKSPACE`, `ZILCH_TICKET`, `ZILCH_QUESTION` are set). Each session also serves the editor
+link of its workspace.
+
+The daemon listens on a local socket for this user only (Linux: an abstract socket; elsewhere a
+socket file in a private directory; peer uid checked; no TCP: use `ssh -L` to reach it remotely).
+`ZILCH_DAEMON_SOCKET` picks another endpoint (`@name` or a path). Provider keys come from the
+daemon's environment: start it from a shell that has them, or for a systemd user unit put them in
+an `EnvironmentFile` and run `zilch daemon run` (foreground).
+
 ## Costs and models
 
 At startup zilch reads each provider's `{base}/models` (OpenCode and OpenRouter publish prices and

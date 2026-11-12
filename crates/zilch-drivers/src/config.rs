@@ -184,6 +184,9 @@ struct FileConfig {
     approval: Option<String>,
     /// Outside sources: `[web] enabled = true`, `search = "searxng" | "brave"`, `search_url`, `search_api_key_env`.
     web: Option<WebCfg>,
+    /// Daemon sessions: a shell command run when a question waits and no client is attached
+    /// (env: ZILCH_WORKSPACE, ZILCH_TICKET, ZILCH_QUESTION).
+    on_question: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -248,6 +251,8 @@ pub struct Config {
     pub sources: Vec<PathBuf>,
     /// Outside sources (`[web]`, `--web`).
     pub web: WebConfig,
+    /// Run when a daemon session's question waits with no client attached.
+    pub on_question: Option<String>,
     pub providers: BTreeMap<String, ProviderCfg>,
     pub architect: ModelBinding,
     pub developer: ModelBinding,
@@ -360,6 +365,7 @@ impl Config {
             merge_opt(&mut fc.expensive_model_spend, layer.expensive_model_spend);
             merge_opt(&mut fc.spec_dir, layer.spec_dir);
             merge_opt(&mut fc.approval, layer.approval);
+            merge_opt(&mut fc.on_question, layer.on_question);
             if let Some(w) = layer.web {
                 fc.web.get_or_insert_with(WebCfg::default).merge(w);
             }
@@ -509,6 +515,7 @@ impl Config {
             loop_limit: fc.loop_limit,
             repo_map: fc.repo_map.unwrap_or(true),
             web,
+            on_question: fc.on_question.clone().filter(|c| !c.trim().is_empty()),
             max_task_tokens: fc.max_task_tokens,
             env: env.clone(),
         };
