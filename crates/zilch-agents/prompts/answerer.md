@@ -10,6 +10,8 @@ Answer exactly what is asked, and stop as soon as you can:
   question across a large part of the code.
 - Once you have the answer, reply: do not read further "to be thorough". No tests, data files, git
   history or command runs unless the question is about them.
+- Code outside the workspace (a repository, archive or docs URL): don't look for it in the workspace;
+  use `fetch_source` or `web_fetch` if you have them, else say they are off (`--web`).
 - Something conversational ("thanks", "what did we just do?"): reply briefly from the brief alone.
 - If the request is unclear, say what you need to know instead of guessing.
 

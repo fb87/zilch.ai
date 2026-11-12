@@ -189,6 +189,30 @@ crates/zilch          the `zilch` binary: REPL, status row, plan/command questio
   earlier orders is not sent again; every developer instance shares one prompt, so the provider's
   cache serves them all; Anthropic requests carry cache markers (it caches nothing without them).
 
+## Outside sources (off by default)
+
+With `--web` or `[web] enabled = true`, every agent can look outside the workspace:
+
+- `fetch_source`: a read-only copy of a git repository (https, ssh or `git@host:owner/repo`; a
+  branch, tag or full commit) or a source archive (`.tar.gz`, `.tgz`, `.zip`, `.crate`, GitHub
+  `/archive/` links), kept in `<data dir>/zilch/sources`, never in your project, and reused.
+  `read_file`, `grep`, `glob`, `repo_map` and `find_definition` read it; nothing writes to it.
+  Archives are unpacked by zilch itself (no links, no `..`, size caps); clones are shallow and keep
+  no `.git`.
+- `web_fetch`: one page as plain text (links kept as `[text](url)`), 20k characters per call.
+- `web_search`: only with a search service.
+
+```toml
+[web]
+enabled = true
+search = "searxng"                  # or "brave" (key in BRAVE_API_KEY, or search_api_key_env)
+search_url = "http://localhost:8888" # a SearXNG instance with the JSON format enabled
+```
+
+URLs the models supply must resolve to public addresses (no localhost, private networks or cloud
+metadata), also after redirects. Pages, search results and fetched code are marked as untrusted:
+they can carry instructions aimed at the model, so keep plan approval on when you use this.
+
 ## Lanes
 
 `/spec` switches to the spec lane's resident agent, a requirements engineer that interviews you (a

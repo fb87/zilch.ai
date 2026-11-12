@@ -179,7 +179,7 @@ impl Syscall {
         match self {
             Syscall::Complete(r) => format!("llm {}", r.binding.key()),
             Syscall::Tool { name, args, .. } => {
-                let detail = ["path", "command", "pattern", "doc"]
+                let detail = ["path", "command", "pattern", "doc", "url", "query", "name"]
                     .iter()
                     .find_map(|k| args.get(*k).and_then(|v| v.as_str()))
                     .map(|s| s.lines().next().unwrap_or("").chars().take(80).collect::<String>())
