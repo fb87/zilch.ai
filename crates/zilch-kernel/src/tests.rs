@@ -28,7 +28,7 @@ impl Drivers for FakeDrivers {
             _ => {
                 return SyscallResult::Completion {
                     message: zilch_ipc::Message::assistant("thinking"),
-                    usage: zilch_ipc::Usage { prompt_tokens: 25, completion_tokens: 5 },
+                    usage: zilch_ipc::Usage { prompt_tokens: 25, completion_tokens: 5, ..Default::default() },
                     cut: false,
                 }
             }

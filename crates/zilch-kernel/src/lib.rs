@@ -1305,6 +1305,7 @@ impl Kernel {
                 model,
                 prompt_tokens: usage.prompt_tokens,
                 completion_tokens: usage.completion_tokens,
+                cached_tokens: usage.cached_tokens,
             });
         }
         self.fill(pid, batch, idx, result);

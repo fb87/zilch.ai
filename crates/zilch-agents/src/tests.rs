@@ -43,7 +43,7 @@ fn an_order_is_planned_approved_cooked_in_parallel_and_served() {
     let llm = ScriptedLlm::new(move |req| {
         let system = req.messages[0].text().to_string();
         let first_user = req.messages.iter().find(|m| m.role == Role::User).map(|m| m.text().to_string()).unwrap_or_default();
-        let usage = LlmEvent::Usage(Usage { prompt_tokens: 100, completion_tokens: 10 });
+        let usage = LlmEvent::Usage(Usage { prompt_tokens: 100, completion_tokens: 10, ..Default::default() });
         if system.contains("MAIN agent") {
             // A follow-up order: it must still have the first order in its context.
             let last_user = req.messages.last().filter(|m| m.role == Role::User).map(|m| m.text().to_string()).unwrap_or_default();
@@ -378,4 +378,19 @@ fn prompt_overrides_apply_and_a_task_can_run_on_a_custom_profile() {
     let StepResult::Syscalls(c) = book.developer(1, &task, "").step(&view, vec![]) else { panic!() };
     let Syscall::Complete(req) = &c[0] else { panic!() };
     assert_eq!(req.binding.model, "dev", "no worker: the default subagent");
+}
+
+#[test]
+fn reasoning_from_an_earlier_order_is_not_resent() {
+    let mut a = LlmAgent::new(ModelBinding::default(), "s".into(), "Order #1: hi".into(), vec![], "x".into()).resident();
+    let view = AcbView { pid: 1, ticket: 1, group: Group::Architecture, steps: 0, notes: vec![] };
+    a.step(&view, vec![]);
+    let mut thought = Message::assistant("Hello!");
+    thought.reasoning_content = Some("the guest greets me".into());
+    a.step(&view, vec![SyscallResult::Completion { message: thought, usage: Usage::default(), cut: false }]);
+    let order = SyscallResult::Message(zilch_ipc::Msg { from: 0, kind: zilch_ipc::MsgKind::Guest, body: "Order #2: and now?".into() });
+    let StepResult::Syscalls(c) = a.step(&view, vec![order]) else { panic!() };
+    let Syscall::Complete(req) = &c[0] else { panic!() };
+    assert!(req.messages.iter().all(|m| m.reasoning_content.is_none()), "{:?}", req.messages);
+    assert!(req.messages.iter().any(|m| m.text() == "Hello!"), "the reply itself stays");
 }

@@ -140,13 +140,17 @@ impl View {
 
     /// Keep the status row's picture of live processes up to date.
     fn track(&self, ev: &KernelEvent) {
-        if let KernelEvent::Usage { pid, model, prompt_tokens, completion_tokens } = ev {
+        if let KernelEvent::Usage { pid, model, prompt_tokens, completion_tokens, cached_tokens } = ev {
             let who = match self.procs.lock().unwrap().get(pid).map(|(g, _)| *g) {
                 Some(Group::Architecture) => "main",
                 Some(Group::Spec) => "spec",
                 _ => "subagents",
             };
-            self.costs.record(who, model, zilch_ipc::Usage { prompt_tokens: *prompt_tokens, completion_tokens: *completion_tokens });
+            self.costs.record(
+                who,
+                model,
+                zilch_ipc::Usage { prompt_tokens: *prompt_tokens, completion_tokens: *completion_tokens, cached_tokens: *cached_tokens },
+            );
         }
         let mut live = self.live.lock().unwrap();
         match ev {

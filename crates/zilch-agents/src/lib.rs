@@ -294,7 +294,12 @@ impl Agent for LlmAgent {
                 None
             }
             Phase::AwaitInput => {
-                // The next order (or a note) from the guest.
+                // The next order (or a note) from the guest. A model's reasoning is needed back only
+                // within the tool loop of the order that produced it; from earlier orders it is just
+                // resent tokens, so it is dropped here (one cache miss on the last order's part).
+                for m in &mut self.messages {
+                    m.reasoning_content = None;
+                }
                 for r in wake {
                     let text = match r {
                         SyscallResult::Message(m) => m.body,

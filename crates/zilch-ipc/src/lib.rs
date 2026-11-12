@@ -296,6 +296,9 @@ pub enum KernelEvent {
         model: String,
         prompt_tokens: u64,
         completion_tokens: u64,
+        /// Of `prompt_tokens`, served from the provider's prompt cache.
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        cached_tokens: u64,
     },
     /// The kernel needs the guest: a plan to approve, or (approval = "ask") a command to allow.
     /// Answer with the CLI's `Answer` command.
@@ -503,4 +506,8 @@ mod target_tests {
         assert_eq!(Target::parse("dev"), Some(Target::Group(Group::Development)));
         assert_eq!(Target::parse("T2"), None);
     }
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
 }

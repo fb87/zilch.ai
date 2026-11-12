@@ -4,6 +4,9 @@
 //! for the main agent, `[roles.developer]` (falling back to `[roles.coder]`) for the subagents.
 
 use crate::llm::client::HttpClient;
+
+/// Configured prices of a model: (provider/model, input, output, cached input), USD per 1M tokens.
+type PriceOverride = (String, Option<f64>, Option<f64>, Option<f64>);
 use crate::llm::protocol::Protocol;
 use crate::llm::Backend;
 use crate::tools::sandbox::{BashSandbox, SandboxSpec};
@@ -62,6 +65,8 @@ pub struct RoleCfg {
     /// USD per 1M input / output tokens (overrides discovered prices).
     pub price_in: Option<f64>,
     pub price_out: Option<f64>,
+    /// USD per 1M cached input tokens (default: the listed cache price, else the input price).
+    pub price_cached: Option<f64>,
     /// Prompt override: inline, or a file (relative to the config directory it was set in);
     /// `prompt_mode` "append" (default: after the built-in prompt) or "replace".
     pub system_prompt: Option<String>,
@@ -87,6 +92,7 @@ impl RoleCfg {
         merge_opt(&mut self.context_tokens, o.context_tokens);
         merge_opt(&mut self.price_in, o.price_in);
         merge_opt(&mut self.price_out, o.price_out);
+        merge_opt(&mut self.price_cached, o.price_cached);
         if o.system_prompt.is_some() || o.system_prompt_file.is_some() {
             self.system_prompt = o.system_prompt;
             self.system_prompt_file = o.system_prompt_file;
@@ -225,7 +231,7 @@ pub struct Config {
     /// too), "auto" (nothing asks).
     pub approval: String,
     /// Price overrides from the roles: (model key, input, output) USD per 1M tokens.
-    price_overrides: Vec<(String, Option<f64>, Option<f64>)>,
+    price_overrides: Vec<PriceOverride>,
     env: BTreeMap<String, String>,
 }
 
@@ -374,10 +380,10 @@ impl Config {
         // Every provider key is a secret for commands, whatever its variable is called.
         policy.secret_env = fc.providers.values().filter_map(|p| p.api_key_env.clone()).collect();
         let io_threads = fc.providers.values().map(|p| p.max_concurrent.unwrap_or(8)).sum::<usize>().clamp(8, 64) + 8;
-        let price_overrides: Vec<(String, Option<f64>, Option<f64>)> = [(&architect, &architect_b), (&developer, &developer_b)]
+        let price_overrides: Vec<PriceOverride> = [(&architect, &architect_b), (&developer, &developer_b)]
             .iter()
-            .filter(|(r, _)| r.price_in.is_some() || r.price_out.is_some())
-            .map(|(r, b)| (b.key(), r.price_in, r.price_out))
+            .filter(|(r, _)| r.price_in.is_some() || r.price_out.is_some() || r.price_cached.is_some())
+            .map(|(r, b)| (b.key(), r.price_in, r.price_out, r.price_cached))
             .collect();
         // Prompt overrides of the built-in groups, then custom subagent profiles: every other role,
         // inheriting the subagents' model unless it sets its own.
@@ -504,9 +510,10 @@ impl Config {
                 }
             }
         }
-        for (key, i, o) in &self.price_overrides {
+        for (key, i, o, c) in &self.price_overrides {
             let base = cat.get(key).copied().unwrap_or_default();
-            cat.insert(key.clone(), base.merged(ModelInfo { context: None, input_per_mtok: *i, output_per_mtok: *o }));
+            let set = ModelInfo { input_per_mtok: *i, output_per_mtok: *o, cached_input_per_mtok: *c, ..Default::default() };
+            cat.insert(key.clone(), base.merged(set));
         }
         cat
     }

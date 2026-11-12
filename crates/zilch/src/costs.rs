@@ -157,7 +157,7 @@ mod tests {
         let b = |m: &str| ModelBinding { provider: "p".into(), model: m.into(), ..Default::default() };
         let book = Arc::new(Book::new(b("cheap"), b("cheap"), vec![], vec![], std::path::Path::new("/tmp")));
         let meter = Arc::new(CostMeter::new(None));
-        let price = |o: f64| ModelInfo { context: None, input_per_mtok: Some(1.0), output_per_mtok: Some(o) };
+        let price = |o: f64| ModelInfo { context: None, input_per_mtok: Some(1.0), output_per_mtok: Some(o), ..Default::default() };
         *meter.catalog.write().unwrap() = [("p/cheap".to_string(), price(0.5)), ("p/opus".to_string(), price(75.0))].into();
         Costs::new(meter, book, 10.0, 30, 2.0)
     }
@@ -165,7 +165,7 @@ mod tests {
     #[test]
     fn usage_is_reported_per_agent_and_model_with_cost() {
         let c = costs();
-        let u = Usage { prompt_tokens: 1_000_000, completion_tokens: 0 };
+        let u = Usage { prompt_tokens: 1_000_000, completion_tokens: 0, ..Default::default() };
         c.meter.record("p/cheap", &u);
         c.record("main", "p/cheap", u);
         let r = c.report();
@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn a_high_cost_model_in_use_too_long_warns_until_acknowledged_or_switched_back() {
         let c = costs();
-        let small = Usage { prompt_tokens: 1000, completion_tokens: 100 };
+        let small = Usage { prompt_tokens: 1000, completion_tokens: 100, ..Default::default() };
         c.book.set_binding(Group::Architecture, ModelBinding { provider: "p".into(), model: "opus".into(), ..Default::default() });
         c.meter.record("p/opus", &small);
         assert!(c.alerts().is_empty(), "just switched");
@@ -187,7 +187,7 @@ mod tests {
         assert!(c.status_segment().unwrap().starts_with("$ opus · main · 31 min"));
         assert_eq!(c.ack(), 1);
         assert!(c.alerts().is_empty() && c.status_segment().is_none());
-        c.meter.record("p/opus", &Usage { prompt_tokens: 0, completion_tokens: 30_000 }); // $2.25
+        c.meter.record("p/opus", &Usage { prompt_tokens: 0, completion_tokens: 30_000, ..Default::default() }); // $2.25
         assert_eq!(c.alerts().len(), 1, "spending past $2 alerts again");
         c.book.set_binding(Group::Architecture, ModelBinding { provider: "p".into(), model: "cheap".into(), ..Default::default() });
         assert!(c.alerts().is_empty(), "switched back: nothing high-cost in use");
