@@ -293,6 +293,10 @@ fn attached(
     let done = Arc::new(AtomicBool::new(false));
     // Output to the client.
     let rx = e.link.subscribe(replay);
+    // The replay goes out before anything this client asks is answered.
+    while let Ok(out) = rx.try_recv() {
+        send(w, &Down::Out { out })?;
+    }
     let (w2, done2) = (w.clone(), done.clone());
     std::thread::spawn(move || {
         for out in rx.iter() {
