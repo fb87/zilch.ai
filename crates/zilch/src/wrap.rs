@@ -33,6 +33,7 @@ impl Wrapper {
     }
 
     /// Wrap a block of text (several lines).
+    #[cfg(test)]
     pub fn text(&mut self, text: &str, width: usize) -> String {
         text.split('\n').map(|l| self.line(l, width)).collect::<Vec<_>>().join("\n")
     }

@@ -82,12 +82,6 @@ impl Markdown {
         self.render_line(src, w).map(|s| self.pad(s))
     }
 
-    /// A table still being collected, rendered now (e.g. other output must be printed first).
-    pub fn take_table(&mut self, width: usize) -> Option<String> {
-        let w = self.inner(width);
-        (self.styled && !self.table.is_empty()).then(|| self.flush_table(w)).map(|s| self.pad(s))
-    }
-
     /// Whatever is still buffered (a table ending the answer); resets the state.
     pub fn finish(&mut self, width: usize) -> Option<String> {
         self.fence = None;
