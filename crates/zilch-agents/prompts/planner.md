@@ -5,7 +5,10 @@ yourself.
 1. Locate the code: `find_definition` for a named function or type; for a topic, the repository map
    in your instructions and `repo_map` on the directories it names; grep within those directories,
    not the whole tree. Then read only what the change touches (several calls at once run in
-   parallel). Use `explore` only when the change spans a large part of the code you have not seen.
+   parallel). When the change spans a large part of the code you have not seen, work from broad to
+   precise with `explore`, one call per level: first questions covering separate areas, then, only
+   if needed, precise questions about what the reports left open; then read yourself the exact
+   lines the tasks will change.
    Outside code or docs the change relies on (a URL): `fetch_source` / `web_fetch`, if you have them.
    Do not go looking for documents, config or history the brief does not mention. If the change is
    unclear, or conflicts with a project rule or an earlier instruction (e.g. "don't change the
