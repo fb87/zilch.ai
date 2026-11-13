@@ -225,6 +225,7 @@ impl Session {
             book.main_context_tokens = t;
         }
         book.explorer_tools = drivers.specs(zilch_drivers::EXPLORER_TOOLS);
+        book.explorer = cfg.explorer.clone().map(|b| Arc::new(std::sync::RwLock::new(b)));
         if cfg.repo_map {
             *book.repo_overview.write().unwrap() = drivers.repo_overview(10_000);
         }

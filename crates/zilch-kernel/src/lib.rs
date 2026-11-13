@@ -413,12 +413,19 @@ struct Ticket {
     plan: Option<PlanRun>,
     /// Follow-up plans submitted after an approved one finished (at most MAX_FOLLOW_UPS).
     follow_ups: u32,
+    /// Exploration levels (explore calls) and explorers this order has used.
+    explore_levels: u32,
+    explorers_used: u32,
     served: bool,
 }
 
 /// Fix-up plans an order may run after its first plan: enough to repair what failed, not to polish
 /// forever.
 const MAX_FOLLOW_UPS: u32 = 2;
+/// Exploration goes from broad to precise in levels (one explore call each), within these bounds
+/// per order.
+const MAX_EXPLORE_LEVELS: u32 = 3;
+const MAX_EXPLORERS: u32 = 16;
 
 /// An exploration in progress: (the asker's batch, its parked slot, the questions, the reports).
 type Exploration = (u64, usize, Vec<String>, Vec<Option<String>>);
@@ -776,7 +783,10 @@ impl Kernel {
         self.bus.publish(KernelEvent::TicketOpened { ticket, text: text.clone(), lane });
         match self.mains.get(&lane).copied().filter(|m| self.acbs.get(m).is_some_and(|a| a.state.alive())) {
             Some(main) => {
-                self.tickets.insert(ticket, Ticket { root: main, lane, cancel, plan: None, follow_ups: 0, served: false });
+                self.tickets.insert(
+                    ticket,
+                    Ticket { root: main, lane, cancel, plan: None, follow_ups: 0, explore_levels: 0, explorers_used: 0, served: false },
+                );
                 self.pending_orders.push_back((ticket, lane, text));
                 self.feed_main(lane);
             }
@@ -786,7 +796,19 @@ impl Kernel {
                     Group::Spec => match self.recipes.spec(ticket, &message) {
                         Some(a) => (a, Caps { write: vec![], write_any: false, exec: false }, "spec agent"),
                         None => {
-                            self.tickets.insert(ticket, Ticket { root: 0, lane, cancel, plan: None, follow_ups: 0, served: false });
+                            self.tickets.insert(
+                                ticket,
+                                Ticket {
+                                    root: 0,
+                                    lane,
+                                    cancel,
+                                    plan: None,
+                                    follow_ups: 0,
+                                    explore_levels: 0,
+                                    explorers_used: 0,
+                                    served: false,
+                                },
+                            );
                             self.end_ticket(ticket, false, "[this kitchen has no spec lane]".into());
                             return ticket;
                         }
@@ -800,7 +822,10 @@ impl Kernel {
                 };
                 let session = self.session_cancel.child();
                 let main = self.spawn(agent, None, ticket, lane, title.into(), caps, session, 0);
-                self.tickets.insert(ticket, Ticket { root: main, lane, cancel, plan: None, follow_ups: 0, served: false });
+                self.tickets.insert(
+                    ticket,
+                    Ticket { root: main, lane, cancel, plan: None, follow_ups: 0, explore_levels: 0, explorers_used: 0, served: false },
+                );
                 self.mains.insert(lane, main);
             }
         }
@@ -1511,11 +1536,28 @@ impl Kernel {
                 SyscallResult::Failed("only a main agent or a subagent it dispatched may send explorers".into()),
             );
         }
-        let questions: Vec<String> = questions.into_iter().map(|q| q.trim().to_string()).filter(|q| !q.is_empty()).take(8).collect();
+        let ticket = self.acbs.get(&pid).map(|a| a.ticket).unwrap_or_default();
+        let (levels, used) = self.tickets.get(&ticket).map(|t| (t.explore_levels, t.explorers_used)).unwrap_or_default();
+        if levels >= MAX_EXPLORE_LEVELS || used >= MAX_EXPLORERS {
+            return self.fill(
+                pid,
+                batch,
+                idx,
+                SyscallResult::Failed(format!(
+                    "no more exploration for this order ({levels} levels, {used} explorers used): work from the reports \
+                     you have, reading the exact lines you still need yourself"
+                )),
+            );
+        }
+        let room = (MAX_EXPLORERS - used).min(8) as usize;
+        let questions: Vec<String> = questions.into_iter().map(|q| q.trim().to_string()).filter(|q| !q.is_empty()).take(room).collect();
         if questions.is_empty() {
             return self.fill(pid, batch, idx, SyscallResult::Failed("no questions to explore".into()));
         }
-        let ticket = self.acbs.get(&pid).map(|a| a.ticket).unwrap_or_default();
+        if let Some(t) = self.tickets.get_mut(&ticket) {
+            t.explore_levels += 1;
+            t.explorers_used += questions.len() as u32;
+        }
         let cancel = self.tickets.get(&ticket).map(|t| t.cancel.child()).unwrap_or_default();
         let mut spawned = Vec::new();
         for (i, q) in questions.iter().enumerate() {
@@ -1548,7 +1590,13 @@ impl Kernel {
             return;
         }
         let (_, _, questions, reports) = self.explorations.remove(&asker).expect("present");
-        let mut digest = String::from("All explorers reported.\n");
+        let ticket = self.acbs.get(&asker).map(|a| a.ticket).unwrap_or_default();
+        let (levels, used) = self.tickets.get(&ticket).map(|t| (t.explore_levels, t.explorers_used)).unwrap_or_default();
+        let mut digest = format!(
+            "All explorers reported (level {levels} of at most {MAX_EXPLORE_LEVELS}; {} of {MAX_EXPLORERS} explorers left \
+             for this order).\n",
+            MAX_EXPLORERS.saturating_sub(used)
+        );
         for (q, r) in questions.iter().zip(reports) {
             let r: String = r.unwrap_or_default().chars().take(6000).collect();
             digest.push_str(&format!("\n### {q}\n{r}\n"));

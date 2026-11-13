@@ -22,10 +22,19 @@ declare -A Q=(
   [ask]="Which function converts amounts between currencies? Answer with the file and the function."
   # followup: the ask question, then this in the same session; only the follow-up is measured.
   [followup]="Which file was that in?"
+  # analyze: a broad question about this repository as of ANALYZE_REV (default v0.5.0), not the ledger demo.
+  [analyze]="Analyze the codebase: its architecture, the main components and what each does, and how an order flows from the command line to the developers and back."
 )
 for n in $(seq 1 "$runs"); do
   for sc in $scenarios; do
-    ws=$(mktemp -d); cp -r "$root/examples/ledger-demo/." "$ws/"; rm -f "$ws/try.sh" "$ws/README.md"
+    ws=$(mktemp -d)
+    if [ "$sc" = analyze ]; then
+      git -C "$root" archive "${ANALYZE_REV:-v0.5.0}" | tar -x -C "$ws"
+    else
+      cp -r "$root/examples/ledger-demo/." "$ws/"; rm -f "$ws/try.sh" "$ws/README.md"
+    fi
+    # BENCH_CONFIG=<file>: a workspace .zilch/config.toml for the runs (e.g. explorer settings).
+    if [ -n "${BENCH_CONFIG:-}" ]; then mkdir -p "$ws/.zilch"; cp "$BENCH_CONFIG" "$ws/.zilch/config.toml"; fi
     (cd "$ws" && git init -q && git add -A && git -c user.name=bench -c user.email=bench@localhost commit -qm base)
     t0=$(date +%s.%N)
     if [ "$sc" = followup ]; then
@@ -39,7 +48,9 @@ for n in $(seq 1 "$runs"); do
         --log "$out/$sc-$n.jsonl" -p "${Q[$sc]}" > "$out/$sc-$n.out" 2>&1) || true
     fi
     awk "BEGIN {print $(date +%s.%N) - $t0}" > "$out/$sc-$n.time"
-    (cd "$ws" && ./run_tests.sh 2>&1 | tail -1) > "$out/$sc-$n.tests" || true
+    if [ "$sc" = analyze ]; then echo "-" > "$out/$sc-$n.tests"; else
+      (cd "$ws" && ./run_tests.sh 2>&1 | tail -1) > "$out/$sc-$n.tests" || true
+    fi
     rm -rf "$ws"
   done
 done

@@ -260,6 +260,8 @@ pub struct Config {
     pub providers: BTreeMap<String, ProviderCfg>,
     pub architect: ModelBinding,
     pub developer: ModelBinding,
+    /// Explorers: `[roles.explorer]` over the developer settings (None: they use the developer's).
+    pub explorer: Option<ModelBinding>,
     pub policy: ToolPolicy,
     /// Parallel LLM calls the I/O pool should allow for (sum of provider limits).
     pub io_threads: usize,
@@ -426,6 +428,7 @@ impl Config {
         };
         let architect_b = binding(&architect, "architect")?;
         let developer_b = binding(&developer, "developer")?;
+        let explorer_b = fc.roles.get("explorer").map(|rc| binding(&rc.clone().over(&developer), "explorer")).transpose()?;
         let defaults_policy = ToolPolicy::default();
         let policy = ToolPolicy {
             sandbox: fc.sandbox.unwrap_or(true),
@@ -513,6 +516,7 @@ impl Config {
             providers: fc.providers,
             architect: architect_b,
             developer: developer_b,
+            explorer: explorer_b,
             policy,
             io_threads,
             max_steps: architect.max_steps.or(developer.max_steps).unwrap_or(80) as u32,
@@ -660,6 +664,8 @@ model = "base-free"
 model = "planner-free"
 [roles.coder]
 temperature = 0.2
+[roles.explorer]
+reasoning_effort = "low"
 [quotas]
 developer = 500000
 "#,
@@ -669,6 +675,9 @@ developer = 500000
         let c = Config::load_from(dir.path(), std::slice::from_ref(&z), &env, &Overrides::default()).unwrap();
         assert_eq!((c.architect.provider.as_str(), c.architect.model.as_str()), ("opencode", "planner-free"));
         assert_eq!((c.developer.model.as_str(), c.developer.temperature), ("base-free", Some(0.2)));
+        // Explorers: their own settings over the developers'.
+        let e = c.explorer.clone().expect("[roles.explorer] gives explorers a binding");
+        assert_eq!((e.model.as_str(), e.temperature, e.reasoning_effort.as_deref()), ("base-free", Some(0.2), Some("low")));
         assert!(c.policy.is_secret_env("OC_KEY"), "provider keys are hidden from commands");
         assert_eq!(c.group_tokens, [(Group::Development, 500_000)].into());
 

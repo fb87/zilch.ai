@@ -907,7 +907,7 @@ fn explorers_answer_questions_in_parallel_and_report_together() {
     run.k.send(Cmd::Order("investigate".into()));
     let (ok, summary) = run.served();
     assert!(ok, "{summary}");
-    assert!(summary.starts_with("All explorers reported."), "{summary}");
+    assert!(summary.starts_with("All explorers reported (level 1 of at most 3; 14 of 16 explorers left"), "{summary}");
     assert!(
         summary.contains("### where is X?\nanswer to where is X?") && summary.contains("### how does Y work?\nanswer to how does Y work?"),
         "{summary}"
@@ -915,6 +915,55 @@ fn explorers_answer_questions_in_parallel_and_report_together() {
     let spans = drivers.spans.lock().unwrap().clone();
     assert_eq!(spans.len(), 2, "one explorer per non-empty question");
     assert!(spans[0].1 < spans[1].2 && spans[1].1 < spans[0].2, "the explorers ran at the same time");
+}
+
+#[test]
+fn exploration_goes_in_bounded_levels_per_order() {
+    // An asker that explores 7 questions per level until it is refused, then serves what it saw.
+    struct Asker(Vec<String>);
+    impl Agent for Asker {
+        fn step(&mut self, _: &AcbView, wake: Vec<SyscallResult>) -> StepResult {
+            let last = wake.first().map(SyscallResult::text).unwrap_or_default();
+            if last.contains("no more exploration") {
+                self.0.push(last);
+                return StepResult::Syscalls(vec![Syscall::Serve { summary: self.0.join("\n---\n") }]);
+            }
+            if !last.is_empty() {
+                self.0.push(last.lines().next().unwrap_or("").to_string());
+            }
+            StepResult::Syscalls(vec![Syscall::Explore { questions: (1..=7).map(|i| format!("q{i}")).collect() }])
+        }
+    }
+    struct B(Arc<std::sync::atomic::AtomicU32>);
+    impl Recipes for B {
+        fn architect(&self, _: TicketId, _: &str) -> Box<dyn Agent> {
+            Box::new(Asker(vec![]))
+        }
+        fn developer(&self, _: TicketId, _: &PlanTask, _: &str) -> Box<dyn Agent> {
+            unreachable!("no plan here")
+        }
+        fn explorer(&self, _: TicketId, q: &str) -> Option<Box<dyn Agent>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(Box::new(Scripted(0, {
+                let q = q.to_string();
+                move |_, _, _| StepResult::Exit(ExitStatus::ok(format!("answer to {q}")))
+            })))
+        }
+    }
+    let spawned = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let bus = Arc::new(EventBus::new());
+    let events = bus.subscribe(10_000);
+    let k = start(cfg(), Arc::new(FakeDrivers::default()), Arc::new(B(spawned.clone())), bus);
+    let mut run = Run { k, events, seen: vec![] };
+    run.k.send(Cmd::Order("investigate".into()));
+    let (ok, summary) = run.served();
+    assert!(ok, "{summary}");
+    // 7 + 7, then the 2 explorers left; the next level is refused.
+    assert_eq!(spawned.load(std::sync::atomic::Ordering::SeqCst), 16);
+    for want in ["level 1 of at most 3; 9 of 16", "level 2 of at most 3; 2 of 16", "level 3 of at most 3; 0 of 16"] {
+        assert!(summary.contains(want), "{want}: {summary}");
+    }
+    assert!(summary.contains("no more exploration for this order (3 levels, 16 explorers used)"), "{summary}");
 }
 
 #[test]
