@@ -12,8 +12,11 @@ here="$(cd "$(dirname "$0")" && pwd)"; root="$(cd "$here/.." && pwd)"
 label=${1:?label}; runs=${2:-2}; model=${3:-beam-free}
 scenarios=${SCENARIOS:-fix ask}
 out="$here/out/$label"; rm -rf "$out"; mkdir -p "$out"
-(cd "$root" && cargo build --release -q -p zilch)
-bin="$root/target/release/zilch"
+# ZILCH_BIN=<path> benchmarks another build (e.g. an older release) instead of building this tree.
+if [ -n "${ZILCH_BIN:-}" ]; then bin=$ZILCH_BIN; else
+  (cd "$root" && cargo build --release -q -p zilch)
+  bin="$root/target/release/zilch"
+fi
 declare -A Q=(
   [fix]="Fix every issue in ISSUES.md. Investigate first, plan TODOs that run in parallel where possible, and finish only when ./run_tests.sh passes completely."
   [ask]="Which function converts amounts between currencies? Answer with the file and the function."

@@ -1467,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "zilch"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1486,7 +1486,7 @@ dependencies = [
 
 [[package]]
 name = "zilch-agents"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -1497,7 +1497,7 @@ dependencies = [
 
 [[package]]
 name = "zilch-drivers"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1521,7 +1521,7 @@ dependencies = [
 
 [[package]]
 name = "zilch-ipc"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1529,7 +1529,7 @@ dependencies = [
 
 [[package]]
 name = "zilch-kernel"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "globset",
  "regex",

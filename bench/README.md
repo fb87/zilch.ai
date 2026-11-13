@@ -16,5 +16,7 @@ Scenarios (`SCENARIOS="ask followup"` picks some; default `fix ask`), each in a 
 Reported per run and as the median per scenario: model requests, input tokens, cached input tokens,
 output tokens, seconds, and the test suite's last line (`OK` for a correct fix).
 
+`ZILCH_BIN=path/to/zilch` benchmarks another build, e.g. an older release, instead of this tree.
+
 Run the same label before and after a change with several runs each: a model's results vary a lot
 between runs, so single runs prove little. Use free models (e.g. `beam-free`) for routine checks.
