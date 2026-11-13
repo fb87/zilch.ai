@@ -343,18 +343,30 @@ impl View {
     }
 
     fn render(&self, ev: &KernelEvent) -> Option<String> {
-        if let KernelEvent::TextDelta { pid, text, reasoning } = ev {
-            return if self.verbose() { self.stream(*pid, *reasoning, text) } else { None };
-        }
-        // A model call ended: the rest of its stream comes before the ✓ line.
-        let rest = match ev {
-            KernelEvent::SyscallDone { pid, summary, .. } if summary.starts_with("llm ") => self.flush_stream(*pid),
-            _ => None,
+        let out = if let KernelEvent::TextDelta { pid, text, reasoning } = ev {
+            if !self.verbose() {
+                return None;
+            }
+            self.stream(*pid, *reasoning, text)?
+        } else {
+            // A model call ended: the rest of its stream comes before the ✓ line.
+            let rest = match ev {
+                KernelEvent::SyscallDone { pid, summary, .. } if summary.starts_with("llm ") => self.flush_stream(*pid),
+                _ => None,
+            };
+            match (rest, self.render_line(ev)) {
+                (Some(a), Some(b)) => format!("{a}\n{b}"),
+                (a, b) => a.or(b)?,
+            }
         };
-        match (rest, self.render_line(ev)) {
-            (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
-            (a, b) => a.or(b),
+        if !self.color {
+            return Some(out); // not a terminal: leave long lines to whatever reads them
         }
+        // Wrap ourselves, so a long line continues under its text rather than at column 0
+        // (code fences and tables are left as they are).
+        let width = terminal_width();
+        let mut w = wrap::Wrapper::default();
+        Some(out.split('\n').map(|l| w.line(l, width)).collect::<Vec<_>>().join("\n"))
     }
 
     fn render_line(&self, ev: &KernelEvent) -> Option<String> {
@@ -390,7 +402,10 @@ impl View {
             KernelEvent::SyscallDone { pid, ok: false, summary, result, .. } => {
                 format!("    {red}{pid} ✗ {}{r}{d}: {}{r}", self.rel(summary), first(&result.text(), 200))
             }
-            KernelEvent::SyscallDone { pid, summary, .. } if self.verbose() => format!("    {d}{pid} ✓ {}{r}", self.rel(summary)),
+            KernelEvent::SyscallDone { pid, summary, result, .. } if self.verbose() => match result_note(summary, &result.text()) {
+                Some(note) => format!("    {d}{pid} ✓ {} → {note}{r}", self.rel(summary)),
+                None => format!("    {d}{pid} ✓ {}{r}", self.rel(summary)),
+            },
             KernelEvent::Question { qid, ticket, text, command: true, .. } => {
                 self.questions.lock().unwrap().push_back((*qid, *ticket));
                 self.commands.lock().unwrap().insert(*qid, text.clone());
@@ -554,6 +569,54 @@ Type an order to place it. While a plan waits for you: y approves, n rejects, an
 /detach      (daemon sessions, zilch attach) leave; the session keeps running · /stop ends it
 Tab completes commands, their arguments (groups, models, pids) and @ mentions.
 Ctrl-C cancels the newest open order.";
+
+/// What a finished read or search brought back, for its ✓ line: `84 lines`, `lines 140-419 of
+/// 2223`, `outline + first 40 of 2223 lines`, `unchanged, not resent`, `12 matches`, `3 files`.
+fn result_note(summary: &str, text: &str) -> Option<String> {
+    let tool = summary.split('(').next().unwrap_or("");
+    let footer = |prefix: &str| {
+        text.lines()
+            .rev()
+            .find_map(|l| l.strip_prefix(prefix))
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|n| n.parse::<usize>().ok())
+    };
+    match tool {
+        "read_file" => {
+            if text.contains("unchanged since you read them") {
+                return Some("unchanged, not resent".into());
+            }
+            if let Some((head, _)) = text.split_once(" lines. Definitions") {
+                let total = head.rsplit(' ').next().unwrap_or("?");
+                return Some(format!("outline + first lines of {total}"));
+            }
+            if text == "(empty file)" {
+                return Some("empty file".into());
+            }
+            // "[lines 140-419 of 2223; the rest: …]" or "[lines 140-419 of 2223]" after a range.
+            if let Some(range) = text.lines().rev().find_map(|l| l.strip_prefix("[lines ")) {
+                let range = range.split([';', ']']).next().unwrap_or(range);
+                return Some(format!("lines {range}"));
+            }
+            let n = text
+                .lines()
+                .filter(|l| l.trim_start().split('\t').next().is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())))
+                .count();
+            Some(format!("{n} lines"))
+        }
+        "grep" | "glob" => {
+            let (none, one, many) = if tool == "grep" { ("No matches", "match", "matches") } else { ("No files found", "file", "files") };
+            if text.starts_with(none) {
+                return Some(format!("no {many}"));
+            }
+            // Shown lines, plus "[N more … not shown]".
+            let shown = text.lines().filter(|l| !l.starts_with('[') && !l.trim().is_empty()).count();
+            let n = shown + footer("[").unwrap_or(0);
+            Some(format!("{n} {}", if n == 1 { one } else { many }))
+        }
+        _ => None,
+    }
+}
 
 /// `text` with paths inside one of the `workspaces` (spellings of the same directory) made
 /// relative to it: `/ws/src/a.rs` → `src/a.rs`, a bare `/ws` → `.`. A path that merely starts
@@ -1002,5 +1065,27 @@ mod rel_tests {
         assert_eq!(r("glob(/pst/config/*.nix)"), "glob(/pst/config/*.nix)", "a sibling with a longer name");
         assert_eq!(r("read_file(/mnt/pst/conf/a)"), "read_file(/mnt/pst/conf/a)", "the same letters inside another path");
         assert_eq!(r("grep(x in src)"), "grep(x in src)");
+    }
+}
+
+#[cfg(test)]
+mod result_note_tests {
+    use super::result_note;
+
+    #[test]
+    fn a_finished_read_or_search_says_what_came_back() {
+        let whole = "     1\tname: ci\n     2\ton: push\n     3\tjobs:\n";
+        assert_eq!(result_note("read_file(ci.yml, all)", whole).as_deref(), Some("3 lines"));
+        let part = "   140\ta\n   141\tb\n[lines 140-141 of 2223; the rest: offset=142. Several ranges: …]\n";
+        assert_eq!(result_note("read_file(f.nix:140-141)", part).as_deref(), Some("lines 140-141 of 2223"));
+        let outline = "big.rs: 1601 lines. Definitions (line: signature):\n   100: pub fn f()\n";
+        assert_eq!(result_note("read_file(big.rs, all)", outline).as_deref(), Some("outline + first lines of 1601"));
+        let same = "[a.rs lines 1-40: unchanged since you read them earlier in this conversation. …]";
+        assert_eq!(result_note("read_file(a.rs:1-40)", same).as_deref(), Some("unchanged, not resent"));
+        assert_eq!(result_note("grep(fn main)", "src/a.rs:1: fn main() {}\nsrc/b.rs:9: fn main() {}").as_deref(), Some("2 matches"));
+        assert_eq!(result_note("grep(x)", "a:1: x\n[12 more matches not shown]").as_deref(), Some("13 matches"));
+        assert_eq!(result_note("grep(zzz)", "No matches").as_deref(), Some("no matches"));
+        assert_eq!(result_note("glob(**/*.toml)", "Cargo.toml").as_deref(), Some("1 file"));
+        assert_eq!(result_note("bash(ls)", "x"), None);
     }
 }

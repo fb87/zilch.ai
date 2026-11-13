@@ -40,12 +40,21 @@ pub fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// Text for a terminal: wrapped to its width with a hanging indent; for a pipe: plain text.
+fn for_screen(s: &str, terminal: bool) -> String {
+    if !terminal {
+        return strip_ansi(s);
+    }
+    let width = crate::terminal_width();
+    s.split('\n').map(|l| crate::wrap::wrap_line(l, width)).collect::<Vec<_>>().join("\n")
+}
+
 /// The REPL. `remote`: the session lives in the daemon (/detach and /stop are offered).
 pub fn repl(link: Arc<dyn Link>, banner: &str, replay: usize, remote: bool) -> anyhow::Result<Leave> {
     let color = std::io::stdout().is_terminal();
     let (d, r) = if color { (DIM, RESET) } else { ("", "") };
     let fix = move |s: String| if color { s } else { strip_ansi(&s) };
-    println!("{}", fix(banner.to_string()));
+    println!("{}", for_screen(banner, color));
     let hint = if remote { "Type an order, or /help. /detach leaves it running." } else { "Type an order, or /help." };
     println!("{d}{hint}{r}");
     // Tab lists the choices (commands, their arguments, @ mentions) instead of cycling through them.
@@ -142,7 +151,7 @@ pub fn repl(link: Arc<dyn Link>, banner: &str, replay: usize, remote: bool) -> a
 pub fn one_order(link: &dyn Link, banner: &str, order: &str) -> anyhow::Result<i32> {
     let color = std::io::stdout().is_terminal();
     let fix = |s: String| if color { s } else { strip_ansi(&s) };
-    eprintln!("{}", if std::io::stderr().is_terminal() { banner.to_string() } else { strip_ansi(banner) });
+    eprintln!("{}", for_screen(banner, std::io::stderr().is_terminal()));
     let output = link.subscribe(0);
     link.order(order);
     let stdin = std::io::stdin();
@@ -181,7 +190,7 @@ pub fn one_order(link: &dyn Link, banner: &str, order: &str) -> anyhow::Result<i
             }
             Out::Served { ticket, ok } if mine.is_none_or(|m| m == ticket) => {
                 for line in link.totals() {
-                    eprintln!("{}", fix(line));
+                    eprintln!("{}", for_screen(&line, std::io::stderr().is_terminal()));
                 }
                 return Ok(if ok { 0 } else { 1 });
             }

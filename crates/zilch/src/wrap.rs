@@ -108,15 +108,21 @@ fn is_marker(tok: &str) -> bool {
     v.chars().all(|c| !c.is_alphanumeric() && !c.is_whitespace() && !"([{\"'`".contains(c))
 }
 
-/// Hanging indent (in columns) for `line`: leading spaces plus up to two marker tokens.
+/// Hanging indent (in columns) for `line`: leading spaces plus up to three prefix tokens:
+/// markers, and a process number next to one (`2 ▸ `, `3 │ `, `✓ 2 `).
 fn hanging_indent(line: &str) -> usize {
     let v = visible(line);
     let lead = v.len() - v.trim_start().len();
     let mut cols = lead;
     let mut rest = &v[lead..];
-    for _ in 0..2 {
+    let mut after_marker = false;
+    for _ in 0..3 {
         let Some((tok, after)) = rest.split_once(' ') else { break };
-        if !is_marker(tok) {
+        let pid = !tok.is_empty() && tok.len() <= 6 && tok.bytes().all(|b| b.is_ascii_digit());
+        let next_is_marker = after.trim_start_matches(' ').split_once(' ').is_some_and(|(n, _)| is_marker(n));
+        if is_marker(tok) {
+            after_marker = true;
+        } else if !(pid && (after_marker || next_is_marker)) {
             break;
         }
         cols += tok.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>() + 1;
@@ -273,6 +279,11 @@ mod tests {
             ("  ⎿ ✗ a failing tool summary that is long enough to need wrapping", 6),
             ("  ✓ [a1] Fix currency rounding (coder#1) changed ledger/currency.py and tests", 4),
             ("> a quoted line that is long enough to need wrapping onto another row", 2),
+            // The run log: a process number with its marker.
+            ("    2 ▸ bash(cd . && cargo test --workspace --all-features -- --nocapture)", 8),
+            ("    3 │ the model's streamed reply text, long enough to need a second row", 8),
+            ("  ✓ 2 answer: the subagent's report, long enough to need a second row", 6),
+            ("    12 ✗ read_file(a/very/long/path/to/some/file.rs): access denied", 9),
         ] {
             let r = rows(&wrap_line(line, 40));
             assert!(r.len() > 1, "{line}");

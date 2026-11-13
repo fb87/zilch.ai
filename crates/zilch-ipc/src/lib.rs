@@ -197,7 +197,7 @@ fn tool_detail(name: &str, args: &Value) -> String {
         "read_file" => {
             let path = s("path").unwrap_or("?");
             match (n("offset"), n("limit")) {
-                (None, None) => path.to_string(),
+                (None, None) => format!("{path}, all"),
                 (o, Some(l)) => {
                     let start = o.unwrap_or(1).max(1);
                     format!("{path}:{start}-{}", start + l.saturating_sub(1))
@@ -508,7 +508,7 @@ mod tests {
     #[test]
     fn tool_summaries_tell_calls_on_the_same_file_apart() {
         let t = |name: &str, args: Value| Syscall::Tool { call_id: "c".into(), name: name.into(), args }.summary();
-        assert_eq!(t("read_file", serde_json::json!({"path":"flake.nix"})), "read_file(flake.nix)");
+        assert_eq!(t("read_file", serde_json::json!({"path":"flake.nix"})), "read_file(flake.nix, all)");
         assert_eq!(t("read_file", serde_json::json!({"path":"flake.nix","offset":140,"limit":280})), "read_file(flake.nix:140-419)");
         assert_eq!(t("read_file", serde_json::json!({"path":"a.rs","limit":50})), "read_file(a.rs:1-50)");
         assert_eq!(t("read_file", serde_json::json!({"path":"a.rs","offset":2001})), "read_file(a.rs:2001-)");
