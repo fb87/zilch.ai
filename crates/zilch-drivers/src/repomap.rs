@@ -17,6 +17,22 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+/// Hidden entries that are project files agents need to see (CI and build configuration). Every
+/// other hidden entry stays out of the walk: `.git`, `.env`, `.zilch` (it may hold an API key) …
+const VISIBLE_HIDDEN: &[&str] =
+    &[".github", ".gitlab", ".gitlab-ci.yml", ".circleci", ".buildkite", ".woodpecker", ".forgejo", ".gitea", ".cargo", ".devcontainer"];
+
+/// The walker the map, `glob` and `grep` share: .gitignore honoured, hidden entries skipped
+/// except VISIBLE_HIDDEN (and the start itself, when it is one of them or named on purpose).
+pub fn walker(start: &Path) -> WalkBuilder {
+    let mut w = WalkBuilder::new(start);
+    w.hidden(false).git_ignore(true).require_git(false).filter_entry(|e| {
+        let name = e.file_name().to_string_lossy();
+        e.depth() == 0 || !name.starts_with('.') || VISIBLE_HIDDEN.contains(&name.as_ref())
+    });
+    w
+}
+
 /// Files larger than this are counted but not scanned.
 const MAX_SCAN_BYTES: u64 = 512 * 1024;
 /// Definitions listed per file in a detail view.
@@ -306,7 +322,7 @@ impl RepoMap {
         }
     }
 
-    /// Scan `root`, honouring .gitignore and skipping hidden files.
+    /// Scan `root`, honouring .gitignore and skipping hidden files (except CI/build config).
     pub fn build(root: &Path) -> Self {
         Self::scan_under(root, root, &[])
     }
@@ -333,7 +349,7 @@ impl RepoMap {
         let old: std::collections::HashMap<&str, &FileEntry> = old.iter().map(|f| (f.path.as_str(), f)).collect();
         // Walk in parallel (ripgrep's walker), then scan the files on every core.
         let found = std::sync::Mutex::new(Vec::<PathBuf>::new());
-        WalkBuilder::new(start).hidden(true).git_ignore(true).require_git(false).build_parallel().run(|| {
+        walker(start).build_parallel().run(|| {
             let found = &found;
             Box::new(move |e| {
                 if let Ok(e) = e {
