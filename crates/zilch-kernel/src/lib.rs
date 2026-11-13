@@ -368,6 +368,8 @@ struct Acb {
     budget_warned: bool,
     /// An answerer was told it has read enough and should answer (ANSWER_NUDGE_CALLS).
     answer_nudged: bool,
+    /// ...and, still reading after the grace, that its tools are off for the answer.
+    answer_forced: bool,
     /// Model calls granted beyond the base budget because the task was still making progress.
     granted: u32,
     /// Progress since the last budget check: tool results new to this task, successful writes, and
@@ -1004,6 +1006,7 @@ impl Kernel {
                 order_steps: 0,
                 budget_warned: false,
                 answer_nudged: false,
+                answer_forced: false,
                 granted: 0,
                 fresh: 0,
                 writes: 0,
@@ -1104,6 +1107,22 @@ impl Kernel {
                 reason: format!("{} model calls on one question — asked to answer from what it has", a.calls),
             });
         }
+        // Still reading after the grace: this step's model call goes without tools (see `issue`),
+        // and the model must be told why, or it may think about reading on and return nothing.
+        let force = ANSWER_NUDGE_CALLS + ANSWER_GRACE;
+        if let Some(a) = self.acbs.get_mut(&pid).filter(|a| answerer && a.answer_nudged && a.calls >= force && !a.answer_forced) {
+            a.answer_forced = true;
+            a.notes.push(
+                "[supervisor] Your tools are switched off for this call. Write your complete answer now, as your reply, from \
+                 what you have already read; say briefly what you could not check."
+                    .into(),
+            );
+            self.bus.publish(KernelEvent::Signal {
+                pid,
+                signal: Signal::Warn,
+                reason: format!("{} model calls and still reading — its next call has no tools", a.calls),
+            });
+        }
         // Out of model calls: first ask the agent to wrap up and report (its work is kept and the
         // main agent can continue from the report — cheaper than killing it and redoing the task);
         // stop it only if it is still going after a short grace.
@@ -1198,7 +1217,7 @@ impl Kernel {
         // An answerer still reading ANSWER_GRACE calls after it was told to answer: its model
         // calls may no longer use tools, so the reply is the answer.
         let answerer = self.dispatched.get(&pid).is_some_and(|(_, _, agent)| agent == "answer");
-        if answerer && self.acbs.get(&pid).is_some_and(|a| a.answer_nudged && a.calls >= ANSWER_NUDGE_CALLS + ANSWER_GRACE) {
+        if answerer && self.acbs.get(&pid).is_some_and(|a| a.answer_forced) {
             for c in calls.iter_mut() {
                 if let Syscall::Complete(req) = c {
                     req.binding.extra.insert("tool_choice".into(), "none".into());
