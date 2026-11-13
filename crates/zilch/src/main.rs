@@ -7,11 +7,9 @@ mod costs;
 mod daemon;
 mod front;
 mod ipc;
-#[allow(dead_code)] // ported whole from zilch-cli; streaming parts come later
 mod markdown;
 mod session;
 mod status;
-#[allow(dead_code)]
 mod wrap;
 
 use clap::Parser;
