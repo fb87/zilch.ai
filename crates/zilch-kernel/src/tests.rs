@@ -24,6 +24,14 @@ impl Drivers for FakeDrivers {
     fn run(&self, ctx: &DriverCtx, call: Syscall) -> SyscallResult {
         let name = match call {
             Syscall::Tool { name, .. } => name,
+            // A model call the kernel took the tools from can only answer.
+            Syscall::Complete(req) if req.binding.extra.get("tool_choice").and_then(|v| v.as_str()) == Some("none") => {
+                return SyscallResult::Completion {
+                    message: zilch_ipc::Message::assistant("answered without tools"),
+                    usage: zilch_ipc::Usage { prompt_tokens: 25, completion_tokens: 5, ..Default::default() },
+                    cut: false,
+                }
+            }
             // Every model call "costs" 30 tokens.
             _ => {
                 return SyscallResult::Completion {
@@ -1263,6 +1271,7 @@ fn only_the_main_agent_dispatches_and_only_known_subagents() {
 
 #[test]
 fn an_answerer_that_keeps_reading_is_told_to_answer() {
+    static NOTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     struct Main;
     impl Agent for Main {
         fn step(&mut self, _: &AcbView, wake: Vec<SyscallResult>) -> StepResult {
@@ -1281,10 +1290,14 @@ fn an_answerer_that_keeps_reading_is_told_to_answer() {
             unreachable!("no plan here")
         }
         fn subagent(&self, _: TicketId, _: &str, _: &str) -> Option<Box<dyn Agent>> {
-            // Reads forever (a model call, then a tool) until the supervisor says to answer.
-            Some(Box::new(Scripted(0, |n, _, view: &AcbView| {
-                if let Some(note) = view.notes.iter().find(|x| x.contains("Answer now")) {
-                    return StepResult::Exit(ExitStatus::ok(format!("answered after: {note}")));
+            // Reads forever (a model call, then a tool), ignoring the note to answer, until a
+            // model call without tools can only answer.
+            Some(Box::new(Scripted(0, |n, wake, view: &AcbView| {
+                if view.notes.iter().any(|x| x.contains("Answer now")) {
+                    NOTED.store(n as usize, std::sync::atomic::Ordering::SeqCst);
+                }
+                if wake.iter().any(|w| w.text().contains("answered without tools")) {
+                    return StepResult::Exit(ExitStatus::ok("answered without tools"));
                 }
                 match n % 2 {
                     1 => StepResult::Syscalls(vec![llm_call()]),
@@ -1299,7 +1312,11 @@ fn an_answerer_that_keeps_reading_is_told_to_answer() {
     let mut run = Run { k, events, seen: vec![] };
     run.k.send(Cmd::Order("analyze".into()));
     let (ok, summary) = run.served();
-    assert!(ok && summary.contains("You have made 10 model calls on this question"), "{summary}");
+    assert!(ok && summary.contains("answered without tools"), "{summary}");
+    assert!(NOTED.load(std::sync::atomic::Ordering::SeqCst) > 0, "it was told to answer first");
+    let calls =
+        run.seen.iter().filter(|e| matches!(e, KernelEvent::SyscallIssued { pid: 2, summary, .. } if summary.starts_with("llm "))).count();
+    assert_eq!(calls, 14, "10 calls, the note, 3 more with tools, then one without");
 }
 
 #[test]

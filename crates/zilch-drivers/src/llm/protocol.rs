@@ -171,6 +171,10 @@ fn anthropic_body(req: &ChatRequest) -> Value {
         obj.insert("tools".into(), tools.into());
     }
     insert_common(obj, req, "max_tokens");
+    // `tool_choice: "none"` (OpenAI's spelling, set by the kernel) is an object for Anthropic.
+    if obj.get("tool_choice").and_then(Value::as_str) == Some("none") {
+        obj.insert("tool_choice".into(), json!({"type": "none"}));
+    }
     body
 }
 
@@ -375,6 +379,11 @@ mod tests {
         assert_eq!(m[2]["content"][2]["cache_control"]["type"], "ephemeral");
         assert!(m[2]["content"][0].get("cache_control").is_none() && m[0]["content"][0].get("cache_control").is_none());
         assert_eq!(b["tools"][0]["input_schema"]["type"], "object");
+        // "Answer now, no tools": OpenAI's "none" becomes Anthropic's object.
+        let mut r = req();
+        r.binding.extra.insert("tool_choice".into(), "none".into());
+        assert_eq!(Protocol::Anthropic.body(&r)["tool_choice"], json!({"type": "none"}));
+        assert_eq!(Protocol::Responses.body(&r)["tool_choice"], "none");
     }
 
     #[test]

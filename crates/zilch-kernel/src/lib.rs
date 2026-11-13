@@ -430,6 +430,8 @@ const MAX_EXPLORERS: u32 = 16;
 /// An answerer that has made this many model calls is told to answer from what it has read: a
 /// question rarely needs more, and every further call resends its whole, growing conversation.
 const ANSWER_NUDGE_CALLS: u32 = 10;
+/// Model calls an answerer may still make after that, with tools, before it must answer.
+const ANSWER_GRACE: u32 = 3;
 
 /// An exploration in progress: (the asker's batch, its parked slot, the questions, the reports).
 type Exploration = (u64, usize, Vec<String>, Vec<Option<String>>);
@@ -1192,7 +1194,17 @@ impl Kernel {
 
     // ── syscalls ──
 
-    fn issue(&mut self, pid: Pid, calls: Vec<Syscall>) {
+    fn issue(&mut self, pid: Pid, mut calls: Vec<Syscall>) {
+        // An answerer still reading ANSWER_GRACE calls after it was told to answer: its model
+        // calls may no longer use tools, so the reply is the answer.
+        let answerer = self.dispatched.get(&pid).is_some_and(|(_, _, agent)| agent == "answer");
+        if answerer && self.acbs.get(&pid).is_some_and(|a| a.answer_nudged && a.calls >= ANSWER_NUDGE_CALLS + ANSWER_GRACE) {
+            for c in calls.iter_mut() {
+                if let Syscall::Complete(req) = c {
+                    req.binding.extra.insert("tool_choice".into(), "none".into());
+                }
+            }
+        }
         let n = calls.len();
         let (batch, cancel, ticket) = {
             let a = self.acbs.get_mut(&pid).expect("alive");
