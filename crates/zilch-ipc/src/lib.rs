@@ -211,11 +211,28 @@ fn tool_detail(name: &str, args: &Value) -> String {
         }
         "edit_file" | "edit_doc" => {
             let what = s("path").or(s("doc")).unwrap_or("?");
-            match args.get("edits").and_then(Value::as_array).map(Vec::len) {
-                Some(k) if k > 1 => format!("{what}, {k} edits"),
-                _ if args.get("replace_all").and_then(Value::as_bool) == Some(true) => format!("{what}, all occurrences"),
-                _ => what.to_string(),
+            // Lines changed: each edit's old and new text without the lines they share at the
+            // start and the end.
+            let pair = |e: &Value| {
+                let t = |k: &str| e.get(k).and_then(Value::as_str).unwrap_or("").lines().collect::<Vec<_>>();
+                let (old, new) = (t("old_string"), t("new_string"));
+                let head = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+                let tail = old[head..].iter().rev().zip(new[head..].iter().rev()).take_while(|(a, b)| a == b).count();
+                ((new.len() - head - tail) as u64, (old.len() - head - tail) as u64)
+            };
+            let edits: Vec<&Value> = match args.get("edits").and_then(Value::as_array) {
+                Some(list) if !list.is_empty() => list.iter().collect(),
+                _ => vec![args],
+            };
+            let (added, removed) = edits.iter().map(|e| pair(e)).fold((0, 0), |(a, r), (x, y)| (a + x, r + y));
+            let mut s = format!("{what}, +{added} -{removed}");
+            if edits.len() > 1 {
+                s.push_str(&format!(" in {} edits", edits.len()));
             }
+            if args.get("replace_all").and_then(Value::as_bool) == Some(true) {
+                s.push_str(", all occurrences");
+            }
+            s
         }
         "grep" | "glob" => scope(s("pattern").unwrap_or("?")),
         "repo_map" => s("path").unwrap_or(".").to_string(),
@@ -514,7 +531,9 @@ mod tests {
         assert_eq!(t("read_file", serde_json::json!({"path":"a.rs","offset":2001})), "read_file(a.rs:2001-)");
         assert_eq!(t("write_file", serde_json::json!({"path":"r.md","content":"a\nb\n"})), "write_file(r.md, 2 lines)");
         let edits = serde_json::json!({"path":"a.rs","edits":[{"old_string":"x","new_string":"y"},{"old_string":"p","new_string":"q"}]});
-        assert_eq!(t("edit_file", edits), "edit_file(a.rs, 2 edits)");
+        assert_eq!(t("edit_file", edits), "edit_file(a.rs, +2 -2 in 2 edits)");
+        let one = serde_json::json!({"path":"p.py","old_string":"def f():\n    return 1\n","new_string":"def f():\n    x = 1\n    y = 2\n    return x + y\n"});
+        assert_eq!(t("edit_file", one), "edit_file(p.py, +3 -1)", "the shared first line does not count");
         assert_eq!(t("grep", serde_json::json!({"pattern":"fn main","path":"src","glob":"*.rs"})), "grep(fn main in src (*.rs))");
         assert_eq!(t("glob", serde_json::json!({"pattern":"**/*.toml"})), "glob(**/*.toml)");
         assert_eq!(t("git", serde_json::json!({"command":"log","path":"src/lib.rs"})), "git(log src/lib.rs)");

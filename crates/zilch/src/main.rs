@@ -13,7 +13,7 @@ mod status;
 mod wrap;
 
 use clap::Parser;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -155,6 +155,8 @@ struct View {
     order_stats: Mutex<HashMap<TicketId, OrderStats>>,
     /// Between orders: since when, and what the main agent's last wake-up did.
     idle: Mutex<Idle>,
+    /// Quiet mode: each process.s tool calls of the current step, shown as one line when done.
+    steps: Mutex<HashMap<Pid, Step>>,
 }
 
 /// The status row between orders: `idle 5m12s · woke at 5m00s: nothing to condense`.
@@ -245,6 +247,7 @@ impl View {
     fn set_verbose(&self, on: bool) {
         self.verbose.store(on, std::sync::atomic::Ordering::Relaxed);
         self.streams.lock().unwrap().clear();
+        self.steps.lock().unwrap().clear();
     }
 
     /// One streamed line of a process: `┊` (dim) for reasoning, `│` for reply text.
@@ -534,9 +537,37 @@ impl View {
                 if summary == "recv" || (summary.starts_with("llm ") && !self.verbose()) {
                     return None;
                 }
+                // Quiet: a step's tool calls become one line once they have all finished.
+                if !self.verbose() && is_tool(summary) {
+                    let mut steps = self.steps.lock().unwrap();
+                    let step = steps.entry(*pid).or_default();
+                    step.inflight += 1;
+                    return None;
+                }
                 format!("    {d}{pid} ▸ {}{r}", self.rel(summary))
             }
             KernelEvent::SyscallDone { summary, .. } if summary == "recv" || summary == "serve" => return None,
+            KernelEvent::SyscallDone { pid, ok, summary, result, .. } if !self.verbose() && is_tool(summary) => {
+                let failed = (!ok).then(|| format!("    {red}{pid} ✗ {}{r}{d}: {}{r}", self.rel(summary), first(&result.text(), 200)));
+                let done = {
+                    let mut steps = self.steps.lock().unwrap();
+                    let step = steps.entry(*pid).or_default();
+                    step.inflight = step.inflight.saturating_sub(1);
+                    if *ok {
+                        step.add(summary); // a failed call has its ✗ line and is not counted
+                    }
+                    if step.inflight == 0 {
+                        steps.remove(pid).and_then(|s| s.text())
+                    } else {
+                        None
+                    }
+                }
+                .map(|t| format!("    {d}{pid} ▸ {}{r}", self.rel(&t)));
+                match (failed, done) {
+                    (Some(a), Some(b)) => format!("{a}\n{b}"),
+                    (a, b) => a.or(b)?,
+                }
+            }
             KernelEvent::SyscallDone { pid, ok: false, summary, result, .. } => {
                 format!("    {red}{pid} ✗ {}{r}{d}: {}{r}", self.rel(summary), first(&result.text(), 200))
             }
@@ -711,12 +742,107 @@ Type an order to place it. While a plan waits for you: y approves, n rejects, an
 /about       version, repository, workspace, session file, config files
 /redraw      clear the screen and re-render the last answer at the current width
 /verbose     also show model calls, results and the models' streamed text and reasoning
-/quiet       back to the short log (the default)
+/quiet       back to the short log (the default): one line per step, e.g. "read 2 files, edited a.rs +3 -1"
 /help        this help
 /exit        quit (Ctrl-D)
 /detach      (daemon sessions, zilch attach) leave; the session keeps running · /stop ends it
 Tab completes commands, their arguments (groups, models, pids) and @ mentions.
 Ctrl-C cancels the newest open order.";
+
+/// A tool call (as opposed to a model call or the kernel's own syscalls, which have lines of
+/// their own).
+fn is_tool(summary: &str) -> bool {
+    !["llm ", "recv", "serve", "dispatch", "explore", "submit_plan", "send "].iter().any(|p| summary.starts_with(p))
+}
+
+/// The quiet log's account of one step's tool calls (a process's calls issued together):
+/// `read ci.yml, edited ledger/parse.py +3 -1, ran 2 shell commands`.
+#[derive(Default, Debug)]
+struct Step {
+    /// Calls issued and not yet finished.
+    inflight: u32,
+    reads: BTreeSet<String>,
+    searches: u32,
+    commands: u32,
+    git: u32,
+    edits: BTreeSet<String>,
+    added: u64,
+    removed: u64,
+    writes: Vec<(String, u64)>,
+    fetches: u32,
+    web_searches: u32,
+    other: Vec<String>,
+}
+
+impl Step {
+    /// Count one call from its summary (`read_file(ci.yml, all)`, `edit_file(a.rs, +3 -1)` …).
+    fn add(&mut self, summary: &str) {
+        let (tool, detail) = summary.split_once('(').map(|(t, d)| (t, d.strip_suffix(')').unwrap_or(d))).unwrap_or((summary, ""));
+        let path = detail.split([',', ':']).next().unwrap_or(detail).trim().to_string();
+        let num =
+            |prefix: char| detail.split_whitespace().find_map(|w| w.strip_prefix(prefix)).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+        match tool {
+            "read_file" => {
+                self.reads.insert(path);
+            }
+            "grep" | "glob" | "find_definition" | "repo_map" => self.searches += 1,
+            "bash" => self.commands += 1,
+            "git" => self.git += 1,
+            "edit_file" | "edit_doc" => {
+                self.edits.insert(path);
+                self.added += num('+');
+                self.removed += num('-');
+            }
+            "write_file" | "write_doc" => {
+                let lines = detail.rsplit(", ").next().and_then(|l| l.strip_suffix(" lines")).and_then(|n| n.parse().ok()).unwrap_or(0);
+                self.writes.push((path, lines));
+            }
+            "web_fetch" | "fetch_source" => self.fetches += 1,
+            "web_search" => self.web_searches += 1,
+            _ => self.other.push(summary.to_string()),
+        }
+    }
+
+    fn text(&self) -> Option<String> {
+        let n = |k: u32, one: &str, many: &str| format!("{k} {}", if k == 1 { one } else { many });
+        let mut parts = Vec::new();
+        match self.edits.len() {
+            0 => {}
+            1 => parts.push(format!("edited {} +{} -{}", self.edits.first().unwrap(), self.added, self.removed)),
+            k => parts.push(format!("edited {k} files +{} -{}", self.added, self.removed)),
+        }
+        match self.writes.as_slice() {
+            [] => {}
+            [(p, lines)] => parts.push(format!("wrote {p} ({lines} lines)")),
+            w => parts.push(format!("wrote {} files ({} lines)", w.len(), w.iter().map(|(_, l)| l).sum::<u64>())),
+        }
+        match self.reads.len() {
+            0 => {}
+            1 => parts.push(format!("read {}", self.reads.first().unwrap())),
+            k => parts.push(format!("read {k} files")),
+        }
+        if self.searches > 0 {
+            parts.push(format!("searched {}", if self.searches == 1 { "once".into() } else { format!("{} times", self.searches) }));
+        }
+        if self.commands > 0 {
+            parts.push(format!("ran {}", n(self.commands, "shell command", "shell commands")));
+        }
+        if self.git > 0 {
+            parts.push(format!("ran {}", n(self.git, "git command", "git commands")));
+        }
+        if self.fetches > 0 {
+            parts.push(format!("fetched {}", n(self.fetches, "page", "pages")));
+        }
+        if self.web_searches > 0 {
+            parts.push(format!(
+                "searched the web {}",
+                if self.web_searches == 1 { "once".into() } else { format!("{} times", self.web_searches) }
+            ));
+        }
+        parts.extend(self.other.iter().cloned());
+        (!parts.is_empty()).then(|| parts.join(", "))
+    }
+}
 
 /// Lines of a tool's output shown under its ✓ line in /verbose.
 const OUTPUT_LINES: usize = 12;
@@ -1288,5 +1414,35 @@ mod tool_output_tests {
     fn idle_durations_read_short() {
         assert_eq!(super::short_duration(std::time::Duration::from_secs(9)), "9s");
         assert_eq!(super::short_duration(std::time::Duration::from_secs(312)), "5m12s");
+    }
+}
+
+#[cfg(test)]
+mod step_tests {
+    use super::Step;
+
+    #[test]
+    fn a_steps_tool_calls_read_as_one_short_line() {
+        let mut s = Step::default();
+        for c in ["read_file(ci.yml, all)", "edit_file(ledger/parse.py, +3 -1)", "bash(cargo test)", "bash(ls)", "grep(fn main in src)"] {
+            s.add(c);
+        }
+        assert_eq!(s.text().unwrap(), "edited ledger/parse.py +3 -1, read ci.yml, searched once, ran 2 shell commands");
+        let mut s = Step::default();
+        for c in [
+            "read_file(a.rs:1-40)",
+            "read_file(a.rs:41-80)",
+            "read_file(b.rs, all)",
+            "edit_file(a.rs, +2 -0)",
+            "edit_file(b.rs, +1 -4 in 2 edits)",
+        ] {
+            s.add(c);
+        }
+        assert_eq!(s.text().unwrap(), "edited 2 files +3 -4, read 2 files", "two ranges of a.rs are one file");
+        let mut s = Step::default();
+        s.add("write_file(report.md, 63 lines)");
+        s.add("web_search(rust serde)");
+        assert_eq!(s.text().unwrap(), "wrote report.md (63 lines), searched the web once");
+        assert!(Step::default().text().is_none());
     }
 }
