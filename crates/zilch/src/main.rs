@@ -153,6 +153,29 @@ struct View {
     tickets_of: Mutex<HashMap<Pid, TicketId>>,
     /// Per order: when it was placed, and its model requests, tokens and cost so far.
     order_stats: Mutex<HashMap<TicketId, OrderStats>>,
+    /// Between orders: since when, and what the main agent's last wake-up did.
+    idle: Mutex<Idle>,
+}
+
+/// The status row between orders: `idle 5m12s · woke at 5m00s: nothing to condense`.
+#[derive(Default)]
+struct Idle {
+    /// None while an order is open.
+    since: Option<Instant>,
+    /// A wake-up in progress: when (into the idle time), and whether it called the model.
+    waking: Option<(Duration, bool)>,
+    /// The last finished wake-up.
+    last: Option<(Duration, bool)>,
+}
+
+/// `75s` → `1m15s`, `9s` → `9s`.
+fn short_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    if s >= 60 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{s}s")
+    }
 }
 
 #[derive(Default)]
@@ -269,11 +292,59 @@ impl View {
         self.open.lock().unwrap().iter().max().copied()
     }
 
+    /// Idle time and the main agent's wake-ups between orders: a resident agent's `recv` ending
+    /// with no order open is a wake-up; a model call before its next `recv` means it condensed its
+    /// conversation.
+    fn track_idle(&self, ev: &KernelEvent) {
+        let resident = |pid: &Pid| matches!(self.procs.lock().unwrap().get(pid).map(|(g, _)| *g), Some(Group::Architecture | Group::Spec));
+        let mut idle = self.idle.lock().unwrap();
+        match ev {
+            KernelEvent::TicketOpened { .. } => *idle = Idle::default(),
+            KernelEvent::TicketServed { ticket, .. } => {
+                if self.open.lock().unwrap().iter().all(|t| t == ticket) {
+                    *idle = Idle { since: Some(Instant::now()), ..Default::default() };
+                }
+            }
+            KernelEvent::SyscallDone { pid, summary, .. } if summary == "recv" && resident(pid) => {
+                if let Some(since) = idle.since {
+                    idle.waking = Some((since.elapsed(), false));
+                }
+            }
+            KernelEvent::SyscallIssued { pid, summary, .. } if summary.starts_with("llm ") && resident(pid) => {
+                if let Some((_, called)) = idle.waking.as_mut() {
+                    *called = true;
+                }
+            }
+            KernelEvent::SyscallIssued { pid, summary, .. } if summary == "recv" && resident(pid) => {
+                if let Some(w) = idle.waking.take() {
+                    idle.last = Some(w);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `idle 5m12s · woke at 5m00s: nothing to condense` (before the first order: since start).
+    fn idle_text(&self) -> String {
+        let idle = self.idle.lock().unwrap();
+        let since = idle.since.map_or_else(|| self.started.elapsed(), |s| s.elapsed());
+        let mut s = format!("idle {}", short_duration(since));
+        match (idle.waking, idle.last) {
+            (Some(_), _) => s.push_str(" · main agent awake: checking its conversation"),
+            (None, Some((at, condensed))) => {
+                s.push_str(&format!(" · woke at {}: {}", short_duration(at), if condensed { "condensed" } else { "nothing to condense" }))
+            }
+            _ => {}
+        }
+        s
+    }
+
     /// Keep the status row's picture of live processes up to date.
     fn track(&self, ev: &KernelEvent) {
         if let KernelEvent::RequestParts { parts, .. } = ev {
             self.costs.record_parts(parts);
         }
+        self.track_idle(ev);
         match ev {
             KernelEvent::TicketOpened { ticket, .. } => {
                 self.order_stats.lock().unwrap().insert(*ticket, OrderStats { started: Some(Instant::now()), ..Default::default() });
@@ -386,7 +457,7 @@ impl View {
             live.values().filter(|l| !(matches!(l.group, Group::Architecture | Group::Spec) && l.state == "blocked(recv)")).count()
                 - busy.len();
         if busy.is_empty() {
-            let rest = if waiting > 0 { format!("{waiting} waiting") } else { "idle".into() };
+            let rest = if waiting > 0 { format!("{waiting} waiting") } else { self.idle_text() };
             return (format!("{note}{d}{rest}{r}{spent}"), false);
         }
         const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -469,10 +540,19 @@ impl View {
             KernelEvent::SyscallDone { pid, ok: false, summary, result, .. } => {
                 format!("    {red}{pid} ✗ {}{r}{d}: {}{r}", self.rel(summary), first(&result.text(), 200))
             }
-            KernelEvent::SyscallDone { pid, summary, result, .. } if self.verbose() => match result_note(summary, &result.text()) {
-                Some(note) => format!("    {d}{pid} ✓ {} → {note}{r}", self.rel(summary)),
-                None => format!("    {d}{pid} ✓ {}{r}", self.rel(summary)),
-            },
+            KernelEvent::SyscallDone { pid, summary, result, .. } if self.verbose() => {
+                let text = result.text();
+                let head = match result_note(summary, &text) {
+                    Some(note) => format!("    {d}{pid} ✓ {} → {note}{r}", self.rel(summary)),
+                    None => format!("    {d}{pid} ✓ {}{r}", self.rel(summary)),
+                };
+                // A tool's output under its line (model replies stream; reports have their own line).
+                let tool = !(summary.starts_with("llm ") || ["dispatch", "explore", "submit_plan"].iter().any(|p| summary.starts_with(p)));
+                match tool.then(|| tool_output(&text, d, r)).flatten() {
+                    Some(out) => format!("{head}\n{out}"),
+                    None => head,
+                }
+            }
             KernelEvent::Question { qid, ticket, text, command: true, .. } => {
                 self.questions.lock().unwrap().push_back((*qid, *ticket));
                 self.commands.lock().unwrap().insert(*qid, text.clone());
@@ -637,6 +717,35 @@ Type an order to place it. While a plan waits for you: y approves, n rejects, an
 /detach      (daemon sessions, zilch attach) leave; the session keeps running · /stop ends it
 Tab completes commands, their arguments (groups, models, pids) and @ mentions.
 Ctrl-C cancels the newest open order.";
+
+/// Lines of a tool's output shown under its ✓ line in /verbose.
+const OUTPUT_LINES: usize = 12;
+
+/// A tool's output for /verbose: the first lines, dim and indented under its ✓ line, with a note of
+/// what was left out (None for empty output).
+fn tool_output(text: &str, d: &str, r: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let mut out: Vec<String> = lines
+        .iter()
+        .take(OUTPUT_LINES)
+        .map(|l| {
+            // read_file's numbered lines (`    12\tcode`) read better as `12  code`.
+            let l = match l.split_once('\t') {
+                Some((n, rest)) if n.trim().bytes().all(|b| b.is_ascii_digit()) && !n.trim().is_empty() => format!("{}  {rest}", n.trim()),
+                _ => l.replace('\t', "  "),
+            };
+            let l: String = l.chars().take(300).collect();
+            format!("        {d}│ {l}{r}")
+        })
+        .collect();
+    if lines.len() > OUTPUT_LINES {
+        out.push(format!("        {d}│ … {} more lines{r}", lines.len() - OUTPUT_LINES));
+    }
+    Some(out.join("\n"))
+}
 
 /// What a finished read or search brought back, for its ✓ line: `84 lines`, `lines 140-419 of
 /// 2223`, `outline + first 40 of 2223 lines`, `unchanged, not resent`, `12 matches`, `3 files`.
@@ -1158,5 +1267,26 @@ mod result_note_tests {
         assert_eq!(result_note("grep(zzz)", "No matches").as_deref(), Some("no matches"));
         assert_eq!(result_note("glob(**/*.toml)", "Cargo.toml").as_deref(), Some("1 file"));
         assert_eq!(result_note("bash(ls)", "x"), None);
+    }
+}
+
+#[cfg(test)]
+mod tool_output_tests {
+    #[test]
+    fn verbose_shows_the_first_lines_of_a_tools_output() {
+        let read: String = (1..=20).map(|i| format!("{i:>6}\tline {i}\n")).collect();
+        let out = super::tool_output(&read, "", "").unwrap();
+        let rows: Vec<&str> = out.lines().collect();
+        assert_eq!(rows.len(), 13, "{out}");
+        assert_eq!(rows[0], "        │ 1  line 1");
+        assert_eq!(rows[12], "        │ … 8 more lines");
+        assert_eq!(super::tool_output("ok", "", "").unwrap(), "        │ ok");
+        assert!(super::tool_output("  \n", "", "").is_none());
+    }
+
+    #[test]
+    fn idle_durations_read_short() {
+        assert_eq!(super::short_duration(std::time::Duration::from_secs(9)), "9s");
+        assert_eq!(super::short_duration(std::time::Duration::from_secs(312)), "5m12s");
     }
 }

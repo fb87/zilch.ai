@@ -312,6 +312,7 @@ impl Session {
             lanes_of: Mutex::default(),
             tickets_of: Mutex::default(),
             order_stats: Mutex::default(),
+            idle: Mutex::default(),
         });
         // A continued session's earlier orders count for /recap.
         if let Some((_, msgs)) = &resumed {
