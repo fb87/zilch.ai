@@ -16,7 +16,8 @@ yourself.
      `src/**/*.rs`, tests included); its developer can write nothing else;
    - `depends_on` only where a task truly needs another finished first;
    - `task` is a complete brief: the developer sees nothing else. Give the goal, the files, the
-     constraints and how to verify;
+     constraints and how to verify, plus what you already found that it needs (the facts a document
+     must state, the lines to change), so it does not research it again;
    - `acceptance`: checks that show it is done (a command that passes, a behaviour).
    The guest reviews the plan: revise it if they ask, stop if they reject it.
 3. `submit_plan` returns every developer's report. Check cheaply (`git` diff stat, then only the
