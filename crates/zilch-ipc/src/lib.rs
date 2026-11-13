@@ -8,6 +8,7 @@
 pub mod llm;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -173,19 +174,70 @@ pub enum Syscall {
     Dispatch { agent: String, brief: String },
 }
 
+/// What a tool call is about, enough to tell two calls apart in the log: the range of a read, the
+/// scope of a search, the size of a write.
+fn tool_detail(name: &str, args: &Value) -> String {
+    let s = |k: &str| args.get(k).and_then(Value::as_str).filter(|v| !v.is_empty());
+    let n = |k: &str| args.get(k).and_then(Value::as_u64);
+    let first_line = |v: &str, max: usize| {
+        let line = v.lines().next().unwrap_or("");
+        if line.chars().count() > max || v.lines().nth(1).is_some() {
+            format!("{}…", line.chars().take(max).collect::<String>())
+        } else {
+            line.to_string()
+        }
+    };
+    let scope = |pattern: &str| match (s("path"), s("glob")) {
+        (Some(p), Some(g)) => format!("{} in {p} ({g})", first_line(pattern, 60)),
+        (Some(p), None) => format!("{} in {p}", first_line(pattern, 60)),
+        (None, Some(g)) => format!("{} ({g})", first_line(pattern, 60)),
+        (None, None) => first_line(pattern, 60),
+    };
+    match name {
+        "read_file" => {
+            let path = s("path").unwrap_or("?");
+            match (n("offset"), n("limit")) {
+                (None, None) => path.to_string(),
+                (o, Some(l)) => {
+                    let start = o.unwrap_or(1).max(1);
+                    format!("{path}:{start}-{}", start + l.saturating_sub(1))
+                }
+                (Some(o), None) => format!("{path}:{o}-"),
+            }
+        }
+        "write_file" | "write_doc" => {
+            let lines = s("content").map_or(0, |c| c.lines().count());
+            format!("{}, {lines} lines", s("path").or(s("doc")).unwrap_or("?"))
+        }
+        "edit_file" | "edit_doc" => {
+            let what = s("path").or(s("doc")).unwrap_or("?");
+            match args.get("edits").and_then(Value::as_array).map(Vec::len) {
+                Some(k) if k > 1 => format!("{what}, {k} edits"),
+                _ if args.get("replace_all").and_then(Value::as_bool) == Some(true) => format!("{what}, all occurrences"),
+                _ => what.to_string(),
+            }
+        }
+        "grep" | "glob" => scope(s("pattern").unwrap_or("?")),
+        "repo_map" => s("path").unwrap_or(".").to_string(),
+        "git" => [s("command"), s("rev"), s("path")].into_iter().flatten().collect::<Vec<_>>().join(" "),
+        "web_fetch" => match n("start") {
+            Some(st) if st > 0 => format!("{} from {st}", s("url").unwrap_or("?")),
+            _ => s("url").unwrap_or("?").to_string(),
+        },
+        _ => ["path", "command", "pattern", "doc", "url", "query", "name"]
+            .iter()
+            .find_map(|k| s(k))
+            .map(|v| first_line(v, 80))
+            .unwrap_or_default(),
+    }
+}
+
 impl Syscall {
     /// Short label for the process table and the event stream.
     pub fn summary(&self) -> String {
         match self {
             Syscall::Complete(r) => format!("llm {}", r.binding.key()),
-            Syscall::Tool { name, args, .. } => {
-                let detail = ["path", "command", "pattern", "doc", "url", "query", "name"]
-                    .iter()
-                    .find_map(|k| args.get(*k).and_then(|v| v.as_str()))
-                    .map(|s| s.lines().next().unwrap_or("").chars().take(80).collect::<String>())
-                    .unwrap_or_default();
-                format!("{name}({detail})")
-            }
+            Syscall::Tool { name, args, .. } => format!("{name}({})", tool_detail(name, args)),
             Syscall::Send { to, kind, .. } => format!("send {kind:?} → {to}"),
             Syscall::Recv => "recv".into(),
             Syscall::SubmitPlan { tasks } => format!("submit_plan ({} tasks)", tasks.len()),
@@ -290,10 +342,13 @@ pub enum KernelEvent {
         summary: String,
         result: SyscallResult,
     },
-    /// Streamed reply text (not written to the log: the Completion result has it all).
+    /// Streamed reply text, or reasoning when `reasoning` (not written to the log: the Completion
+    /// result has it all).
     TextDelta {
         pid: Pid,
         text: String,
+        #[serde(default)]
+        reasoning: bool,
     },
     Usage {
         pid: Pid,
@@ -451,6 +506,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tool_summaries_tell_calls_on_the_same_file_apart() {
+        let t = |name: &str, args: Value| Syscall::Tool { call_id: "c".into(), name: name.into(), args }.summary();
+        assert_eq!(t("read_file", serde_json::json!({"path":"flake.nix"})), "read_file(flake.nix)");
+        assert_eq!(t("read_file", serde_json::json!({"path":"flake.nix","offset":140,"limit":280})), "read_file(flake.nix:140-419)");
+        assert_eq!(t("read_file", serde_json::json!({"path":"a.rs","limit":50})), "read_file(a.rs:1-50)");
+        assert_eq!(t("read_file", serde_json::json!({"path":"a.rs","offset":2001})), "read_file(a.rs:2001-)");
+        assert_eq!(t("write_file", serde_json::json!({"path":"r.md","content":"a\nb\n"})), "write_file(r.md, 2 lines)");
+        let edits = serde_json::json!({"path":"a.rs","edits":[{"old_string":"x","new_string":"y"},{"old_string":"p","new_string":"q"}]});
+        assert_eq!(t("edit_file", edits), "edit_file(a.rs, 2 edits)");
+        assert_eq!(t("grep", serde_json::json!({"pattern":"fn main","path":"src","glob":"*.rs"})), "grep(fn main in src (*.rs))");
+        assert_eq!(t("glob", serde_json::json!({"pattern":"**/*.toml"})), "glob(**/*.toml)");
+        assert_eq!(t("git", serde_json::json!({"command":"log","path":"src/lib.rs"})), "git(log src/lib.rs)");
+        assert_eq!(t("bash", serde_json::json!({"command":"cargo test\necho done"})), "bash(cargo test…)");
+        assert_eq!(t("web_fetch", serde_json::json!({"url":"https://x.dev","start":20000})), "web_fetch(https://x.dev from 20000)");
+    }
+
+    #[test]
     fn a_full_mailbox_hands_the_message_back_instead_of_blocking() {
         let mut m = Mailbox::new(2);
         let msg = |b: &str| Msg { from: 1, kind: MsgKind::Task, body: b.into() };
@@ -495,7 +567,7 @@ mod tests {
         let buf = Buf::default();
         bus.set_log(Box::new(buf.clone()));
         bus.set_tick(7);
-        bus.publish(KernelEvent::TextDelta { pid: 1, text: "x".into() });
+        bus.publish(KernelEvent::TextDelta { pid: 1, text: "x".into(), reasoning: false });
         bus.publish(KernelEvent::Exited { pid: 1, ok: true, report: "done".into() });
         let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         assert_eq!(text.lines().count(), 1);

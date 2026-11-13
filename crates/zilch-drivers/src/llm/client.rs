@@ -278,7 +278,12 @@ mod tests {
         let (url, seen) = serve(vec![busy, ok]);
         let c = HttpClient::new("p", url, Some("sk-test".into()), 2).with_session_header(Some("x-session".into()));
         let mut streamed = String::new();
-        let (msg, usage, cut) = complete(&c, &req(), &CancelToken::new(), &|| {}, |t| streamed.push_str(t)).unwrap();
+        let (msg, usage, cut) = complete(&c, &req(), &CancelToken::new(), &|| {}, |t, r| {
+            if !r {
+                streamed.push_str(t)
+            }
+        })
+        .unwrap();
         assert_eq!((msg.text(), streamed.as_str(), usage.prompt_tokens, cut), ("Hello", "Hello", 5, false));
         let heads = seen.lock().unwrap();
         assert_eq!(heads.len(), 2, "retried once after the 429");
@@ -291,7 +296,7 @@ mod tests {
         let bad = "HTTP/1.1 400 Bad Request\r\nContent-Length: 13\r\n\r\nunknown model".to_string();
         let (url, seen) = serve(vec![bad]);
         let c = HttpClient::new("p", url, None, 1);
-        let err = complete(&c, &req(), &CancelToken::new(), &|| {}, |_| {}).unwrap_err().to_string();
+        let err = complete(&c, &req(), &CancelToken::new(), &|| {}, |_, _| {}).unwrap_err().to_string();
         assert!(err.contains("400") && err.contains("unknown model"), "{err}");
         assert_eq!(seen.lock().unwrap().len(), 1);
     }
@@ -303,7 +308,7 @@ mod tests {
         let refs: Vec<&str> = spam.iter().map(String::as_str).chain(["[DONE]"]).collect();
         let (url, _) = serve(vec![sse(&refs)]);
         let c = HttpClient::new("p", url, None, 1);
-        let (msg, usage, cut) = complete(&c, &req(), &CancelToken::new(), &|| {}, |_| {}).unwrap();
+        let (msg, usage, cut) = complete(&c, &req(), &CancelToken::new(), &|| {}, |_, _| {}).unwrap();
         assert!(cut && msg.text().contains("cut by the supervisor") && msg.text().len() < 600);
         assert!(usage.completion_tokens > 0, "estimated for the budget");
     }

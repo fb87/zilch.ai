@@ -36,8 +36,7 @@ fn model_server(reply: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
                 let mut body = vec![0; len];
                 r.read_exact(&mut body).unwrap();
                 log.lock().unwrap().push(String::from_utf8_lossy(&body).into_owned());
-                let chunk =
-                    serde_json::json!({"choices":[{"delta":{"content": reply}}],"usage":{"prompt_tokens":10,"completion_tokens":3}});
+                let chunk = serde_json::json!({"choices":[{"delta":{"reasoning_content": "Thinking it over.\n", "content": reply}}],"usage":{"prompt_tokens":10,"completion_tokens":3}});
                 let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -189,4 +188,17 @@ fn p_with_a_new_session_name_creates_it_for_this_directory() {
     assert!(text(&env.run(ws.path(), &["ls"])).contains("fresh"));
     let _ = env.run(ws.path(), &["daemon", "stop"]);
     let _ = daemon.wait();
+}
+
+#[test]
+fn verbose_shows_the_models_streamed_reasoning_and_text_quiet_does_not() {
+    let (url, _) = model_server("The answer is 42.");
+    let env = Env::new(&url);
+    let ws = tempfile::tempdir().unwrap();
+    let quiet = text(&env.run(ws.path(), &["-p", "what is it?", "--no-log", "--no-session"]));
+    assert!(quiet.contains("The answer is 42.") && !quiet.contains('┊') && !quiet.contains("│ The answer"), "{quiet}");
+    let verbose = text(&env.run(ws.path(), &["-p", "what is it?", "--no-log", "--no-session", "-v"]));
+    assert!(verbose.contains("1 ┊ Thinking it over."), "the reasoning, per process: {verbose}");
+    assert!(verbose.contains("1 │ The answer is 42."), "the reply text as it streamed: {verbose}");
+    assert!(verbose.contains("▸ llm "), "model calls too: {verbose}");
 }

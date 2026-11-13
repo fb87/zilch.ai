@@ -15,6 +15,7 @@ pub const COMMANDS: &[&str] = &[
     "/models",
     "/prompt",
     "/ps",
+    "/quiet",
     "/quit",
     "/recap",
     "/redraw",
@@ -22,6 +23,7 @@ pub const COMMANDS: &[&str] = &[
     "/spec",
     "/status",
     "/usage",
+    "/verbose",
 ];
 
 /// What completion can offer besides the fixed words.
