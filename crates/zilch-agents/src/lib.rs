@@ -435,6 +435,8 @@ pub struct Book {
     pub profiles: Vec<SubagentProfile>,
     /// Read-only tools for explorers (empty = no explorers).
     pub explorer_tools: Vec<ToolSpec>,
+    /// The explorers' own model settings (`[roles.explorer]`); None: the developers'.
+    pub explorer: Option<SharedBinding>,
     sessions: AtomicU64,
 }
 
@@ -464,6 +466,7 @@ impl Book {
             prompts: Default::default(),
             profiles: vec![],
             explorer_tools: vec![],
+            explorer: None,
             sessions: AtomicU64::new(1),
         }
     }
@@ -586,7 +589,7 @@ impl Recipes for Book {
                 self.explorer_tools.clone(),
                 self.session(ticket, Group::Development),
             )
-            .with_shared_binding(self.developer.clone()),
+            .with_shared_binding(self.explorer.clone().unwrap_or_else(|| self.developer.clone())),
         ))
     }
 
