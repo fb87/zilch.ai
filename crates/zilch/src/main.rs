@@ -124,6 +124,8 @@ struct View {
     verbose: std::sync::atomic::AtomicBool,
     /// Streamed text not yet shown, per process: (is reasoning, the unfinished line).
     streams: Mutex<HashMap<Pid, (bool, String)>>,
+    /// Per process: the markdown state of its streamed reply (inside a code block, a table …).
+    md: Mutex<HashMap<Pid, markdown::Markdown>>,
     /// The workspace as models may spell it (canonical, and as given); paths below it are shown
     /// relative to it.
     workspace: Vec<String>,
@@ -247,17 +249,31 @@ impl View {
     fn set_verbose(&self, on: bool) {
         self.verbose.store(on, std::sync::atomic::Ordering::Relaxed);
         self.streams.lock().unwrap().clear();
+        self.md.lock().unwrap().clear();
         self.steps.lock().unwrap().clear();
     }
 
-    /// One streamed line of a process: `┊` (dim) for reasoning, `│` for reply text.
+    /// One streamed line of a process: `┊` (dim, as written) for reasoning, `│` for reply text,
+    /// which is markdown: rendered line by line on a terminal (a table comes out once it ends).
     fn stream_line(&self, pid: Pid, reasoning: bool, line: &str) -> Option<String> {
         let line = line.trim_end();
-        if line.trim().is_empty() {
-            return None;
-        }
         let (d, r) = (self.c(DIM), self.c(RESET));
-        Some(if reasoning { format!("    {d}{pid} ┊ {line}{r}") } else { format!("    {d}{pid} │{r} {line}") })
+        if reasoning || !self.color {
+            if line.trim().is_empty() {
+                return None;
+            }
+            return Some(if reasoning { format!("    {d}{pid} ┊ {line}{r}") } else { format!("    {d}{pid} │{r} {line}") });
+        }
+        let width = terminal_width().saturating_sub(8 + pid.to_string().len()).max(20);
+        let rows = self.md.lock().unwrap().entry(pid).or_insert_with(|| markdown::Markdown::new(true)).line(line, width)?;
+        self.md_rows(pid, &rows)
+    }
+
+    /// Rendered markdown rows under a process's `│`.
+    fn md_rows(&self, pid: Pid, rows: &str) -> Option<String> {
+        let (d, r) = (self.c(DIM), self.c(RESET));
+        let rows: Vec<String> = rows.split('\n').filter(|l| !l.trim().is_empty()).map(|l| format!("    {d}{pid} │{r} {l}")).collect();
+        (!rows.is_empty()).then(|| rows.join("\n"))
     }
 
     /// Streamed text of one process: whole lines come out at once, the rest waits for more (or
@@ -283,7 +299,14 @@ impl View {
     /// What is left of a process's stream when its model call ends.
     fn flush_stream(&self, pid: Pid) -> Option<String> {
         let (kind, buf) = self.streams.lock().unwrap().remove(&pid)?;
-        self.stream_line(pid, kind, &buf)
+        let last = self.stream_line(pid, kind, &buf);
+        // A table still being collected ends with the reply.
+        let width = terminal_width().saturating_sub(8 + pid.to_string().len()).max(20);
+        let table = self.md.lock().unwrap().remove(&pid).and_then(|mut m| m.finish(width)).and_then(|t| self.md_rows(pid, &t));
+        match (last, table) {
+            (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+            (a, b) => a.or(b),
+        }
     }
 
     /// The oldest plan waiting for an answer.
@@ -600,7 +623,10 @@ impl View {
                     return None; // the served ticket shows its report
                 }
                 let mark = if *ok && zilch_kernel::report_ok(report) { format!("{g}✓{r}") } else { format!("{red}✗{r}") };
-                format!("  {mark} {pid} {title}{d}: {}{r}", first(report, 160))
+                // The report is markdown: its first line with inline markup rendered (code, bold).
+                let line = first(report, 160);
+                let line = if self.color { markdown::inline(&line) } else { line };
+                format!("  {mark} {pid} {title}{d}:{r} {line}")
             }
             KernelEvent::TicketServed { ticket, ok, summary } => {
                 self.open.lock().unwrap().remove(ticket);

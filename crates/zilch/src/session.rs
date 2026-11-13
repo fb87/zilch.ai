@@ -283,6 +283,7 @@ impl Session {
             color: opts.color,
             verbose: opts.verbose.into(),
             streams: Mutex::default(),
+            md: Mutex::default(),
             workspace: {
                 let mut w = vec![cwd.display().to_string()];
                 let given = std::path::absolute(&opts.workspace).unwrap_or_else(|_| opts.workspace.clone()).display().to_string();
