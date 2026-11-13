@@ -55,6 +55,10 @@ jobs:
           name="zilch-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/zilch" "dist/$name/"
+          # [profile.release] strip = true; `file` reports it for ELF only.
+          case "${{ matrix.target }}" in
+            *linux*) file "dist/$name/zilch" | grep -q ', stripped' || { echo "::error::zilch is not stripped"; exit 1; } ;;
+          esac
           cp README.md "dist/$name/"
           cp -r examples "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
