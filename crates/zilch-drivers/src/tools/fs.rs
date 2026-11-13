@@ -18,7 +18,7 @@ impl Tool for ReadFile {
     }
     fn description(&self) -> String {
         "Read a text file as numbered lines; offset/limit (1-based) for a range. Over 1500 lines without a range: its \
-         outline (definitions with line numbers) and first lines, where the file type has one. Re-reading unchanged lines you have: a short note."
+         outline (definitions with line numbers) and first lines, where the file type has one; asked again, the text. Re-reading unchanged lines you have: a short note."
             .into()
     }
     fn schema(&self) -> Value {
@@ -32,6 +32,7 @@ impl Tool for ReadFile {
         args.get("path").and_then(Value::as_str).unwrap_or("?").to_string()
     }
     fn call(&self, args: Value, ctx: &ToolCtx) -> Result<String> {
+        let args = inline_range(args);
         let path = ctx.resolve_checked(arg_str(&args, "path")?, false)?;
         let bytes = std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
         ctx.read_hashes.lock().unwrap().insert(path.clone(), sha256(&bytes));
@@ -69,8 +70,11 @@ impl Tool for ReadFile {
 
         // A long file read whole: its shape first, so the agent reads only the ranges it needs. Without
         // an outline (a file type the map does not know) that would be 40 lines and a guess, so it is
-        // read like any other file.
-        let outline = if !explicit && total > OUTLINE_OVER {
+        // read like any other file. Only the first time: an agent that already has part of this file
+        // (its outline, say) and asks for it whole again wants the text, and a second outline would
+        // only send it round in circles.
+        let seen = ctx.shown.lock().unwrap().get(&path).is_some_and(|(h, _)| *h == hash);
+        let outline = if !explicit && !seen && total > OUTLINE_OVER {
             crate::repomap::outline(&shown_path, &text).filter(|items| !items.is_empty())
         } else {
             None
@@ -119,6 +123,34 @@ impl Tool for ReadFile {
         }
         Ok(out)
     }
+}
+
+/// Models sometimes write the range into the path (`src/lib.rs" offset=600 limit=400`), which names no
+/// file. Take such trailing `offset=`/`limit=` words out of the path and use them as the arguments
+/// they meant to be (unless those arguments were given too).
+fn inline_range(mut args: Value) -> Value {
+    let Some(raw) = args.get("path").and_then(Value::as_str).map(str::to_owned) else { return args };
+    let mut words: Vec<&str> = raw.split_whitespace().collect();
+    let mut found: Vec<(&str, u64)> = vec![];
+    while let Some((key, n)) = words.last().and_then(|w| w.split_once('=')) {
+        let n = n.trim_matches(|c| c == '"' || c == '\'' || c == ',');
+        match (key, n.parse::<u64>()) {
+            ("offset" | "limit", Ok(n)) => found.push((key, n)),
+            _ => break,
+        }
+        words.pop();
+    }
+    if found.is_empty() || words.is_empty() {
+        return args;
+    }
+    let path = words.join(" ").trim_matches(|c| c == '"' || c == '\'' || c == ',').to_string();
+    args["path"] = json!(path);
+    for (key, n) in found {
+        if args.get(key).is_none_or(Value::is_null) {
+            args[key] = json!(n);
+        }
+    }
+    args
 }
 
 pub struct WriteFile;
@@ -313,6 +345,36 @@ mod read_tests {
         assert!(part.contains("   300\tpub fn f298() {}") && part.contains("[lines 300-301 of 1601; the rest: offset=302."), "{part}");
         let all = ReadFile.call(json!({"path":"big.rs","offset":1,"limit":1601}), &c).unwrap();
         assert!(all.contains("  1601\tpub fn f1599() {}"));
+    }
+
+    #[test]
+    fn asking_for_a_long_file_whole_again_gets_its_text_not_the_outline_again() {
+        // Seen in a run: the agent asked for a 2000-line file whole, got the outline, asked again,
+        // got the outline again, … until the loop guard restarted it and its context was lost.
+        let dir = tempfile::tempdir().unwrap();
+        let src: String = (0..1600).map(|i| format!("pub fn f{i}() {{}}\n")).collect();
+        std::fs::write(dir.path().join("big.rs"), &src).unwrap();
+        let c = ctx(dir.path());
+        assert!(ReadFile.call(json!({"path":"big.rs"}), &c).unwrap().contains("Definitions"));
+        let again = ReadFile.call(json!({"path":"big.rs"}), &c).unwrap();
+        assert!(!again.contains("Definitions") && again.contains("  1600\tpub fn f1599() {}"), "{}", &again[..200]);
+        // A changed file, or a fresh context, starts with the outline again.
+        std::fs::write(dir.path().join("big.rs"), format!("{src}pub fn last() {{}}\n")).unwrap();
+        assert!(ReadFile.call(json!({"path":"big.rs"}), &c).unwrap().contains("Definitions"));
+    }
+
+    #[test]
+    fn a_range_written_into_the_path_is_used_as_the_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let src: String = (1..=50).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(dir.path().join("a.txt"), &src).unwrap();
+        let c = ctx(dir.path());
+        let out = ReadFile.call(json!({"path":"a.txt\" offset=30 limit=2"}), &c).unwrap();
+        assert!(out.contains("    30\tline 30") && out.contains("    31\tline 31") && !out.contains("line 32\n"), "{out}");
+        // Given twice, the real argument wins; a plain path is left alone.
+        let out = ReadFile.call(json!({"path":"a.txt offset=10","offset":40,"limit":1}), &c).unwrap();
+        assert!(out.contains("    40\tline 40"), "{out}");
+        assert_eq!(inline_range(json!({"path":"my file.txt"})), json!({"path":"my file.txt"}));
     }
 
     #[test]
