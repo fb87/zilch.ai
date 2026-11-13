@@ -59,7 +59,7 @@ jobs:
           case "${{ matrix.target }}" in
             *linux*) file "dist/$name/zilch" | grep -q ', stripped' || { echo "::error::zilch is not stripped"; exit 1; } ;;
           esac
-          cp README.md "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
           cp -r examples "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
