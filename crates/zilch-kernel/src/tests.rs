@@ -1262,6 +1262,47 @@ fn only_the_main_agent_dispatches_and_only_known_subagents() {
 }
 
 #[test]
+fn an_answerer_that_keeps_reading_is_told_to_answer() {
+    struct Main;
+    impl Agent for Main {
+        fn step(&mut self, _: &AcbView, wake: Vec<SyscallResult>) -> StepResult {
+            match wake.first().map(SyscallResult::text) {
+                Some(t) if !t.contains("Order #") => StepResult::Syscalls(vec![Syscall::Serve { summary: t }]),
+                _ => StepResult::Syscalls(vec![Syscall::Dispatch { agent: "answer".into(), brief: "analyze it".into() }]),
+            }
+        }
+    }
+    struct B;
+    impl Recipes for B {
+        fn architect(&self, _: TicketId, _: &str) -> Box<dyn Agent> {
+            Box::new(Main)
+        }
+        fn developer(&self, _: TicketId, _: &PlanTask, _: &str) -> Box<dyn Agent> {
+            unreachable!("no plan here")
+        }
+        fn subagent(&self, _: TicketId, _: &str, _: &str) -> Option<Box<dyn Agent>> {
+            // Reads forever (a model call, then a tool) until the supervisor says to answer.
+            Some(Box::new(Scripted(0, |n, _, view: &AcbView| {
+                if let Some(note) = view.notes.iter().find(|x| x.contains("Answer now")) {
+                    return StepResult::Exit(ExitStatus::ok(format!("answered after: {note}")));
+                }
+                match n % 2 {
+                    1 => StepResult::Syscalls(vec![llm_call()]),
+                    _ => StepResult::Syscalls(vec![tool("read", json!({"n": n}))]),
+                }
+            })))
+        }
+    }
+    let bus = Arc::new(EventBus::new());
+    let events = bus.subscribe(10_000);
+    let k = start(KernelConfig { loop_limit: 0, ..cfg() }, Arc::new(FakeDrivers::default()), Arc::new(B), bus);
+    let mut run = Run { k, events, seen: vec![] };
+    run.k.send(Cmd::Order("analyze".into()));
+    let (ok, summary) = run.served();
+    assert!(ok && summary.contains("You have made 10 model calls on this question"), "{summary}");
+}
+
+#[test]
 fn a_repeated_dispatch_in_one_step_runs_once() {
     // The model asks twice in one step: the first dispatch runs, the second is refused.
     struct Main;

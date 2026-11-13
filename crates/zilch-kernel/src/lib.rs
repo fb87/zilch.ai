@@ -366,6 +366,8 @@ struct Acb {
     order_steps: u32,
     /// The agent was told its budget is used up and must wrap up (it then has a short grace).
     budget_warned: bool,
+    /// An answerer was told it has read enough and should answer (ANSWER_NUDGE_CALLS).
+    answer_nudged: bool,
     /// Model calls granted beyond the base budget because the task was still making progress.
     granted: u32,
     /// Progress since the last budget check: tool results new to this task, successful writes, and
@@ -425,6 +427,9 @@ const MAX_FOLLOW_UPS: u32 = 2;
 /// per order.
 const MAX_EXPLORE_LEVELS: u32 = 3;
 const MAX_EXPLORERS: u32 = 16;
+/// An answerer that has made this many model calls is told to answer from what it has read: a
+/// question rarely needs more, and every further call resends its whole, growing conversation.
+const ANSWER_NUDGE_CALLS: u32 = 10;
 
 /// An exploration in progress: (the asker's batch, its parked slot, the questions, the reports).
 type Exploration = (u64, usize, Vec<String>, Vec<Option<String>>);
@@ -996,6 +1001,7 @@ impl Kernel {
                 calls: 0,
                 order_steps: 0,
                 budget_warned: false,
+                answer_nudged: false,
                 granted: 0,
                 fresh: 0,
                 writes: 0,
@@ -1082,6 +1088,20 @@ impl Kernel {
     }
 
     fn within_budget(&mut self, pid: Pid) -> bool {
+        let answerer = self.dispatched.get(&pid).is_some_and(|(_, _, agent)| agent == "answer");
+        if let Some(a) = self.acbs.get_mut(&pid).filter(|a| answerer && a.calls >= ANSWER_NUDGE_CALLS && !a.answer_nudged) {
+            a.answer_nudged = true;
+            a.notes.push(format!(
+                "[supervisor] You have made {} model calls on this question. Answer now from what you have already read; read \
+                 more only if one specific fact the answer cannot do without is still missing.",
+                a.calls
+            ));
+            self.bus.publish(KernelEvent::Signal {
+                pid,
+                signal: Signal::Warn,
+                reason: format!("{} model calls on one question — asked to answer from what it has", a.calls),
+            });
+        }
         // Out of model calls: first ask the agent to wrap up and report (its work is kept and the
         // main agent can continue from the report — cheaper than killing it and redoing the task);
         // stop it only if it is still going after a short grace.
