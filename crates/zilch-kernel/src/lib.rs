@@ -415,6 +415,8 @@ struct Ticket {
     /// Exploration levels (explore calls) and explorers this order has used.
     explore_levels: u32,
     explorers_used: u32,
+    /// Subagents the main agent dispatched for this order (at most MAX_DISPATCHES).
+    dispatches: u32,
     served: bool,
 }
 
@@ -425,6 +427,9 @@ const MAX_FOLLOW_UPS: u32 = 2;
 /// per order.
 const MAX_EXPLORE_LEVELS: u32 = 3;
 const MAX_EXPLORERS: u32 = 16;
+/// Subagents one order may dispatch (an answer, a follow-up, a plan …): a main agent unhappy
+/// with a report may otherwise start doing the work itself in many tiny dispatches.
+const MAX_DISPATCHES: u32 = 3;
 
 /// An exploration in progress: (the asker's batch, its parked slot, the questions, the reports).
 type Exploration = (u64, usize, Vec<String>, Vec<Option<String>>);
@@ -784,7 +789,17 @@ impl Kernel {
             Some(main) => {
                 self.tickets.insert(
                     ticket,
-                    Ticket { root: main, lane, cancel, plan: None, follow_ups: 0, explore_levels: 0, explorers_used: 0, served: false },
+                    Ticket {
+                        root: main,
+                        lane,
+                        cancel,
+                        plan: None,
+                        follow_ups: 0,
+                        explore_levels: 0,
+                        explorers_used: 0,
+                        dispatches: 0,
+                        served: false,
+                    },
                 );
                 self.pending_orders.push_back((ticket, lane, text));
                 self.feed_main(lane);
@@ -805,6 +820,7 @@ impl Kernel {
                                     follow_ups: 0,
                                     explore_levels: 0,
                                     explorers_used: 0,
+                                    dispatches: 0,
                                     served: false,
                                 },
                             );
@@ -823,7 +839,17 @@ impl Kernel {
                 let main = self.spawn(agent, None, ticket, lane, title.into(), caps, session, 0);
                 self.tickets.insert(
                     ticket,
-                    Ticket { root: main, lane, cancel, plan: None, follow_ups: 0, explore_levels: 0, explorers_used: 0, served: false },
+                    Ticket {
+                        root: main,
+                        lane,
+                        cancel,
+                        plan: None,
+                        follow_ups: 0,
+                        explore_levels: 0,
+                        explorers_used: 0,
+                        dispatches: 0,
+                        served: false,
+                    },
                 );
                 self.mains.insert(lane, main);
             }
@@ -1617,6 +1643,17 @@ impl Kernel {
             return self.fill(pid, batch, idx, SyscallResult::Failed("the brief is empty: say what the subagent should do".into()));
         }
         let ticket = self.acbs.get(&pid).map(|a| a.ticket).unwrap_or_default();
+        if self.tickets.get(&ticket).is_some_and(|t| t.dispatches >= MAX_DISPATCHES) {
+            return self.fill(
+                pid,
+                batch,
+                idx,
+                SyscallResult::Failed(format!(
+                    "no more subagents for this order ({MAX_DISPATCHES} already ran): reply to the guest from the reports you have, \
+                     and say what is still open"
+                )),
+            );
+        }
         let Some(sub) = self.recipes.subagent(ticket, &agent, &brief) else {
             return self.fill(pid, batch, idx, SyscallResult::Failed(format!("no subagent '{agent}': use \"answer\" or \"plan\"")));
         };
@@ -1626,6 +1663,9 @@ impl Kernel {
         let title = format!("{agent}: {}", brief.lines().next().unwrap_or("").chars().take(50).collect::<String>());
         let child = self.spawn(sub, Some(pid), ticket, Group::Development, title, caps, cancel.child(), 0);
         self.dispatched.insert(child, (pid, batch, agent));
+        if let Some(t) = self.tickets.get_mut(&ticket) {
+            t.dispatches += 1;
+        }
         if let Some(a) = self.acbs.get_mut(&pid) {
             a.parked_slot = Some(idx);
         }
