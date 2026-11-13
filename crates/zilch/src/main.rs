@@ -5,6 +5,7 @@
 mod completion;
 mod costs;
 mod daemon;
+mod debug;
 mod front;
 mod ipc;
 mod markdown;
@@ -80,6 +81,11 @@ struct Cli {
     /// reasoning (/verbose, /quiet switch while running).
     #[arg(short, long, global = true)]
     verbose: bool,
+    /// Start in debug mode: verbose, plus timings and sizes of every model and tool call (time to
+    /// first token, tokens, cost, output size, zilch's own overhead) and a breakdown per order
+    /// (/debug switches while running).
+    #[arg(long, global = true)]
+    debug: bool,
     /// With -p: the order goes to this daemon session (created for this directory if missing).
     #[arg(long, value_name = "ID", global = true)]
     session: Option<String>,
@@ -155,6 +161,9 @@ struct View {
     tickets_of: Mutex<HashMap<Pid, TicketId>>,
     /// Per order: when it was placed, and its model requests, tokens and cost so far.
     order_stats: Mutex<HashMap<TicketId, OrderStats>>,
+    /// `--debug` / `/debug`: timings and sizes of every call, and a breakdown per order.
+    debug: std::sync::atomic::AtomicBool,
+    probe: debug::Probe,
     /// Between orders: since when, and what the main agent's last wake-up did.
     idle: Mutex<Idle>,
     /// Quiet mode: each process.s tool calls of the current step, shown as one line when done.
@@ -239,6 +248,35 @@ impl View {
     /// paths outside it stay absolute.
     fn rel(&self, text: &str) -> String {
         rel_to(&self.workspace, text)
+    }
+
+    /// The order a process works for: a subagent's own, or the open order of a resident agent's
+    /// lane (none between orders: idle housekeeping counts for the session only).
+    fn ticket_for(&self, pid: Pid) -> Option<TicketId> {
+        self.tickets_of.lock().unwrap().get(&pid).copied().or_else(|| {
+            let lane = self.procs.lock().unwrap().get(&pid).map(|(g, _)| *g)?;
+            let lanes = self.lanes_of.lock().unwrap();
+            self.open.lock().unwrap().iter().filter(|t| lanes.get(t) == Some(&lane)).max().copied()
+        })
+    }
+
+    /// A process as the debug breakdown names it: `main`, `spec`, `2 answer`, `5 [T1]`.
+    fn label(&self, pid: Pid) -> String {
+        match self.procs.lock().unwrap().get(&pid) {
+            Some((Group::Architecture, _)) => "main".into(),
+            Some((Group::Spec, _)) => "spec".into(),
+            Some((_, title)) => format!("{pid} {}", title.split([':', ' ']).next().unwrap_or("")),
+            None => pid.to_string(),
+        }
+    }
+
+    fn debug(&self) -> bool {
+        self.debug.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `/debug` on or off (on implies verbose; `/quiet` and `/verbose` switch it off).
+    fn set_debug(&self, on: bool) {
+        self.debug.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn verbose(&self) -> bool {
@@ -380,6 +418,20 @@ impl View {
             }
             _ => {}
         }
+        // Measure for --debug (always: /debug switched on mid-order still gets the whole order).
+        match ev {
+            KernelEvent::TicketOpened { ticket, .. } => self.probe.order_opened(*ticket),
+            KernelEvent::SyscallIssued { pid, idx, summary } => {
+                self.probe.issued(*pid, *idx, summary, self.ticket_for(*pid), self.debug());
+            }
+            KernelEvent::TextDelta { pid, .. } => self.probe.token(*pid),
+            KernelEvent::SyscallDone { pid, idx, summary, result, .. } => {
+                let who = self.label(*pid);
+                let at = debug::At { who: &who, ticket: self.ticket_for(*pid), keep: self.debug() };
+                self.probe.done(*pid, *idx, summary, result.text().chars().count(), at)
+            }
+            _ => {}
+        }
         if let KernelEvent::Usage { pid, model, prompt_tokens, completion_tokens, cached_tokens } = ev {
             let group = self.procs.lock().unwrap().get(pid).map(|(g, _)| *g);
             let who = match group {
@@ -390,14 +442,8 @@ impl View {
             let u =
                 zilch_ipc::Usage { prompt_tokens: *prompt_tokens, completion_tokens: *completion_tokens, cached_tokens: *cached_tokens };
             self.costs.record(who, model, u);
-            // The order it was for: a subagent's own, or the open order of a resident agent's lane
-            // (none between orders: idle housekeeping counts for the session only).
-            let ticket = self.tickets_of.lock().unwrap().get(pid).copied().or_else(|| {
-                let lane = group?;
-                let lanes = self.lanes_of.lock().unwrap();
-                self.open.lock().unwrap().iter().filter(|t| lanes.get(t) == Some(&lane)).max().copied()
-            });
-            if let Some(t) = ticket {
+            self.probe.usage(*pid, u, self.costs.price(model, &u));
+            if let Some(t) = self.ticket_for(*pid) {
                 let price = self.costs.price(model, &u);
                 if let Some(s) = self.order_stats.lock().unwrap().get_mut(&t) {
                     s.requests += 1;
@@ -554,6 +600,11 @@ impl View {
                     _ => format!("  {cy}+{r} {pid} {} {b}{title}{r}", group.name()),
                 }
             }
+            KernelEvent::SyscallIssued { pid, idx, summary } if self.debug() && summary != "recv" => {
+                // How long zilch took since this process's previous results came back.
+                let gap = self.probe.gap(*pid, *idx).map(|g| format!(" (+{} after its results)", debug::ms(g))).unwrap_or_default();
+                format!("    {d}{pid} ▸ {}{gap}{r}", self.rel(summary))
+            }
             KernelEvent::SyscallIssued { pid, summary, .. } => {
                 // A resident agent waiting for its next order (also after an idle wake) is never
                 // news; model calls are only in /verbose.
@@ -591,14 +642,16 @@ impl View {
                     (a, b) => a.or(b)?,
                 }
             }
-            KernelEvent::SyscallDone { pid, ok: false, summary, result, .. } => {
-                format!("    {red}{pid} ✗ {}{r}{d}: {}{r}", self.rel(summary), first(&result.text(), 200))
+            KernelEvent::SyscallDone { pid, idx, ok: false, summary, result } => {
+                let dbg = self.probe.note(*pid, *idx).map(|n| format!(" · {n}")).unwrap_or_default();
+                format!("    {red}{pid} ✗ {}{r}{d}{dbg}: {}{r}", self.rel(summary), first(&result.text(), 200))
             }
-            KernelEvent::SyscallDone { pid, summary, result, .. } if self.verbose() => {
+            KernelEvent::SyscallDone { pid, idx, summary, result, .. } if self.verbose() => {
                 let text = result.text();
+                let dbg = self.probe.note(*pid, *idx).map(|n| format!(" · {n}")).unwrap_or_default();
                 let head = match result_note(summary, &text) {
-                    Some(note) => format!("    {d}{pid} ✓ {} → {note}{r}", self.rel(summary)),
-                    None => format!("    {d}{pid} ✓ {}{r}", self.rel(summary)),
+                    Some(note) => format!("    {d}{pid} ✓ {} → {note}{dbg}{r}", self.rel(summary)),
+                    None => format!("    {d}{pid} ✓ {}{dbg}{r}", self.rel(summary)),
                 };
                 // A tool's output under its line (model replies stream; reports have their own line).
                 let tool = !(summary.starts_with("llm ") || ["dispatch", "explore", "submit_plan"].iter().any(|p| summary.starts_with(p)));
@@ -638,13 +691,20 @@ impl View {
                 let width = terminal_width().saturating_sub(2).max(20);
                 let body = markdown::Markdown::new(self.color).with_indent(2).text(summary.trim(), width);
                 let mark = if self.lanes_of.lock().unwrap().get(ticket) == Some(&Group::Spec) { "spec " } else { "" };
-                let stats = self.order_stats.lock().unwrap().remove(ticket).map(|s| format!(" · {}", s.line())).unwrap_or_default();
+                let stats = self.order_stats.lock().unwrap().remove(ticket);
+                let wall = stats.as_ref().and_then(|s| s.started).map(|s| s.elapsed()).unwrap_or_default();
+                let stats = stats.map(|s| format!(" · {}", s.line())).unwrap_or_default();
                 let end = if *ok {
                     format!("{g}── {mark}order #{ticket} served{stats} ──{r}")
                 } else {
                     format!("{red}── {mark}order #{ticket} not served{stats} ──{r}")
                 };
-                format!("{body}\n{end}")
+                // --debug: where the order's time and tokens went.
+                let report = self.probe.order_report(*ticket, wall);
+                match report.filter(|_| self.debug()) {
+                    Some(rep) => format!("{body}\n{end}\n{}", rep.lines().map(|l| format!("{d}{l}{r}")).collect::<Vec<_>>().join("\n")),
+                    None => format!("{body}\n{end}"),
+                }
             }
             KernelEvent::Notice { text, .. } => format!("  {d}{text}{r}"),
             KernelEvent::Lagged { missed } => format!("  {d}(display missed {missed} events; the log has them){r}"),
@@ -768,6 +828,7 @@ Type an order to place it. While a plan waits for you: y approves, n rejects, an
 /about       version, repository, workspace, session file, config files
 /redraw      clear the screen and re-render the last answer at the current width
 /verbose     also show model calls, results and the models' streamed text and reasoning
+/debug       verbose plus timings, tokens, cost and sizes per call, and a breakdown per order
 /quiet       back to the short log (the default): one line per step, e.g. read 2 files, edited a.rs +3 -1
 /help        this help
 /exit        quit (Ctrl-D)
@@ -1016,7 +1077,8 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         r#continue: cli.r#continue,
         resume: cli.resume.clone(),
         no_session: cli.no_session,
-        verbose: cli.verbose,
+        verbose: cli.verbose || cli.debug,
+        debug: cli.debug,
         color,
         editor_link,
     };

@@ -8,6 +8,7 @@ pub const COMMANDS: &[&str] = &[
     "/cancel",
     "/clear",
     "/code",
+    "/debug",
     "/exit",
     "/help",
     "/kill",

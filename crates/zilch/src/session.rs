@@ -36,6 +36,9 @@ pub struct SessionOpts {
     pub resume: Option<String>,
     pub no_session: bool,
     pub verbose: bool,
+    /// Timings, sizes and a per-order breakdown on top of verbose (`--debug`, `/debug`).
+    #[serde(default)]
+    pub debug: bool,
     /// ANSI colours in the rendered output.
     pub color: bool,
     /// Serve the editor link for this workspace.
@@ -281,7 +284,9 @@ impl Session {
         };
         let view = Arc::new(View {
             color: opts.color,
-            verbose: opts.verbose.into(),
+            verbose: (opts.verbose || opts.debug).into(),
+            debug: opts.debug.into(),
+            probe: Default::default(),
             streams: Mutex::default(),
             md: Mutex::default(),
             workspace: {
@@ -562,8 +567,17 @@ impl Session {
         let (cmd, arg) = input.split_once(' ').map(|(c, a)| (c, a.trim())).unwrap_or((input, ""));
         match cmd {
             "/help" => say!("{HELP}"),
+            "/debug" => {
+                view.set_verbose(true);
+                view.set_debug(true);
+                say!(
+                    "Debug: verbose, plus per call its time (time to first token, tok/s), tokens, cost and output size, zilch's \
+                     own time before each model call, and a breakdown per order. /verbose or /quiet switches back."
+                );
+            }
             "/verbose" | "/quiet" => {
                 view.set_verbose(cmd == "/verbose");
+                view.set_debug(false);
                 say!(
                     "{}",
                     if cmd == "/verbose" {
