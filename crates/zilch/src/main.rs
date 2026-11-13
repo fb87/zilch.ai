@@ -78,7 +78,8 @@ struct Cli {
     /// Show the resolved setup and ping every model, then exit.
     #[arg(long, global = true)]
     doctor: bool,
-    /// Show every model call and syscall result.
+    /// Start verbose: every model call and syscall result, and the models' streamed text and
+    /// reasoning (/verbose, /quiet switch while running).
     #[arg(short, long, global = true)]
     verbose: bool,
     /// With -p: the order goes to this daemon session (created for this directory if missing).
@@ -120,7 +121,11 @@ const CYAN: &str = "\x1b[36m";
 /// Turns kernel events into lines for the guest, and remembers what the prompt needs.
 struct View {
     color: bool,
-    verbose: bool,
+    /// `/verbose` (or -v): model calls, syscall results and the models' streamed text and
+    /// reasoning too; `/quiet` switches back.
+    verbose: std::sync::atomic::AtomicBool,
+    /// Streamed text not yet shown, per process: (is reasoning, the unfinished line).
+    streams: Mutex<HashMap<Pid, (bool, String)>>,
     procs: Mutex<HashMap<Pid, (Group, String)>>,
     /// Plans waiting for the guest, oldest first: (qid, ticket).
     questions: Mutex<std::collections::VecDeque<(u64, TicketId)>>,
@@ -161,6 +166,52 @@ impl View {
         } else {
             ""
         }
+    }
+
+    fn verbose(&self) -> bool {
+        self.verbose.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `/verbose` or `/quiet`: whether the log shows everything or only what the guest needs.
+    fn set_verbose(&self, on: bool) {
+        self.verbose.store(on, std::sync::atomic::Ordering::Relaxed);
+        self.streams.lock().unwrap().clear();
+    }
+
+    /// One streamed line of a process: `┊` (dim) for reasoning, `│` for reply text.
+    fn stream_line(&self, pid: Pid, reasoning: bool, line: &str) -> Option<String> {
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            return None;
+        }
+        let (d, r) = (self.c(DIM), self.c(RESET));
+        Some(if reasoning { format!("    {d}{pid} ┊ {line}{r}") } else { format!("    {d}{pid} │{r} {line}") })
+    }
+
+    /// Streamed text of one process: whole lines come out at once, the rest waits for more (or
+    /// for the call's end), so parallel processes don't interleave mid-line.
+    fn stream(&self, pid: Pid, reasoning: bool, text: &str) -> Option<String> {
+        let mut streams = self.streams.lock().unwrap();
+        let (kind, buf) = streams.entry(pid).or_insert_with(|| (reasoning, String::new()));
+        let mut out = Vec::new();
+        if *kind != reasoning {
+            // Reasoning ended and the reply began (or the other way round): finish the line.
+            out.extend(self.stream_line(pid, *kind, buf));
+            buf.clear();
+            *kind = reasoning;
+        }
+        buf.push_str(text);
+        while let Some(i) = buf.find('\n') {
+            let line: String = buf.drain(..=i).collect();
+            out.extend(self.stream_line(pid, reasoning, &line));
+        }
+        (!out.is_empty()).then(|| out.join("\n"))
+    }
+
+    /// What is left of a process's stream when its model call ends.
+    fn flush_stream(&self, pid: Pid) -> Option<String> {
+        let (kind, buf) = self.streams.lock().unwrap().remove(&pid)?;
+        self.stream_line(pid, kind, &buf)
     }
 
     /// The oldest plan waiting for an answer.
@@ -285,6 +336,21 @@ impl View {
     }
 
     fn render(&self, ev: &KernelEvent) -> Option<String> {
+        if let KernelEvent::TextDelta { pid, text, reasoning } = ev {
+            return if self.verbose() { self.stream(*pid, *reasoning, text) } else { None };
+        }
+        // A model call ended: the rest of its stream comes before the ✓ line.
+        let rest = match ev {
+            KernelEvent::SyscallDone { pid, summary, .. } if summary.starts_with("llm ") => self.flush_stream(*pid),
+            _ => None,
+        };
+        match (rest, self.render_line(ev)) {
+            (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn render_line(&self, ev: &KernelEvent) -> Option<String> {
         let (b, d, r, g, red, y, cy) = (self.c(BOLD), self.c(DIM), self.c(RESET), self.c(GREEN), self.c(RED), self.c(YELLOW), self.c(CYAN));
         let first = |s: &str, n: usize| {
             s.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("STATUS:")).unwrap_or("").chars().take(n).collect::<String>()
@@ -309,7 +375,7 @@ impl View {
             }
             KernelEvent::SyscallIssued { pid, summary, .. } => {
                 // Model calls, and the resident agent waiting again after an idle wake, are not news.
-                if (summary.starts_with("llm ") || summary == "recv") && !self.verbose {
+                if (summary.starts_with("llm ") || summary == "recv") && !self.verbose() {
                     return None;
                 }
                 format!("    {d}{pid} ▸ {summary}{r}")
@@ -317,7 +383,7 @@ impl View {
             KernelEvent::SyscallDone { pid, ok: false, summary, result, .. } => {
                 format!("    {red}{pid} ✗ {summary}{r}{d}: {}{r}", first(&result.text(), 200))
             }
-            KernelEvent::SyscallDone { pid, summary, .. } if self.verbose => format!("    {d}{pid} ✓ {summary}{r}"),
+            KernelEvent::SyscallDone { pid, summary, .. } if self.verbose() => format!("    {d}{pid} ✓ {summary}{r}"),
             KernelEvent::Question { qid, ticket, text, command: true, .. } => {
                 self.questions.lock().unwrap().push_back((*qid, *ticket));
                 self.commands.lock().unwrap().insert(*qid, text.clone());
@@ -474,6 +540,8 @@ Type an order to place it. While a plan waits for you: y approves, n rejects, an
 /clear       start a fresh session (new main agent, empty context; the old one stays resumable)
 /about       version, repository, workspace, session file, config files
 /redraw      clear the screen and re-render the last answer at the current width
+/verbose     also show model calls, results and the models' streamed text and reasoning
+/quiet       back to the short log (the default)
 /help        this help
 /exit        quit (Ctrl-D)
 /detach      (daemon sessions, zilch attach) leave; the session keeps running · /stop ends it
@@ -864,7 +932,7 @@ fn doctor(cfg: &Config, meter: &zilch_drivers::llm::catalog::CostMeter, cwd: &st
             session: Some(format!("zilch-doctor-{}", std::process::id())),
         };
         let start = Instant::now();
-        match zilch_drivers::llm::complete(backend.as_ref(), &req, &zilch_kernel::CancelToken::new(), &|| {}, |_| {}) {
+        match zilch_drivers::llm::complete(backend.as_ref(), &req, &zilch_kernel::CancelToken::new(), &|| {}, |_, _| {}) {
             Ok((msg, _, _)) => {
                 let reply: String = msg.text().trim().chars().take(30).collect();
                 let reply = if reply.is_empty() { "(empty reply — the call works)".to_string() } else { reply };

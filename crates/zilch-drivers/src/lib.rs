@@ -236,8 +236,8 @@ impl Drivers for DriverSet {
                     ));
                 }
                 let (pid, bus) = (ctx.pid, ctx.bus);
-                match llm::complete(backend.as_ref(), &req, ctx.cancel, &*ctx.alive, |t| {
-                    bus.publish(KernelEvent::TextDelta { pid, text: t.to_string() })
+                match llm::complete(backend.as_ref(), &req, ctx.cancel, &*ctx.alive, |t, reasoning| {
+                    bus.publish(KernelEvent::TextDelta { pid, text: t.to_string(), reasoning })
                 }) {
                     Ok((message, usage, cut)) => {
                         self.meter.record(&key, &usage);

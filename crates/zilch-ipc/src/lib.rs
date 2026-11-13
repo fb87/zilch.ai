@@ -290,10 +290,13 @@ pub enum KernelEvent {
         summary: String,
         result: SyscallResult,
     },
-    /// Streamed reply text (not written to the log: the Completion result has it all).
+    /// Streamed reply text, or reasoning when `reasoning` (not written to the log: the Completion
+    /// result has it all).
     TextDelta {
         pid: Pid,
         text: String,
+        #[serde(default)]
+        reasoning: bool,
     },
     Usage {
         pid: Pid,
@@ -495,7 +498,7 @@ mod tests {
         let buf = Buf::default();
         bus.set_log(Box::new(buf.clone()));
         bus.set_tick(7);
-        bus.publish(KernelEvent::TextDelta { pid: 1, text: "x".into() });
+        bus.publish(KernelEvent::TextDelta { pid: 1, text: "x".into(), reasoning: false });
         bus.publish(KernelEvent::Exited { pid: 1, ok: true, report: "done".into() });
         let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         assert_eq!(text.lines().count(), 1);

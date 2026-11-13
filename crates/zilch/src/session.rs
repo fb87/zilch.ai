@@ -280,7 +280,8 @@ impl Session {
         };
         let view = Arc::new(View {
             color: opts.color,
-            verbose: opts.verbose,
+            verbose: opts.verbose.into(),
+            streams: Mutex::default(),
             procs: Mutex::default(),
             questions: Mutex::default(),
             commands: Mutex::default(),
@@ -544,6 +545,17 @@ impl Session {
         let (cmd, arg) = input.split_once(' ').map(|(c, a)| (c, a.trim())).unwrap_or((input, ""));
         match cmd {
             "/help" => say!("{HELP}"),
+            "/verbose" | "/quiet" => {
+                view.set_verbose(cmd == "/verbose");
+                say!(
+                    "{}",
+                    if cmd == "/verbose" {
+                        "Verbose: model calls, results, and the models' streamed text (│) and reasoning (┊). /quiet switches back."
+                    } else {
+                        "Quiet: orders, subagents, commands and answers only. /verbose shows everything."
+                    }
+                );
+            }
             "/ps" => say!("{}", ps(&self.kernel)),
             "/kill" => match arg.parse::<Pid>() {
                 Ok(pid) => self.kernel.send(Cmd::Kill(pid)),
