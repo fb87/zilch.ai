@@ -742,7 +742,7 @@ Type an order to place it. While a plan waits for you: y approves, n rejects, an
 /about       version, repository, workspace, session file, config files
 /redraw      clear the screen and re-render the last answer at the current width
 /verbose     also show model calls, results and the models' streamed text and reasoning
-/quiet       back to the short log (the default): one line per step, e.g. "read 2 files, edited a.rs +3 -1"
+/quiet       back to the short log (the default): one line per step, e.g. read 2 files, edited a.rs +3 -1
 /help        this help
 /exit        quit (Ctrl-D)
 /detach      (daemon sessions, zilch attach) leave; the session keeps running · /stop ends it
