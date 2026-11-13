@@ -1,7 +1,6 @@
 use super::{arg_bool, arg_opt_str, arg_str, Tool, ToolCtx};
 use anyhow::Result;
 use globset::Glob;
-use ignore::WalkBuilder;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
@@ -9,10 +8,7 @@ const MAX_FILES: usize = 500;
 const MAX_MATCHES: usize = 300;
 
 fn walk(root: PathBuf) -> impl Iterator<Item = PathBuf> {
-    WalkBuilder::new(root)
-        .hidden(true)
-        .git_ignore(true)
-        .require_git(false)
+    crate::repomap::walker(&root)
         .build()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
@@ -26,7 +22,7 @@ impl Tool for GlobTool {
         "glob"
     }
     fn description(&self) -> String {
-        "Find files by glob pattern (e.g. `src/**/*.rs`). Respects .gitignore.".into()
+        "Find files by glob pattern (e.g. `src/**/*.rs`). Respects .gitignore; hidden entries are skipped except CI and build config (.github, .gitlab, .cargo, …).".into()
     }
     fn schema(&self) -> Value {
         json!({"type":"object","properties":{
@@ -94,7 +90,7 @@ impl Tool for GrepTool {
         // Like ripgrep: walk in parallel, and test each whole file once (the regex engine's literal
         // prefilters make that fast) before splitting a matching file into lines.
         let found = std::sync::Mutex::new(Vec::<(String, usize, String)>::new());
-        WalkBuilder::new(&root).hidden(true).git_ignore(true).require_git(false).build_parallel().run(|| {
+        crate::repomap::walker(&root).build_parallel().run(|| {
             let (re, filter, cwd, found, alive) = (&re, &filter, &cwd, &found, &alive);
             Box::new(move |entry| {
                 let Ok(e) = entry else { return ignore::WalkState::Continue };
@@ -138,5 +134,32 @@ impl Tool for GrepTool {
             s.push_str(&format!("\n[{} more matches not shown]", total - MAX_MATCHES));
         }
         Ok(super::repeat_note(ctx, "grep", &args, &s).unwrap_or(s))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ci_config_is_found_other_hidden_entries_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = |p: &str, s: &str| {
+            let p = dir.path().join(p);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, s).unwrap();
+        };
+        w(".github/workflows/ci.yml", "run: cargo test --workspace\n");
+        w(".env", "SECRET=cargo test\n");
+        w(".zilch/config.toml", "api_key = \"cargo test\"\n");
+        w(".hidden/notes.txt", "cargo test\n");
+        w("src/main.rs", "// cargo test\n");
+        let ctx = ToolCtx::new("t", dir.path().to_path_buf());
+        let found = GlobTool.call(json!({"pattern":"**/*"}), &ctx).unwrap();
+        assert!(found.contains(".github/workflows/ci.yml") && found.contains("src/main.rs"), "{found}");
+        assert!(!found.contains(".env") && !found.contains(".zilch") && !found.contains(".hidden"), "{found}");
+        let hits = GrepTool.call(json!({"pattern":"cargo test"}), &ctx).unwrap();
+        assert!(hits.contains(".github/workflows/ci.yml") && hits.contains("src/main.rs"), "{hits}");
+        assert!(!hits.contains(".env") && !hits.contains(".zilch") && !hits.contains(".hidden"), "{hits}");
     }
 }
