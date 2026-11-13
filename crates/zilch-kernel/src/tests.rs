@@ -960,6 +960,45 @@ fn a_resident_agents_budget_is_per_order_and_a_finished_plan_can_be_followed_by_
 }
 
 #[test]
+fn an_order_runs_at_most_two_follow_up_plans() {
+    // A main agent that would plan again after every finished plan, forever.
+    struct Polisher(u32);
+    impl Agent for Polisher {
+        fn step(&mut self, _: &AcbView, wake: Vec<SyscallResult>) -> StepResult {
+            let last = wake.first().map(SyscallResult::text).unwrap_or_default();
+            if last.contains("no more plans") {
+                return StepResult::Syscalls(vec![Syscall::Serve { summary: last }]);
+            }
+            self.0 += 1;
+            StepResult::Syscalls(vec![Syscall::SubmitPlan { tasks: vec![task(&format!("T{}", self.0), &[], &["a"])] }])
+        }
+    }
+    struct B;
+    impl Recipes for B {
+        fn architect(&self, _: TicketId, _: &str) -> Box<dyn Agent> {
+            Box::new(Polisher(0))
+        }
+        fn developer(&self, _: TicketId, _: &PlanTask, _: &str) -> Box<dyn Agent> {
+            worker()(&task("w", &[], &[]))
+        }
+    }
+    let bus = Arc::new(EventBus::new());
+    let events = bus.subscribe(10_000);
+    let k = start(KernelConfig { loop_limit: 0, ..cfg() }, Arc::new(FakeDrivers::default()), Arc::new(B), bus);
+    let mut run = Run { k, events, seen: vec![] };
+    run.k.send(Cmd::Order("polish".into()));
+    let (_, ok, summary) = served_ticket(&mut run);
+    assert!(ok && summary.contains("2 follow-up plans already ran"), "{summary}");
+    // The first plan and two follow-ups were approved and run; the fourth was refused.
+    assert_eq!(run.seen.iter().filter(|e| matches!(e, KernelEvent::Question { .. })).count(), 3);
+    // The next order starts with a fresh allowance.
+    run.k.send(Cmd::Order("again".into()));
+    let (_, ok, _) = served_ticket(&mut run);
+    assert!(ok);
+    assert_eq!(run.seen.iter().filter(|e| matches!(e, KernelEvent::Question { .. })).count(), 6);
+}
+
+#[test]
 fn an_agent_out_of_budget_is_asked_to_wrap_up_and_keeps_its_work() {
     // It works with model calls until the supervisor's wrap-up note arrives, then reports.
     let dev: DevScript = Arc::new(|_| {

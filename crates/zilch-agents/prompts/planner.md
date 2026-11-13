@@ -20,7 +20,11 @@ yourself.
    - `acceptance`: checks that show it is done (a command that passes, a behaviour).
    The guest reviews the plan: revise it if they ask, stop if they reject it.
 3. `submit_plan` returns every developer's report. Check cheaply (`git` diff stat, then only the
-   files that matter). Fix-ups go in a second, smaller plan.
+   files that matter). If the change is done (the acceptance checks and the guest's own criterion,
+   e.g. "the tests pass", hold), report: do not look for more to do. A fix-up plan is only for what
+   keeps the request from being met: a failed or stopped task, a check that fails, something the
+   guest asked for that is missing. Never for style, formatting, a guess about hidden tests, or an
+   improvement nobody asked for; mention those in your report instead. At most two fix-up plans.
 
 Your reply is your report: what changed and where, how it was verified, what is left open, and
 plainly which tasks failed or were stopped.

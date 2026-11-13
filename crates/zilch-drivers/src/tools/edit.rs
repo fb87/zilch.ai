@@ -61,7 +61,23 @@ fn edit_list(args: &Value) -> Result<Vec<Edit<'_>>> {
                 Ok((s("old_string")?, s("new_string")?, arg_bool(e, "replace_all")))
             })
             .collect::<Result<_>>()?,
-        None => vec![(arg_str(args, "old_string")?, arg_str(args, "new_string")?, arg_bool(args, "replace_all"))],
+        None => {
+            let s = |k: &str| args.get(k).and_then(Value::as_str);
+            match (s("old_string"), s("new_string")) {
+                (Some(old), Some(new)) => vec![(old, new, arg_bool(args, "replace_all"))],
+                (old, new) => {
+                    let missing: Vec<&str> =
+                        [("old_string", old), ("new_string", new)].iter().filter(|(_, v)| v.is_none()).map(|(k, _)| *k).collect();
+                    let got: Vec<&str> = args.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
+                    bail!(
+                        "edit_file needs old_string and new_string (or `edits`); missing {}, got only {}. Send both \
+                         strings in the call; to rewrite the whole file, use write_file with its full content",
+                        missing.join(" and "),
+                        got.join(", ")
+                    )
+                }
+            }
+        }
     };
     for (i, (old, new, _)) in edits.iter().enumerate() {
         let at = if edits.len() > 1 { format!("edits[{i}]: ") } else { String::new() };
@@ -131,5 +147,14 @@ mod tests {
         assert_eq!(edit_list(&json!({"path":"f","old_string":"a","new_string":"b"})).unwrap(), vec![("a", "b", false)]);
         assert!(edit_list(&json!({"path":"f","edits":[{"old_string":"","new_string":"b"}]})).is_err());
         assert!(edit_list(&json!({"path":"f","edits":[{"old_string":"a","new_string":"a"}]})).is_err());
+    }
+
+    #[test]
+    fn a_call_without_the_strings_says_what_is_missing_and_offers_write_file() {
+        let err = edit_list(&json!({"path":"f","replace_all":false})).unwrap_err().to_string();
+        assert!(err.contains("missing old_string and new_string") && err.contains("got only path, replace_all"), "{err}");
+        assert!(err.contains("write_file"), "{err}");
+        let err = edit_list(&json!({"path":"f","old_string":"a"})).unwrap_err().to_string();
+        assert!(err.contains("missing new_string,"), "{err}");
     }
 }

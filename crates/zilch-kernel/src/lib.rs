@@ -411,8 +411,14 @@ struct Ticket {
     lane: Group,
     cancel: CancelToken,
     plan: Option<PlanRun>,
+    /// Follow-up plans submitted after an approved one finished (at most MAX_FOLLOW_UPS).
+    follow_ups: u32,
     served: bool,
 }
+
+/// Fix-up plans an order may run after its first plan: enough to repair what failed, not to polish
+/// forever.
+const MAX_FOLLOW_UPS: u32 = 2;
 
 /// An exploration in progress: (the asker's batch, its parked slot, the questions, the reports).
 type Exploration = (u64, usize, Vec<String>, Vec<Option<String>>);
@@ -770,7 +776,7 @@ impl Kernel {
         self.bus.publish(KernelEvent::TicketOpened { ticket, text: text.clone(), lane });
         match self.mains.get(&lane).copied().filter(|m| self.acbs.get(m).is_some_and(|a| a.state.alive())) {
             Some(main) => {
-                self.tickets.insert(ticket, Ticket { root: main, lane, cancel, plan: None, served: false });
+                self.tickets.insert(ticket, Ticket { root: main, lane, cancel, plan: None, follow_ups: 0, served: false });
                 self.pending_orders.push_back((ticket, lane, text));
                 self.feed_main(lane);
             }
@@ -780,7 +786,7 @@ impl Kernel {
                     Group::Spec => match self.recipes.spec(ticket, &message) {
                         Some(a) => (a, Caps { write: vec![], write_any: false, exec: false }, "spec agent"),
                         None => {
-                            self.tickets.insert(ticket, Ticket { root: 0, lane, cancel, plan: None, served: false });
+                            self.tickets.insert(ticket, Ticket { root: 0, lane, cancel, plan: None, follow_ups: 0, served: false });
                             self.end_ticket(ticket, false, "[this kitchen has no spec lane]".into());
                             return ticket;
                         }
@@ -794,7 +800,7 @@ impl Kernel {
                 };
                 let session = self.session_cancel.child();
                 let main = self.spawn(agent, None, ticket, lane, title.into(), caps, session, 0);
-                self.tickets.insert(ticket, Ticket { root: main, lane, cancel, plan: None, served: false });
+                self.tickets.insert(ticket, Ticket { root: main, lane, cancel, plan: None, follow_ups: 0, served: false });
                 self.mains.insert(lane, main);
             }
         }
@@ -1621,12 +1627,26 @@ impl Kernel {
         if running {
             return self.fill(pid, batch, idx, SyscallResult::Failed("this order's plan is still running; wait for its results".into()));
         }
+        // A follow-up comes after an approved plan finished; revising a plan not yet approved is not one.
+        let follow_up = self.tickets.get(&ticket).and_then(|t| t.plan.as_ref()).is_some_and(|p| p.approved);
+        if follow_up && self.tickets.get(&ticket).is_some_and(|t| t.follow_ups >= MAX_FOLLOW_UPS) {
+            return self.fill(
+                pid,
+                batch,
+                idx,
+                SyscallResult::Failed(format!(
+                    "no more plans for this order ({MAX_FOLLOW_UPS} follow-up plans already ran): report what was done \
+                     and what is still open"
+                )),
+            );
+        }
         if let Err(e) = plan::validate(&tasks) {
             return self.fill(pid, batch, idx, SyscallResult::Failed(format!("invalid plan: {e}. Fix it and submit again.")));
         }
         let text = render_plan(&tasks);
         let runs = tasks.iter().map(|_| TaskRun { status: TaskStatus::Pending, pid: None, report: String::new() }).collect();
         if let Some(t) = self.tickets.get_mut(&ticket) {
+            t.follow_ups += u32::from(follow_up);
             t.plan = Some(PlanRun { tasks, runs, approved: false, owner: pid });
         }
         if let Some(a) = self.acbs.get_mut(&pid) {
