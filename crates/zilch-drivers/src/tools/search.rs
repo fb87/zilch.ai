@@ -22,7 +22,7 @@ impl Tool for GlobTool {
         "glob"
     }
     fn description(&self) -> String {
-        "Find files by glob pattern (e.g. `src/**/*.rs`). Respects .gitignore; hidden entries are skipped except CI and build config (.github, .gitlab, .cargo, …).".into()
+        "Find files by glob pattern (e.g. `src/**/*.rs`). Respects .gitignore; hidden entries are skipped except CI, build and tool config (.github, .gitlab, .cargo, .gitignore, .editorconfig, …).".into()
     }
     fn schema(&self) -> Value {
         json!({"type":"object","properties":{
@@ -150,16 +150,26 @@ mod tests {
             std::fs::write(p, s).unwrap();
         };
         w(".github/workflows/ci.yml", "run: cargo test --workspace\n");
+        w("bench/.gitignore", "out/ # cargo test output\n");
+        w(".npmrc", "//registry/:_authToken=cargo test\n");
         w(".env", "SECRET=cargo test\n");
         w(".zilch/config.toml", "api_key = \"cargo test\"\n");
         w(".hidden/notes.txt", "cargo test\n");
         w("src/main.rs", "// cargo test\n");
         let ctx = ToolCtx::new("t", dir.path().to_path_buf());
         let found = GlobTool.call(json!({"pattern":"**/*"}), &ctx).unwrap();
-        assert!(found.contains(".github/workflows/ci.yml") && found.contains("src/main.rs"), "{found}");
+        assert!(
+            found.contains(".github/workflows/ci.yml") && found.contains("src/main.rs") && found.contains("bench/.gitignore"),
+            "{found}"
+        );
+        assert!(!found.contains(".npmrc"), "{found}");
+        assert!(
+            GlobTool.call(json!({"pattern":"**/.gitignore"}), &ctx).unwrap().contains("bench/.gitignore"),
+            "a dotfile named in the pattern"
+        );
         assert!(!found.contains(".env") && !found.contains(".zilch") && !found.contains(".hidden"), "{found}");
         let hits = GrepTool.call(json!({"pattern":"cargo test"}), &ctx).unwrap();
         assert!(hits.contains(".github/workflows/ci.yml") && hits.contains("src/main.rs"), "{hits}");
-        assert!(!hits.contains(".env") && !hits.contains(".zilch") && !hits.contains(".hidden"), "{hits}");
+        assert!(!hits.contains(".env") && !hits.contains(".zilch") && !hits.contains(".hidden") && !hits.contains(".npmrc"), "{hits}");
     }
 }

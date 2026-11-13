@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "zilch OS agents: the LLM-driven Architect and Developer programs."
+description = "zilch OS agents: the LLM-driven programs (main agent, answerer, planner, developer, explorer, spec agent) and their prompts."
 
 [dependencies]
 zilch-ipc = { path = "../zilch-ipc" }

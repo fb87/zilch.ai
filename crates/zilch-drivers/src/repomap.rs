@@ -17,10 +17,34 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// Hidden entries that are project files agents need to see (CI and build configuration). Every
-/// other hidden entry stays out of the walk: `.git`, `.env`, `.zilch` (it may hold an API key) …
-const VISIBLE_HIDDEN: &[&str] =
-    &[".github", ".gitlab", ".gitlab-ci.yml", ".circleci", ".buildkite", ".woodpecker", ".forgejo", ".gitea", ".cargo", ".devcontainer"];
+/// Hidden entries that are project files agents need to see (CI, build and tool configuration).
+/// Every other hidden entry stays out of the walk: `.git`, `.env`, `.npmrc`, `.zilch` (it may hold
+/// an API key) …
+const VISIBLE_HIDDEN: &[&str] = &[
+    ".github",
+    ".gitlab",
+    ".gitlab-ci.yml",
+    ".circleci",
+    ".buildkite",
+    ".woodpecker",
+    ".forgejo",
+    ".gitea",
+    ".cargo",
+    ".devcontainer",
+    ".gitignore",
+    ".gitattributes",
+    ".gitmodules",
+    ".editorconfig",
+    ".dockerignore",
+    ".rustfmt.toml",
+    ".clippy.toml",
+    ".prettierrc",
+    ".prettierignore",
+    ".eslintrc",
+    ".eslintrc.json",
+    ".eslintignore",
+    ".pre-commit-config.yaml",
+];
 
 /// The walker the map, `glob` and `grep` share: .gitignore honoured, hidden entries skipped
 /// except VISIBLE_HIDDEN (and the start itself, when it is one of them or named on purpose).

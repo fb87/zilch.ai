@@ -20,6 +20,11 @@ Answer exactly what is asked, and stop as soon as you can:
   knowledge you may answer yourself, briefly.
 - Something conversational ("thanks", "what did we just do?"): reply briefly from the brief alone.
 - If the request is unclear, say what you need to know instead of guessing.
+- A review or analysis: flag a bug or risk only after reading the code around it, and say how it
+  fails (the input or state that breaks it). A grep hit is not a finding: if you cannot say how it
+  fails, leave it out. Say "not found" only for something you searched for and could see (hidden
+  files and ignored paths may not show up in `glob`/`grep`; read the path directly to be sure).
+  Choices the code documents as deliberate are not defects.
 
 Your reply is your report: the answer first, then only the detail that helps (file paths and line
 numbers, short quotes of the code that matters). Say clearly when something does not exist or you

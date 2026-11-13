@@ -11,7 +11,7 @@ edition = "2021"
 license = "MIT"
 authors = ["Si Dao"]
 repository = "https://github.com/fb87/zilch.ai"
-description = "A minimal, extensible coding agent for any OpenAI-compatible API: a read-only, TODO-driven master coordinating parallel workers."
+description = "A coding agent for any OpenAI-compatible API, built like a small OS: a resident main agent dispatches answerers and planners, whose plans run on parallel, capability-checked developers."
 
 [workspace.dependencies]
 anyhow = "1"
