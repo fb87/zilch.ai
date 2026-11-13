@@ -42,9 +42,8 @@ pub fn dispatch_spec() -> ToolSpec {
 pub fn explore_spec() -> ToolSpec {
     ToolSpec::new(
         "explore",
-        "Questions (at most 8, about separate areas), each answered by its own read-only explorer in parallel; returns \
-         their reports. For broad requests: one call per level, from broad to precise (at most 3 levels, 16 explorers \
-         per order). A few known files are cheaper to read yourself.",
+        "Precise, independent questions (at most 8), each answered by its own read-only explorer in parallel. Only for \
+         broad investigations of code you have not seen; a few files are cheaper to read yourself.",
         json!({"type":"object","properties":{"questions":{"type":"array","items":{"type":"string"}}},"required":["questions"]}),
     )
 }
