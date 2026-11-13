@@ -18,7 +18,7 @@ impl Tool for ReadFile {
     }
     fn description(&self) -> String {
         "Read a text file as numbered lines; offset/limit (1-based) for a range. Over 1500 lines without a range: its \
-         outline (definitions with line numbers) and first lines. Re-reading unchanged lines you have: a short note."
+         outline (definitions with line numbers) and first lines, where the file type has one. Re-reading unchanged lines you have: a short note."
             .into()
     }
     fn schema(&self) -> Value {
@@ -67,19 +67,21 @@ impl Tool for ReadFile {
             e.1.push((a, b));
         };
 
-        // A long file read whole: its shape first, so the agent reads only the ranges it needs.
-        if !explicit && total > OUTLINE_OVER {
+        // A long file read whole: its shape first, so the agent reads only the ranges it needs. Without
+        // an outline (a file type the map does not know) that would be 40 lines and a guess, so it is
+        // read like any other file.
+        let outline = if !explicit && total > OUTLINE_OVER {
+            crate::repomap::outline(&shown_path, &text).filter(|items| !items.is_empty())
+        } else {
+            None
+        };
+        if let Some(items) = outline {
             let mut out = format!("{shown_path}: {total} lines. Definitions (line: signature):\n");
-            match crate::repomap::outline(&shown_path, &text) {
-                Some(items) if !items.is_empty() => {
-                    for it in items.iter().take(150) {
-                        out.push_str(&format!("{:>6}: {}\n", it.line, it.sig));
-                    }
-                    if items.len() > 150 {
-                        out.push_str(&format!("  … {} more\n", items.len() - 150));
-                    }
-                }
-                _ => out.push_str("  (no outline for this file type)\n"),
+            for it in items.iter().take(150) {
+                out.push_str(&format!("{:>6}: {}\n", it.line, it.sig));
+            }
+            if items.len() > 150 {
+                out.push_str(&format!("  … {} more\n", items.len() - 150));
             }
             out.push_str(&format!("First {OUTLINE_HEAD} lines:\n"));
             for (i, line) in text.lines().enumerate().take(OUTLINE_HEAD) {
@@ -87,8 +89,9 @@ impl Tool for ReadFile {
                 out.push_str(&format!("{:>6}\t{}\n", i + 1, line));
             }
             out.push_str(&format!(
-                "[lines 1-{OUTLINE_HEAD} of {total}. Read the ranges you need with offset/limit (e.g. offset=120 limit=80); \
-                 the whole file: offset=1 limit={total}.]\n"
+                "[lines 1-{OUTLINE_HEAD} of {total}. Read the ranges you need with offset/limit (e.g. offset=120 limit=80), \
+                 several ranges as several read_file calls in one turn (they run in parallel); the whole file: \
+                 offset=1 limit={total}.]\n"
             ));
             remember(1, OUTLINE_HEAD.min(total));
             return Ok(out);
@@ -105,8 +108,14 @@ impl Tool for ReadFile {
         if offset <= shown_end {
             remember(offset, shown_end);
         }
-        if shown_end < total || offset > 1 {
-            out.push_str(&format!("[lines {}-{} of {}]\n", offset, shown_end, total));
+        if shown_end < total {
+            out.push_str(&format!(
+                "[lines {offset}-{shown_end} of {total}; the rest: offset={}. Several ranges: several read_file calls in \
+                 one turn (they run in parallel).]\n",
+                shown_end + 1
+            ));
+        } else if offset > 1 {
+            out.push_str(&format!("[lines {offset}-{shown_end} of {total}]\n"));
         }
         Ok(out)
     }
@@ -301,8 +310,21 @@ mod read_tests {
         assert!(out.contains("the whole file: offset=1 limit=1601"));
         // Asking explicitly reads anything: a range, or the whole file.
         let part = ReadFile.call(json!({"path":"big.rs","offset":300,"limit":2}), &c).unwrap();
-        assert!(part.contains("   300\tpub fn f298() {}") && part.contains("[lines 300-301 of 1601]"), "{part}");
+        assert!(part.contains("   300\tpub fn f298() {}") && part.contains("[lines 300-301 of 1601; the rest: offset=302."), "{part}");
         let all = ReadFile.call(json!({"path":"big.rs","offset":1,"limit":1601}), &c).unwrap();
         assert!(all.contains("  1601\tpub fn f1599() {}"));
+    }
+
+    #[test]
+    fn a_long_file_without_an_outline_is_read_like_any_other() {
+        // A file type the map has no outline for (here Nix): 40 lines and a guess would only cost
+        // round trips, so the text comes back, up to the usual limit.
+        let dir = tempfile::tempdir().unwrap();
+        let src: String = (1..=2223).map(|i| format!("  opt{i} = true;\n")).collect();
+        std::fs::write(dir.path().join("flake.nix"), &src).unwrap();
+        let out = ReadFile.call(json!({"path":"flake.nix"}), &ctx(dir.path())).unwrap();
+        assert!(!out.contains("Definitions"), "{}", &out[..200]);
+        assert!(out.contains("  2000\t  opt2000 = true;") && !out.contains("  2001\t"), "the default limit applies");
+        assert!(out.contains("[lines 1-2000 of 2223; the rest: offset=2001."), "{}", &out[out.len() - 200..]);
     }
 }
