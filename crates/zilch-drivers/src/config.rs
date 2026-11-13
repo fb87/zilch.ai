@@ -187,7 +187,13 @@ struct FileConfig {
     /// Daemon sessions: a shell command run when a question waits and no client is attached
     /// (env: ZILCH_WORKSPACE, ZILCH_TICKET, ZILCH_QUESTION).
     on_question: Option<String>,
+    /// Every other top-level key: warned about at startup (a typo, or a key zilch no longer reads).
+    #[serde(flatten)]
+    other: BTreeMap<String, toml::Value>,
 }
+
+/// Keys of the previous zilch that are no longer read: accepted without a warning.
+const RETIRED_KEYS: &[&str] = &["markdown_indent", "bash_overlay"];
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -269,6 +275,10 @@ pub struct Config {
     pub loop_limit: Option<usize>,
     /// The repository overview goes into the answerer's, planner's and spec agent's prompts.
     pub repo_map: bool,
+    /// Parallel step workers (`max_workers`; `--workers` wins, the CPU count is the default).
+    pub max_workers: Option<usize>,
+    /// Problems worth telling the guest at startup (unknown config keys, …).
+    pub warnings: Vec<String>,
     pub max_task_tokens: Option<u64>,
     /// Token quota per group (`[quotas]`).
     pub group_tokens: BTreeMap<Group, u64>,
@@ -322,6 +332,7 @@ impl Config {
     pub fn load_from(cwd: &Path, layer_dirs: &[PathBuf], env: &BTreeMap<String, String>, ov: &Overrides) -> Result<Self> {
         let mut fc = FileConfig::default();
         let mut sources = Vec::new();
+        let mut warnings = Vec::new();
         for dir in layer_dirs {
             // Roles may also be files of their own: <dir>/agents/<name>.toml.
             if let Ok(rd) = std::fs::read_dir(dir.join("agents")) {
@@ -377,6 +388,9 @@ impl Config {
             }
             if let Some(q) = layer.quotas {
                 fc.quotas.get_or_insert_with(BTreeMap::new).extend(q);
+            }
+            for key in layer.other.keys().filter(|k| !RETIRED_KEYS.contains(&k.as_str())) {
+                warnings.push(format!("{}: unknown key `{key}` (ignored)", file.display()));
             }
             sources.push(file);
         }
@@ -522,6 +536,8 @@ impl Config {
             max_steps: architect.max_steps.or(developer.max_steps).unwrap_or(80) as u32,
             loop_limit: fc.loop_limit,
             repo_map: fc.repo_map.unwrap_or(true),
+            max_workers: fc.max_workers.filter(|n| *n > 0),
+            warnings,
             web,
             on_question: fc.on_question.clone().filter(|c| !c.trim().is_empty()),
             max_task_tokens: fc.max_task_tokens,
@@ -653,6 +669,8 @@ model = "fast"
             r#"
 max_workers = 8
 spec_dir = "specs"
+markdown_indent = 2
+aproval = "auto"
 [providers.opencode]
 base_url = "https://example.test/v1"
 api_key_env = "OC_KEY"
@@ -675,6 +693,10 @@ developer = 500000
         let c = Config::load_from(dir.path(), std::slice::from_ref(&z), &env, &Overrides::default()).unwrap();
         assert_eq!((c.architect.provider.as_str(), c.architect.model.as_str()), ("opencode", "planner-free"));
         assert_eq!((c.developer.model.as_str(), c.developer.temperature), ("base-free", Some(0.2)));
+        assert_eq!(c.max_workers, Some(8), "max_workers is read");
+        // A typo is reported (with its file); a key the previous zilch had is accepted quietly.
+        assert_eq!(c.warnings.len(), 1, "{:?}", c.warnings);
+        assert!(c.warnings[0].contains("config.toml: unknown key `aproval` (ignored)"), "{:?}", c.warnings);
         // Explorers: their own settings over the developers'.
         let e = c.explorer.clone().expect("[roles.explorer] gives explorers a binding");
         assert_eq!((e.model.as_str(), e.temperature, e.reasoning_effort.as_deref()), ("base-free", Some(0.2), Some("low")));

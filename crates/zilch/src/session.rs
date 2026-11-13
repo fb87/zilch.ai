@@ -268,7 +268,7 @@ impl Session {
         };
         let defaults = KernelConfig::default();
         let kcfg = KernelConfig {
-            workers: opts.workers.unwrap_or(defaults.workers),
+            workers: opts.workers.or(cfg.max_workers).unwrap_or(defaults.workers),
             io_threads: cfg.io_threads,
             loop_limit: cfg.loop_limit.unwrap_or(defaults.loop_limit),
             max_steps: cfg.max_steps,
@@ -336,6 +336,9 @@ impl Session {
         );
         if !session_note.is_empty() {
             banner = format!("{banner}\n{}{session_note}{r}", view.c(CYAN));
+        }
+        for w in &cfg.warnings {
+            banner = format!("{banner}\n{}warning: {w}{r}", view.c(YELLOW));
         }
         let drivers = Arc::new(drivers);
         if cfg.repo_map {

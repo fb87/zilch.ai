@@ -1057,6 +1057,9 @@ fn doctor(cfg: &Config, meter: &zilch_drivers::llm::catalog::CostMeter, cwd: &st
     for (i, s) in cfg.sources.iter().enumerate() {
         println!("{}{}", if i == 0 { "  config      " } else { "              " }, s.display());
     }
+    for w in &cfg.warnings {
+        println!("  warning     {w}");
+    }
     println!("  providers   {}", cfg.usable_providers().join(", "));
     println!("  main/spec   {}", priced(meter, &cfg.architect));
     println!("  subagents   {}", priced(meter, &cfg.developer));
