@@ -126,6 +126,9 @@ struct View {
     verbose: std::sync::atomic::AtomicBool,
     /// Streamed text not yet shown, per process: (is reasoning, the unfinished line).
     streams: Mutex<HashMap<Pid, (bool, String)>>,
+    /// The workspace as models may spell it (canonical, and as given); paths below it are shown
+    /// relative to it.
+    workspace: Vec<String>,
     procs: Mutex<HashMap<Pid, (Group, String)>>,
     /// Plans waiting for the guest, oldest first: (qid, ticket).
     questions: Mutex<std::collections::VecDeque<(u64, TicketId)>>,
@@ -166,6 +169,12 @@ impl View {
         } else {
             ""
         }
+    }
+
+    /// Paths inside the workspace relative to it (`/ws/src/a.rs` → `src/a.rs`, `/ws` → `.`);
+    /// paths outside it stay absolute.
+    fn rel(&self, text: &str) -> String {
+        rel_to(&self.workspace, text)
     }
 
     fn verbose(&self) -> bool {
@@ -255,7 +264,7 @@ impl View {
             }
             KernelEvent::SyscallIssued { pid, summary, .. } => {
                 if let Some(l) = live.get_mut(pid) {
-                    let what = if summary.starts_with("llm ") { "thinking".to_string() } else { summary.clone() };
+                    let what = if summary.starts_with("llm ") { "thinking".to_string() } else { self.rel(summary) };
                     // Several calls in one step: show the first, count the rest.
                     l.doing = match l.doing.take() {
                         Some((d, t)) if !d.ends_with(" more") && d != what => Some((format!("{d} +1 more"), t)),
@@ -378,12 +387,12 @@ impl View {
                 if (summary.starts_with("llm ") || summary == "recv") && !self.verbose() {
                     return None;
                 }
-                format!("    {d}{pid} ▸ {summary}{r}")
+                format!("    {d}{pid} ▸ {}{r}", self.rel(summary))
             }
             KernelEvent::SyscallDone { pid, ok: false, summary, result, .. } => {
-                format!("    {red}{pid} ✗ {summary}{r}{d}: {}{r}", first(&result.text(), 200))
+                format!("    {red}{pid} ✗ {}{r}{d}: {}{r}", self.rel(summary), first(&result.text(), 200))
             }
-            KernelEvent::SyscallDone { pid, summary, .. } if self.verbose() => format!("    {d}{pid} ✓ {summary}{r}"),
+            KernelEvent::SyscallDone { pid, summary, .. } if self.verbose() => format!("    {d}{pid} ✓ {}{r}", self.rel(summary)),
             KernelEvent::Question { qid, ticket, text, command: true, .. } => {
                 self.questions.lock().unwrap().push_back((*qid, *ticket));
                 self.commands.lock().unwrap().insert(*qid, text.clone());
@@ -547,6 +556,38 @@ Type an order to place it. While a plan waits for you: y approves, n rejects, an
 /detach      (daemon sessions, zilch attach) leave; the session keeps running · /stop ends it
 Tab completes commands, their arguments (groups, models, pids) and @ mentions.
 Ctrl-C cancels the newest open order.";
+
+/// `text` with paths inside one of the `workspaces` (spellings of the same directory) made
+/// relative to it: `/ws/src/a.rs` → `src/a.rs`, a bare `/ws` → `.`. A path that merely starts
+/// with the same letters (`/ws2/x`, `/mnt/ws/x`) is left alone, as is everything outside.
+fn rel_to(workspaces: &[String], text: &str) -> String {
+    let part_of_path = |c: char| c.is_alphanumeric() || matches!(c, '/' | '.' | '-' | '_');
+    let mut out = text.to_string();
+    for ws in workspaces.iter().filter(|w| w.len() > 1) {
+        let ws = ws.trim_end_matches('/');
+        let mut result = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        while let Some(i) = rest.find(ws) {
+            let before = rest[..i].chars().next_back();
+            let after = rest[i + ws.len()..].chars().next();
+            result.push_str(&rest[..i]);
+            if before.is_some_and(part_of_path) {
+                result.push_str(ws);
+            } else if after == Some('/') {
+                rest = &rest[i + ws.len() + 1..];
+                continue;
+            } else if after.is_some_and(part_of_path) {
+                result.push_str(ws);
+            } else {
+                result.push('.');
+            }
+            rest = &rest[i + ws.len()..];
+        }
+        result.push_str(rest);
+        out = result;
+    }
+    out
+}
 
 fn main() {
     // Sandbox helper mode: before any thread exists (unshare(CLONE_NEWUSER) refuses
@@ -948,5 +989,20 @@ fn doctor(cfg: &Config, meter: &zilch_drivers::llm::catalog::CostMeter, cwd: &st
         1
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod rel_tests {
+    #[test]
+    fn paths_inside_the_workspace_are_shown_relative_others_in_full() {
+        let ws = vec!["/pst/conf".to_string()];
+        let r = |s: &str| super::rel_to(&ws, s);
+        assert_eq!(r("read_file(/pst/conf/flake.nix:1-40)"), "read_file(flake.nix:1-40)");
+        assert_eq!(r("bash(cd /pst/conf && sed -n '1,9p' flake.nix)"), "bash(cd . && sed -n '1,9p' flake.nix)");
+        assert_eq!(r("write_file(/tmp/spots.txt, 3 lines)"), "write_file(/tmp/spots.txt, 3 lines)");
+        assert_eq!(r("glob(/pst/config/*.nix)"), "glob(/pst/config/*.nix)", "a sibling with a longer name");
+        assert_eq!(r("read_file(/mnt/pst/conf/a)"), "read_file(/mnt/pst/conf/a)", "the same letters inside another path");
+        assert_eq!(r("grep(x in src)"), "grep(x in src)");
     }
 }
