@@ -46,9 +46,10 @@ OPENAI_BASE_URL=http://localhost:11434/v1 zilch --model qwen2.5-coder   # Ollama
 ```
 
 How an order flows:
-1. The main agent dispatches it with a self-contained brief: a question, explanation or check to the
-   read-only **answerer** (its report comes back and the main agent replies; no plan, nothing to
-   approve), a change to the **planner**.
+1. An order the conversation already answers ("which file was that?", "thanks") gets a direct
+   reply. Anything else the main agent dispatches with a self-contained brief: a question,
+   explanation or check to the read-only **answerer** (its report comes back and the main agent
+   replies; no plan, nothing to approve), a change to the **planner**.
 2. The planner reads what the change touches (read-only **explorers** can investigate a large
    codebase in parallel) and calls `submit_plan`. Nobody writes planning documents into your
    project (approved plans are kept with the session, outside it).
@@ -90,6 +91,7 @@ spec_dir = "specs"                 # the spec lane's documents
 loop_limit = 3                     # supervisor: repeats before a nudge (0 = off)
 max_session_cost = 5.0             # USD cap, checked before each model call
 max_session_tokens = 2_000_000
+repo_map = true                    # repository overview in the prompts of the agents that read code
 
 [providers.openai]                 # exists by default
 base_url = "https://api.openai.com/v1"
@@ -113,6 +115,8 @@ context_tokens = 64000             # compaction starts at 75%
 [roles.coder]                      # the subagents (also [roles.developer])
 provider = "opencode"
 model = "qwen3.8-flash"
+reasoning_effort = "low"           # thinking models: fewer output tokens on small tasks
+price_cached = 0.003               # USD / 1M cached input tokens, when the provider lists none
 system_prompt = "Prefer small diffs."
 prompt_mode = "append"             # append (default) | replace; or system_prompt_file = "…"
 
@@ -162,11 +166,54 @@ crates/zilch          the `zilch` binary: REPL, status row, plan/command questio
   restarted or killed. Processes waiting on each other's mailboxes are woken instead of hanging.
 - **Scheduling.** Tasks can carry a `priority` (0 urgent … 3 background); waiting work ages upward;
   per-process step and token budgets; `[quotas]` per group.
-- **Context.** Subagents and explorers start fresh per task. The resident agents compact their
-  history at 75% of their budget: old tool output is shortened first, then older turns are
-  summarized.
+- **Context.** Subagents and explorers start fresh per task. A resident main agent compacts while
+  idle: right after an order is served (past 40% of its budget) and again once the provider has
+  likely dropped its cache (5 min, past 20%), into a digest of the finished orders; the digest
+  request reuses its cached prefix. At 75% during an order, old tool output is shortened first,
+  then older turns are summarized.
 - **Events.** Everything the kernel does is an event; the JSONL log (`<data dir>/zilch/logs/`, mode
   0600) records every syscall result, which is what a replay needs.
+
+## Finding code, spending fewer tokens
+
+- **Repository map.** A module overview (every source directory with its purpose, each documented
+  file) goes into the prompts of the agents that read code. `repo_map` lists a directory's or
+  file's definitions with line numbers; `find_definition` finds where a function or type is
+  defined. Extracted from the code itself (doc comments, READMEs, manifests, per-language
+  patterns), no model calls; cached in the data directory for large trees and refreshed where it
+  changed.
+- **Search and reads.** `grep` searches in parallel like ripgrep. Re-reading unchanged lines, or an
+  identical `grep` / `glob` with the same result, returns a short note instead of the text again;
+  a file over 1,500 lines read without a range returns its outline first.
+- **Less resent.** Command output loses build progress and passing-test lines; reasoning from
+  earlier orders is not sent again; every developer instance shares one prompt, so the provider's
+  cache serves them all; Anthropic requests carry cache markers (it caches nothing without them).
+
+## Outside sources (off by default)
+
+With `--web` or `[web] enabled = true`, every agent can look outside the workspace:
+
+- `fetch_source`: a read-only copy of a git repository (https, ssh or `git@host:owner/repo`; a
+  branch, tag or full commit) or a source archive (`.tar.gz`, `.tgz`, `.zip`, `.crate`, GitHub
+  `/archive/` links), kept in `<data dir>/zilch/sources`, never in your project, and reused.
+  `read_file`, `grep`, `glob`, `repo_map` and `find_definition` read it; nothing writes to it.
+  Archives are unpacked by zilch itself (no links, no `..`, size caps); clones are shallow and keep
+  no `.git`.
+- `web_fetch`: one page as plain text (links kept as `[text](url)`), 20k characters per call.
+- `web_search`: DuckDuckGo's HTML results by default, with no key or setup. That page is not an API
+  and can answer with a bot check now and then; for a dependable service, set SearXNG or Brave.
+
+```toml
+[web]
+enabled = true
+search = "searxng"                  # default "duckduckgo"; or "brave" (key in BRAVE_API_KEY,
+                                    # or search_api_key_env); "none" turns search off
+search_url = "http://localhost:8888" # a SearXNG instance with the JSON format enabled
+```
+
+URLs the models supply must resolve to public addresses (no localhost, private networks or cloud
+metadata), also after redirects. Pages, search results and fetched code are marked as untrusted:
+they can carry instructions aimed at the model, so keep plan approval on when you use this.
 
 ## Lanes
 
@@ -194,12 +241,45 @@ zilch --no-session            # don't save
 Order numbers carry on in a continued session. Work on an order that was not served yet is not
 saved. `/clear` starts a fresh session; the old one stays resumable.
 
+## Daemon (optional)
+
+Plain `zilch` runs in its own process, as before. For sessions that outlive the terminal, one
+daemon per user hosts any number of them, each with its own workspace, config, kernel and costs:
+
+```sh
+zilch daemon start                 # in the background (log: <data dir>/zilch/logs/daemon.log)
+zilch attach                       # REPL on this directory's session (created if missing)
+zilch attach ledger-1              # ... or a named one; /detach leaves it running, /stop ends it
+zilch new --workspace ~/src/app --name app --web   # a session, from anywhere
+zilch -p "run the tests" --session app             # one order; prints its progress, exits when served
+zilch ls                           # id, state (idle, working, waiting for you), spend, clients
+zilch stop app                     # end a session (its conversation stays resumable with -c)
+zilch daemon stop                  # end them all
+```
+
+Attaching replays the session's recent output, then follows it live; any number of clients can
+attach at once. Orders keep running with nobody attached; a plan approval or command question
+then waits for the next client (`zilch ls` shows "waiting for you"). Nothing is approved for you
+unless the session was created with `--approval auto`; `on_question = "notify-send zilch
+\"$ZILCH_QUESTION\""` in the config runs a command when a question waits unattended
+(`ZILCH_WORKSPACE`, `ZILCH_TICKET`, `ZILCH_QUESTION` are set). Each session also serves the editor
+link of its workspace.
+
+The daemon listens on a local socket for this user only (Linux: an abstract socket; elsewhere a
+socket file in a private directory; peer uid checked; no TCP: use `ssh -L` to reach it remotely).
+`ZILCH_DAEMON_SOCKET` picks another endpoint (`@name` or a path). Provider keys come from the
+daemon's environment: start it from a shell that has them, or for a systemd user unit put them in
+an `EnvironmentFile` and run `zilch daemon run` (foreground).
+
 ## Costs and models
 
 At startup zilch reads each provider's `{base}/models` (OpenCode and OpenRouter publish prices and
-context windows); `price_in` / `price_out` on a role override them, `discover = false` on a
-provider skips the lookup. `/usage` shows tokens and USD per agent and model, the status row the
-session's spend; the caps stop a call before it would exceed them. `/model` switches a group for
+context windows, and OpenCode its cache price and peak-hour multipliers); `price_in` / `price_out` /
+`price_cached` on a role override them, `discover = false` on a provider skips the lookup. Cached
+input is billed at the cache price. `/usage` shows tokens (with the share served from the
+provider's cache) and USD per agent and model, a session line and where the input went (system,
+tools, history, each tool's output); the session line is also printed on exit and after `-p`. The
+status row shows the session's spend; the caps stop a call before it would exceed them. `/model` switches a group for
 the session. A model whose output price is at least `expensive_model_price` (default 10 USD/1M) and
 that has been in use for `expensive_model_minutes` (30) or cost `expensive_model_spend` ($2)
 pulses in the status row until `/ack` (next step) or until no group uses it.
@@ -244,6 +324,10 @@ whose address zilch writes to `.zilch/ipc`. See [`editor/nvim/README.md`](editor
 cargo test     # offline: kernel behaviour with scripted agents, tools, protocols, end-to-end orders
                # with a scripted model on real files, sessions, the editor link
 ```
+
+`bench/run.sh <label> [runs] [model]` measures what orders cost (requests, input, cached and
+output tokens, time, tests passing) on fixed scenarios in a copy of `examples/ledger-demo`;
+`bench/report.sh` compares labels. Compare before and after a change with several runs each.
 
 Pushing a `v*` tag builds and tests Linux (gnu + static musl, x86_64 + aarch64) and macOS (Intel +
 Apple Silicon) binaries and publishes them with `SHA256SUMS`.

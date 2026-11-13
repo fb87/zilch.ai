@@ -18,7 +18,7 @@ zilch-drivers = { path = "../zilch-drivers" }
 zilch-agents = { path = "../zilch-agents" }
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
-rustyline = "15"
+rustyline = "19"
 unicode-width = "0.2"
 libc = "0.2"
 dirs = "5"

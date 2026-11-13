@@ -10,6 +10,7 @@ type PriceOverride = (String, Option<f64>, Option<f64>, Option<f64>);
 use crate::llm::protocol::Protocol;
 use crate::llm::Backend;
 use crate::tools::sandbox::{BashSandbox, SandboxSpec};
+use crate::tools::web::{SearchProvider, WebConfig};
 use crate::tools::ToolPolicy;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -181,6 +182,54 @@ struct FileConfig {
     expensive_model_spend: Option<f64>,
     spec_dir: Option<String>,
     approval: Option<String>,
+    /// Outside sources: `[web] enabled = true`, `search = "duckduckgo" (default) | "searxng" | "brave" | "none"`, `search_url`, `search_api_key_env`.
+    web: Option<WebCfg>,
+    /// Daemon sessions: a shell command run when a question waits and no client is attached
+    /// (env: ZILCH_WORKSPACE, ZILCH_TICKET, ZILCH_QUESTION).
+    on_question: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebCfg {
+    enabled: Option<bool>,
+    search: Option<String>,
+    search_url: Option<String>,
+    search_api_key_env: Option<String>,
+}
+
+impl WebCfg {
+    fn merge(&mut self, o: WebCfg) {
+        merge_opt(&mut self.enabled, o.enabled);
+        merge_opt(&mut self.search, o.search);
+        merge_opt(&mut self.search_url, o.search_url);
+        merge_opt(&mut self.search_api_key_env, o.search_api_key_env);
+    }
+
+    fn resolve(&self, flag: Option<bool>, env: &BTreeMap<String, String>) -> Result<WebConfig> {
+        let enabled = flag.or(self.enabled).unwrap_or(false);
+        let search = match self.search.as_deref().map(str::trim) {
+            None | Some("duckduckgo") => Some(SearchProvider::DuckDuckGo),
+            Some("") | Some("none") => None,
+            Some("searxng") => match &self.search_url {
+                Some(u) if u.starts_with("http") => Some(SearchProvider::Searxng { url: u.clone() }),
+                _ => bail!("[web] search = \"searxng\" needs search_url = \"https://…\" (an instance with the JSON format enabled)"),
+            },
+            Some("brave") => {
+                Some(SearchProvider::Brave { key_env: self.search_api_key_env.clone().unwrap_or_else(|| "BRAVE_API_KEY".into()) })
+            }
+            Some(other) => {
+                bail!("[web] search = \"{other}\": supported are \"duckduckgo\" (the default), \"searxng\", \"brave\" and \"none\"")
+            }
+        };
+        if let (true, Some(SearchProvider::Brave { key_env })) = (enabled, &search) {
+            if env.get(key_env).is_none_or(|v| v.is_empty()) {
+                bail!("[web] search = \"brave\": set {key_env} (or search_api_key_env)");
+            }
+        }
+        let search = if enabled { search } else { None };
+        Ok(WebConfig { enabled, search })
+    }
 }
 
 fn merge_opt<T>(dst: &mut Option<T>, src: Option<T>) {
@@ -196,12 +245,18 @@ pub struct Overrides {
     pub model: Option<String>,
     pub architect_model: Option<String>,
     pub developer_model: Option<String>,
+    /// `--web`: outside sources on (overrides `[web] enabled`).
+    pub web: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cwd: PathBuf,
     pub sources: Vec<PathBuf>,
+    /// Outside sources (`[web]`, `--web`).
+    pub web: WebConfig,
+    /// Run when a daemon session's question waits with no client attached.
+    pub on_question: Option<String>,
     pub providers: BTreeMap<String, ProviderCfg>,
     pub architect: ModelBinding,
     pub developer: ModelBinding,
@@ -314,6 +369,10 @@ impl Config {
             merge_opt(&mut fc.expensive_model_spend, layer.expensive_model_spend);
             merge_opt(&mut fc.spec_dir, layer.spec_dir);
             merge_opt(&mut fc.approval, layer.approval);
+            merge_opt(&mut fc.on_question, layer.on_question);
+            if let Some(w) = layer.web {
+                fc.web.get_or_insert_with(WebCfg::default).merge(w);
+            }
             if let Some(q) = layer.quotas {
                 fc.quotas.get_or_insert_with(BTreeMap::new).extend(q);
             }
@@ -384,6 +443,13 @@ impl Config {
         let mut policy = policy;
         // Every provider key is a secret for commands, whatever its variable is called.
         policy.secret_env = fc.providers.values().filter_map(|p| p.api_key_env.clone()).collect();
+        let web = fc.web.clone().unwrap_or_default().resolve(ov.web, env)?;
+        if let Some(SearchProvider::Brave { key_env }) = &web.search {
+            policy.secret_env.push(key_env.clone());
+        }
+        if web.enabled {
+            policy.read_roots.push(crate::tools::web::sources_dir());
+        }
         let io_threads = fc.providers.values().map(|p| p.max_concurrent.unwrap_or(8)).sum::<usize>().clamp(8, 64) + 8;
         let price_overrides: Vec<PriceOverride> = [(&architect, &architect_b), (&developer, &developer_b)]
             .iter()
@@ -452,6 +518,8 @@ impl Config {
             max_steps: architect.max_steps.or(developer.max_steps).unwrap_or(80) as u32,
             loop_limit: fc.loop_limit,
             repo_map: fc.repo_map.unwrap_or(true),
+            web,
+            on_question: fc.on_question.clone().filter(|c| !c.trim().is_empty()),
             max_task_tokens: fc.max_task_tokens,
             env: env.clone(),
         };
@@ -612,5 +680,52 @@ developer = 500000
         assert!(err.contains("missing API key") && err.contains("OC_KEY"), "{err}");
         let err = Config::load_from(dir.path(), &[], &BTreeMap::new(), &Overrides::default()).unwrap_err().to_string();
         assert!(err.contains("no model"), "{err}");
+    }
+
+    #[test]
+    fn outside_sources_are_off_until_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let z = dir.path().join("z");
+        std::fs::create_dir_all(&z).unwrap();
+        let write = |extra: &str| {
+            std::fs::write(z.join("config.toml"), format!("[defaults]\nmodel = \"m\"\n{extra}")).unwrap();
+        };
+        let env: BTreeMap<String, String> = [("OPENAI_API_KEY".to_string(), "k".to_string())].into();
+        let load = |env: &BTreeMap<String, String>, ov: &Overrides| Config::load_from(dir.path(), std::slice::from_ref(&z), env, ov);
+        write("");
+        let c = load(&env, &Overrides::default()).unwrap();
+        assert_eq!(c.web, WebConfig::default());
+        assert!(c.policy.read_roots.is_empty());
+        let names =
+            |c: &Config| crate::DriverSet::new(dir.path(), c.policy.clone(), HashMap::new()).with_web(&c.web).specs(crate::EXPLORER_TOOLS);
+        assert!(!names(&c).iter().any(|t| t.function.name.starts_with("web") || t.function.name == "fetch_source"));
+        // --web: fetch_source, web_fetch and web_search (DuckDuckGo unless another service is set).
+        let c = load(&env, &Overrides { web: Some(true), ..Default::default() }).unwrap();
+        let tools: Vec<String> = names(&c).into_iter().map(|t| t.function.name).collect();
+        assert!(
+            tools.contains(&"fetch_source".into()) && tools.contains(&"web_fetch".into()) && tools.contains(&"web_search".into()),
+            "{tools:?}"
+        );
+        assert_eq!(c.policy.read_roots, vec![crate::tools::web::sources_dir()]);
+        assert_eq!(c.web.search, Some(SearchProvider::DuckDuckGo));
+        write("[web]\nenabled = true\nsearch = \"none\"\n");
+        let c = load(&env, &Overrides::default()).unwrap();
+        assert!(c.web.search.is_none() && !names(&c).iter().any(|t| t.function.name == "web_search"));
+        // Search providers.
+        write("[web]\nenabled = true\nsearch = \"searxng\"\nsearch_url = \"http://127.0.0.1:8888\"\n");
+        let c = load(&env, &Overrides::default()).unwrap();
+        assert_eq!(c.web.search, Some(SearchProvider::Searxng { url: "http://127.0.0.1:8888".into() }));
+        assert!(names(&c).iter().any(|t| t.function.name == "web_search"));
+        write("[web]\nenabled = true\nsearch = \"brave\"\n");
+        let err = load(&env, &Overrides::default()).unwrap_err().to_string();
+        assert!(err.contains("BRAVE_API_KEY"), "{err}");
+        let mut with_key = env.clone();
+        with_key.insert("BRAVE_API_KEY".into(), "b".into());
+        let c = load(&with_key, &Overrides::default()).unwrap();
+        assert!(c.policy.is_secret_env("BRAVE_API_KEY"), "the search key is hidden from commands");
+        write("[web]\nsearch = \"google\"\n");
+        assert!(load(&env, &Overrides::default()).unwrap_err().to_string().contains("searxng"));
+        write("[web]\nenable = true\n");
+        assert!(load(&env, &Overrides::default()).is_err(), "a misspelled key is an error, not silently off");
     }
 }

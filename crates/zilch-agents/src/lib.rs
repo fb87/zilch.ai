@@ -29,13 +29,11 @@ pub const PLANNER_PROMPT: &str = include_str!("../prompts/planner.md");
 pub fn dispatch_spec() -> ToolSpec {
     ToolSpec::new(
         "dispatch",
-        "Hand the guest's order to one subagent and wait for its report. agent \"answer\": questions, explanations, \
-         checks, anything conversational. agent \"plan\": any change to the project (it plans, the guest approves, \
-         developers carry it out). The brief is all the subagent sees: the request word for word plus the session \
-         context it needs.",
+        "Hand the order to one subagent and wait for its report (not needed when the conversation answers it). \
+         \"answer\": questions that need the code. \"plan\": any change (the guest approves its plan, developers do it).",
         json!({"type":"object","properties":{
             "agent":{"type":"string","enum":["answer","plan"]},
-            "brief":{"type":"string","description":"Self-contained: the guest's request verbatim and the context needed"}
+            "brief":{"type":"string","description":"All the subagent sees: the request verbatim plus the context it needs"}
         },"required":["agent","brief"]}),
     )
 }
@@ -44,10 +42,8 @@ pub fn dispatch_spec() -> ToolSpec {
 pub fn explore_spec() -> ToolSpec {
     ToolSpec::new(
         "explore",
-        "Investigate several questions at once: each goes to its own read-only explorer and they run in parallel. \
-         Returns every explorer's report. Only for a broad investigation across code you have not seen (where is X \
-         handled, how does Y work in a large project); a few files are cheaper to read yourself, and a question \
-         answerable from the conversation needs no tools. Ask precise, independent questions (at most 8).",
+        "Precise, independent questions (at most 8), each answered by its own read-only explorer in parallel. Only for \
+         broad investigations of code you have not seen; a few files are cheaper to read yourself.",
         json!({"type":"object","properties":{"questions":{"type":"array","items":{"type":"string"}}},"required":["questions"]}),
     )
 }
@@ -56,18 +52,17 @@ pub fn explore_spec() -> ToolSpec {
 pub fn submit_plan_spec() -> ToolSpec {
     ToolSpec::new(
         "submit_plan",
-        "Only for a change to the project (never to answer a question). Submit the implementation plan. The guest reviews it; once approved, every task runs on its own developer \
-         (independent tasks in parallel). Returns when all tasks finished, with each developer's report — or the \
-         guest's feedback / rejection.",
+        "Submit the plan of a change. The guest reviews it; once approved, each task runs on its own developer \
+         (independent ones in parallel). Returns every report, or the guest's feedback or rejection.",
         json!({"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object","properties":{
-            "id":{"type":"string","description":"Short id, e.g. T1"},
+            "id":{"type":"string","description":"e.g. T1"},
             "title":{"type":"string"},
-            "task":{"type":"string","description":"Complete, self-contained brief for the developer"},
+            "task":{"type":"string","description":"Self-contained brief: the developer sees nothing else"},
             "depends_on":{"type":"array","items":{"type":"string"}},
-            "owned_paths":{"type":"array","items":{"type":"string"},"description":"Files, directories (dir/ covers everything below) or globs this task may write; disjoint from parallel tasks"},
+            "owned_paths":{"type":"array","items":{"type":"string"},"description":"Files, directories or globs it may write; disjoint from parallel tasks"},
             "acceptance":{"type":"array","items":{"type":"string"}},
-            "priority":{"type":"integer","description":"0 most urgent … 3 background (default 1)"},
-            "worker":{"type":"string","description":"A subagent profile from the environment section (default: developer)"}
+            "priority":{"type":"integer","description":"0 urgent … 3 background (default 1)"},
+            "worker":{"type":"string","description":"Profile (default: developer)"}
         },"required":["id","title","task","owned_paths"]}}},"required":["tasks"]}),
     )
 }
@@ -83,6 +78,8 @@ enum Phase {
     Compacting(usize),
     /// Resident only: waiting for the digest of the history before the new order (`held_order`).
     Digesting,
+    /// Resident only: compacting while idle (the kernel woke it between orders); then it waits again.
+    IdleDigesting,
 }
 
 /// A model-driven process.
@@ -323,6 +320,33 @@ impl Agent for LlmAgent {
                 }
                 self.just_compacted = true;
                 None
+            }
+            Phase::AwaitInput
+                if !wake.is_empty()
+                    && wake.iter().all(|r| matches!(r, SyscallResult::Message(m) if m.kind == zilch_ipc::MsgKind::Idle)) =>
+            {
+                // Idle between orders: compact now if worthwhile ("cold": the provider has likely
+                // dropped its cache, so even a smaller history is worth it), then wait again.
+                let cold = wake.iter().any(|r| matches!(r, SyscallResult::Message(m) if m.body == "cold"));
+                let share = if cold { compact::DIGEST_WHEN_COLD } else { compact::DIGEST_AT };
+                if self.messages.len() >= 2
+                    && (compact::estimate_tokens(&self.system, &self.messages, &self.tools) as f64) >= self.budget as f64 * share
+                {
+                    let binding = self.binding.read().unwrap().clone();
+                    let req = compact::digest_request(&binding, Some(self.session.clone()), &self.system, &self.tools, &self.messages);
+                    self.phase = Phase::IdleDigesting;
+                    return StepResult::Syscalls(vec![Syscall::Complete(req)]);
+                }
+                return StepResult::Syscalls(vec![Syscall::Recv]);
+            }
+            Phase::IdleDigesting => {
+                if let Some(SyscallResult::Completion { message, .. }) = wake.into_iter().next() {
+                    if !message.text().trim().is_empty() && message.tool_calls.is_empty() {
+                        self.messages = compact::digest_splice(&self.messages, message.text());
+                    }
+                }
+                self.phase = Phase::AwaitInput;
+                return StepResult::Syscalls(vec![Syscall::Recv]);
             }
             Phase::AwaitInput => {
                 // The next order (or a note) from the guest. A model's reasoning is needed back only

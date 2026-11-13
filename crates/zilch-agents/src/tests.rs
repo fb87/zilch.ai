@@ -434,3 +434,86 @@ fn between_orders_a_long_history_is_digested_through_its_cached_prefix_first() {
     assert_eq!(*texts.last().unwrap(), "Order #2: and now?");
     assert!(compact::estimate_tokens("", &req.messages, &[]) < 10_000, "the long reply is not resent");
 }
+
+/// Every developer instance sends the same system prompt and tools (only its brief differs), so a
+/// provider's prompt cache built by one serves the others. With --nocapture: each role's tool
+/// definitions and their sizes.
+#[test]
+fn developers_share_their_prompt_prefix_and_tool_sizes_are_printed() {
+    let dir = tempfile::tempdir().unwrap();
+    let drivers = DriverSet::new(dir.path(), ToolPolicy::default(), HashMap::new());
+    let mut book = Book::new(
+        ModelBinding::default(),
+        ModelBinding::default(),
+        drivers.specs(ARCHITECT_TOOLS),
+        drivers.specs(DEVELOPER_TOOLS),
+        dir.path(),
+    );
+    book.explorer_tools = drivers.specs(zilch_drivers::EXPLORER_TOOLS);
+    let view = AcbView { pid: 2, ticket: 1, group: Group::Development, steps: 0, notes: vec![] };
+    let first = |agent: &mut Box<dyn Agent>| {
+        let StepResult::Syscalls(c) = agent.step(&view, vec![]) else { panic!() };
+        let Syscall::Complete(req) = &c[0] else { panic!() };
+        req.clone()
+    };
+    let task = |id: &str, path: &str| PlanTask {
+        id: id.into(),
+        title: id.into(),
+        task: format!("edit {path}"),
+        depends_on: vec![],
+        owned_paths: vec![path.into()],
+        acceptance: vec![],
+        priority: None,
+        worker: None,
+    };
+    let a = first(&mut book.developer(1, &task("T1", "a.rs"), "plan"));
+    let b = first(&mut book.developer(1, &task("T2", "b.rs"), "plan"));
+    assert_eq!(a.messages[0].text(), b.messages[0].text(), "same system prompt for every developer");
+    assert_eq!(serde_json::to_string(&a.tools).unwrap(), serde_json::to_string(&b.tools).unwrap());
+    assert_ne!(a.messages[1].text(), b.messages[1].text(), "only the brief differs");
+
+    let sizes = |label: &str, req: &zilch_ipc::ChatRequest| {
+        let mut v: Vec<(usize, String)> =
+            req.tools.iter().map(|t| (serde_json::to_string(t).unwrap().len() / 4, t.function.name.clone())).collect();
+        v.sort_by(|x, y| y.cmp(x));
+        let total: usize = v.iter().map(|(n, _)| n).sum();
+        println!("{label}: tools ~{total} tokens, system prompt ~{} tokens", req.messages[0].text().len() / 4);
+        for (n, name) in v {
+            println!("  {name:<16} ~{n}");
+        }
+    };
+    sizes("main", &first(&mut book.architect(1, "Order #1: hi")));
+    sizes("planner", &first(&mut book.subagent(1, "plan", "brief").unwrap()));
+    sizes("answerer", &first(&mut book.subagent(1, "answer", "brief").unwrap()));
+    sizes("developer", &a);
+}
+
+#[test]
+fn an_idle_wake_compacts_a_long_history_and_then_waits_again() {
+    let idle = |body: &str| SyscallResult::Message(zilch_ipc::Msg { from: 0, kind: zilch_ipc::MsgKind::Idle, body: body.into() });
+    let reply = |t: &str| SyscallResult::Completion { message: Message::assistant(t), usage: Usage::default(), cut: false };
+    let view = AcbView { pid: 1, ticket: 1, group: Group::Architecture, steps: 0, notes: vec![] };
+    let served = |text: &str| {
+        let mut a =
+            LlmAgent::new(ModelBinding::default(), "s".into(), "Order #1: read".into(), vec![], "x".into()).resident().with_budget(16_000);
+        a.step(&view, vec![]);
+        assert!(matches!(a.step(&view, vec![reply(text)]), StepResult::Syscalls(c) if matches!(c[0], Syscall::Serve { .. })));
+        a
+    };
+    // Small history: nothing to do, keep waiting.
+    let mut small = served("short answer");
+    assert!(matches!(small.step(&view, vec![idle("now")]), StepResult::Syscalls(c) if matches!(c[0], Syscall::Recv)));
+    // Past 40% of the budget: the digest request (own prefix + instruction), then wait again.
+    let mut big = served(&format!("long: {}", "z".repeat(30_000)));
+    let StepResult::Syscalls(c) = big.step(&view, vec![idle("now")]) else { panic!() };
+    let Syscall::Complete(req) = &c[0] else { panic!("expected the digest request, got {c:?}") };
+    assert_eq!(req.messages[1].text(), "Order #1: read");
+    assert!(req.messages.last().unwrap().text().starts_with("[compaction]"));
+    assert!(matches!(big.step(&view, vec![reply("- read a lot")]), StepResult::Syscalls(c) if matches!(c[0], Syscall::Recv)));
+    // The next order goes out on top of the digest.
+    let order = SyscallResult::Message(zilch_ipc::Msg { from: 0, kind: zilch_ipc::MsgKind::Guest, body: "Order #2: next".into() });
+    let StepResult::Syscalls(c) = big.step(&view, vec![order]) else { panic!() };
+    let Syscall::Complete(req) = &c[0] else { panic!() };
+    assert!(req.messages[1].text().starts_with("<conversation-summary>") && req.messages[1].text().contains("read a lot"));
+    assert!(compact::estimate_tokens("", &req.messages, &[]) < 10_000);
+}

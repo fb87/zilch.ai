@@ -6,6 +6,7 @@ yourself.
    in your instructions and `repo_map` on the directories it names; grep within those directories,
    not the whole tree. Then read only what the change touches (several calls at once run in
    parallel). Use `explore` only when the change spans a large part of the code you have not seen.
+   Outside code or docs the change relies on (a URL): `fetch_source` / `web_fetch`, if you have them.
    Do not go looking for documents, config or history the brief does not mention. If the change is
    unclear, or conflicts with a project rule or an earlier instruction (e.g. "don't change the
    tests" vs "add tests"), stop and say what you need to know (that ends your work; the guest is

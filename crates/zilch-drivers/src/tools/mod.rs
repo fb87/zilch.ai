@@ -12,6 +12,7 @@ pub mod sandbox;
 pub mod sandbox_linux;
 pub mod search;
 pub mod spec_tools;
+pub mod web;
 
 use anyhow::Result;
 use serde_json::Value;
@@ -55,6 +56,8 @@ pub struct ToolPolicy {
     pub env_passthrough: Vec<String>,
     pub bash_sandbox: sandbox::BashSandbox,
     pub bash: sandbox::SandboxSpec,
+    /// Directories the read tools may also read (never write): fetched outside sources.
+    pub read_roots: Vec<PathBuf>,
 }
 
 impl Default for ToolPolicy {
@@ -65,6 +68,7 @@ impl Default for ToolPolicy {
             env_passthrough: vec![],
             bash_sandbox: sandbox::BashSandbox::Auto,
             bash: sandbox::SandboxSpec { network: true, protect_git: true, ..Default::default() },
+            read_roots: vec![],
         }
     }
 }
@@ -172,8 +176,22 @@ impl ToolCtx {
     /// Resolve a model-supplied path and enforce the sandbox: the real location (after following
     /// symlinks of every existing ancestor) must be inside the workspace; writes into `.git/` are
     /// refused.
+    /// Reads may also go below a read root (`ToolPolicy::read_roots`), judged by the real path.
     pub fn resolve_checked(&self, p: &str, write: bool) -> Result<PathBuf> {
-        resolve_checked(&self.cwd, self.policy.sandbox, p, write)
+        match resolve_checked(&self.cwd, self.policy.sandbox, p, write) {
+            Err(e) if !write => self.read_root(p).map(|(_, real)| real).ok_or(e),
+            r => r,
+        }
+    }
+
+    /// The read root holding `p` (an existing path, symlinks resolved) and `p`'s real path.
+    pub fn read_root(&self, p: &str) -> Option<(PathBuf, PathBuf)> {
+        let path = Path::new(p);
+        if !path.is_absolute() {
+            return None;
+        }
+        let real = normalize(path).canonicalize().ok()?;
+        self.policy.read_roots.iter().filter_map(|r| r.canonicalize().ok()).find(|r| real.starts_with(r)).map(|r| (r, real))
     }
 
     pub fn relative(&self, abs: &Path) -> String {

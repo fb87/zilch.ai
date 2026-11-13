@@ -181,8 +181,59 @@ fn bind(workspace: &Path, _endpoint: &str) -> std::io::Result<Bound> {
     Ok(Some((listener, Some(path))))
 }
 
+/// The daemon's endpoint: `ZILCH_DAEMON_SOCKET`, else one per user (`@zilch-daemon-<uid>` on Linux, else a socket file in the
+/// private runtime directory).
+pub fn daemon_endpoint() -> String {
+    if let Some(e) = std::env::var("ZILCH_DAEMON_SOCKET").ok().filter(|e| !e.is_empty()) {
+        return e; // another daemon (tests, or a second one on purpose)
+    }
+    if cfg!(target_os = "linux") {
+        format!("@zilch-daemon-{}", uid())
+    } else {
+        socket_file(Path::new("/zilch-daemon")).with_file_name("daemon.sock").display().to_string()
+    }
+}
+
+/// Listen on an endpoint (`@name`: Linux abstract socket; else a path in a private directory).
+/// `Ok(None)`: a live process already listens there.
+pub fn bind_endpoint(endpoint: &str) -> std::io::Result<Option<UnixListener>> {
+    #[cfg(target_os = "linux")]
+    if let Some(name) = endpoint.strip_prefix('@') {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
+        return match UnixListener::bind_addr(&addr) {
+            Ok(l) => Ok(Some(l)),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Ok(None),
+            Err(e) => Err(e),
+        };
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let path = Path::new(endpoint);
+    private_dir(path.parent().unwrap_or(Path::new("/tmp")))?;
+    if path.exists() {
+        if UnixStream::connect(path).is_ok() {
+            return Ok(None);
+        }
+        std::fs::remove_file(path)?; // stale socket from a crash
+    }
+    let listener = UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(Some(listener))
+}
+
+/// Connect to an endpoint (see [`bind_endpoint`]).
+pub fn connect(endpoint: &str) -> std::io::Result<UnixStream> {
+    #[cfg(target_os = "linux")]
+    if let Some(name) = endpoint.strip_prefix('@') {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
+        return UnixStream::connect_addr(&addr);
+    }
+    UnixStream::connect(endpoint)
+}
+
 /// Only the user running zilch may talk to it (peer credentials, not file permissions).
-fn peer_allowed(stream: &UnixStream) -> bool {
+pub fn peer_allowed(stream: &UnixStream) -> bool {
     peer_uid(stream) == Some(uid())
 }
 

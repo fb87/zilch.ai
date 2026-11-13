@@ -20,14 +20,41 @@ use zilch_kernel::{Access, DriverCtx, Drivers};
 
 /// Tools of each group (the kernel's capabilities restrict their writes further).
 /// The main agent reads and plans; it never writes files (its subagents do).
-pub const ARCHITECT_TOOLS: &[&str] = &["read_file", "repo_map", "find_definition", "glob", "grep", "git"];
-pub const DEVELOPER_TOOLS: &[&str] =
-    &["read_file", "write_file", "edit_file", "repo_map", "find_definition", "glob", "grep", "git", "bash"];
+/// fetch_source, web_fetch and web_search exist only with `[web] enabled` (`DriverSet::with_web`).
+pub const ARCHITECT_TOOLS: &[&str] =
+    &["read_file", "repo_map", "find_definition", "glob", "grep", "git", "fetch_source", "web_fetch", "web_search"];
+pub const DEVELOPER_TOOLS: &[&str] = &[
+    "read_file",
+    "write_file",
+    "edit_file",
+    "repo_map",
+    "find_definition",
+    "glob",
+    "grep",
+    "git",
+    "bash",
+    "fetch_source",
+    "web_fetch",
+    "web_search",
+];
 /// The spec lane: read the code, write only the documents of the spec directory.
-pub const SPEC_TOOLS: &[&str] =
-    &["read_file", "repo_map", "find_definition", "glob", "grep", "git", "write_doc", "edit_doc", "release_spec"];
+pub const SPEC_TOOLS: &[&str] = &[
+    "read_file",
+    "repo_map",
+    "find_definition",
+    "glob",
+    "grep",
+    "git",
+    "write_doc",
+    "edit_doc",
+    "release_spec",
+    "fetch_source",
+    "web_fetch",
+    "web_search",
+];
 /// Explorers: read-only.
-pub const EXPLORER_TOOLS: &[&str] = &["read_file", "repo_map", "find_definition", "glob", "grep", "git"];
+pub const EXPLORER_TOOLS: &[&str] =
+    &["read_file", "repo_map", "find_definition", "glob", "grep", "git", "fetch_source", "web_fetch", "web_search"];
 
 /// Per-process content hashes of files read (stale-edit detection).
 type ReadHashes = Arc<Mutex<HashMap<PathBuf, String>>>;
@@ -110,6 +137,19 @@ impl DriverSet {
         self.tools.register(Arc::new(tools::spec_tools::WriteDoc(store.clone())));
         self.tools.register(Arc::new(tools::spec_tools::EditDoc(store.clone())));
         self.tools.register(Arc::new(tools::spec_tools::ReleaseSpec(store)));
+        self
+    }
+
+    /// Outside sources (`[web] enabled`): fetch_source and web_fetch, and web_search when a search
+    /// service is configured. Without this the tools don't exist, so no agent is offered them.
+    pub fn with_web(mut self, web: &tools::web::WebConfig) -> Self {
+        if web.enabled {
+            self.tools.register(Arc::new(tools::web::FetchSource));
+            self.tools.register(Arc::new(tools::web::WebFetch));
+            if let Some(p) = &web.search {
+                self.tools.register(Arc::new(tools::web::WebSearch(p.clone())));
+            }
+        }
         self
     }
 
