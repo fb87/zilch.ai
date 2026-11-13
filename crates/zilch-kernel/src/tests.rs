@@ -1320,6 +1320,41 @@ fn an_answerer_that_keeps_reading_is_told_to_answer() {
 }
 
 #[test]
+fn an_order_dispatches_at_most_three_subagents() {
+    // A main agent that is never satisfied: it dispatches again after every report.
+    struct Main;
+    impl Agent for Main {
+        fn step(&mut self, _: &AcbView, wake: Vec<SyscallResult>) -> StepResult {
+            match wake.first().map(SyscallResult::text) {
+                Some(t) if t.contains("no more subagents") => StepResult::Syscalls(vec![Syscall::Serve { summary: t }]),
+                _ => StepResult::Syscalls(vec![Syscall::Dispatch { agent: "answer".into(), brief: "look again".into() }]),
+            }
+        }
+    }
+    struct B;
+    impl Recipes for B {
+        fn architect(&self, _: TicketId, _: &str) -> Box<dyn Agent> {
+            Box::new(Main)
+        }
+        fn developer(&self, _: TicketId, _: &PlanTask, _: &str) -> Box<dyn Agent> {
+            unreachable!("no plan here")
+        }
+        fn subagent(&self, _: TicketId, _: &str, _: &str) -> Option<Box<dyn Agent>> {
+            Some(Box::new(Scripted(0, |_, _, _| StepResult::Exit(ExitStatus::ok("a partial report")))))
+        }
+    }
+    let bus = Arc::new(EventBus::new());
+    let events = bus.subscribe(10_000);
+    let k = start(cfg(), Arc::new(FakeDrivers::default()), Arc::new(B), bus);
+    let mut run = Run { k, events, seen: vec![] };
+    run.k.send(Cmd::Order("analyze".into()));
+    let (ok, summary) = run.served();
+    assert!(ok && summary.contains("no more subagents for this order (3 already ran)"), "{summary}");
+    let spawned = run.seen.iter().filter(|e| matches!(e, KernelEvent::Spawned { title, .. } if title.starts_with("answer:"))).count();
+    assert_eq!(spawned, 3);
+}
+
+#[test]
 fn a_repeated_dispatch_in_one_step_runs_once() {
     // The model asks twice in one step: the first dispatch runs, the second is refused.
     struct Main;
