@@ -202,3 +202,15 @@ fn verbose_shows_the_models_streamed_reasoning_and_text_quiet_does_not() {
     assert!(verbose.contains("1 │ The answer is 42."), "the reply text as it streamed: {verbose}");
     assert!(verbose.contains("▸ llm "), "model calls too: {verbose}");
 }
+
+#[test]
+fn a_served_order_says_how_long_it_took_and_what_it_used() {
+    let (url, _) = model_server("Done.");
+    let env = Env::new(&url);
+    let ws = tempfile::tempdir().unwrap();
+    let out = text(&env.run(ws.path(), &["-p", "hi", "--no-log", "--no-session", "-v"]));
+    // The fake server answers 10 in / 3 out per request; its model has no known price.
+    let served = out.lines().find(|l| l.contains("order #1 served")).unwrap_or_default().to_string();
+    assert!(served.contains("s · 1 request · 10 in (") && served.contains("· 3 out · price unknown"), "{served}");
+    assert!(!out.contains("▸ recv") && !out.contains("✓ serve"), "no idle bookkeeping lines: {out}");
+}

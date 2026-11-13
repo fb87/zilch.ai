@@ -61,6 +61,11 @@ impl Costs {
         *self.usage.lock().unwrap().entry((who.to_string(), model.to_string())).or_default() += u;
     }
 
+    /// What `u` cost on `model` (None when its price is unknown).
+    pub fn price(&self, model: &str, u: &Usage) -> Option<f64> {
+        self.meter.info(model)?.cost(u)
+    }
+
     pub fn record_parts(&self, parts: &[(String, u64)]) {
         let mut m = self.parts.lock().unwrap();
         for (k, n) in parts {

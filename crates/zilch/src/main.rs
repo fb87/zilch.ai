@@ -149,6 +149,45 @@ struct View {
     /// The lane typed orders go to (Architecture = code, Spec = spec), and each order's lane.
     lane: Mutex<Group>,
     lanes_of: Mutex<HashMap<TicketId, Group>>,
+    /// The order each subagent works for (the resident agents work for their lane's open order).
+    tickets_of: Mutex<HashMap<Pid, TicketId>>,
+    /// Per order: when it was placed, and its model requests, tokens and cost so far.
+    order_stats: Mutex<HashMap<TicketId, OrderStats>>,
+}
+
+#[derive(Default)]
+struct OrderStats {
+    started: Option<Instant>,
+    requests: u64,
+    usage: zilch_ipc::Usage,
+    usd: f64,
+    /// Some request's price was unknown: the total is a lower bound.
+    unpriced: bool,
+}
+
+impl OrderStats {
+    /// `2m29s · 16 requests · 421k in (63% cached) · 10k out · $0.0123`
+    fn line(&self) -> String {
+        let secs = self.started.map_or(0, |s| s.elapsed().as_secs());
+        let time = if secs >= 60 { format!("{}m{:02}s", secs / 60, secs % 60) } else { format!("{secs}s") };
+        if self.requests == 0 {
+            return time;
+        }
+        let u = &self.usage;
+        let cost = match (self.unpriced, self.usd > 0.0) {
+            (true, false) => "price unknown".to_string(),
+            (true, true) => format!("≥ ${:.4}", self.usd),
+            (false, _) => format!("${:.4}", self.usd),
+        };
+        format!(
+            "{time} · {} request{} · {} in ({}) · {} out · {cost}",
+            self.requests,
+            if self.requests == 1 { "" } else { "s" },
+            costs::fmt_tokens(u.prompt_tokens),
+            costs::cached_share(u.cached_tokens, u.prompt_tokens),
+            costs::fmt_tokens(u.completion_tokens),
+        )
+    }
 }
 
 /// What the status row knows about one process.
@@ -235,17 +274,43 @@ impl View {
         if let KernelEvent::RequestParts { parts, .. } = ev {
             self.costs.record_parts(parts);
         }
+        match ev {
+            KernelEvent::TicketOpened { ticket, .. } => {
+                self.order_stats.lock().unwrap().insert(*ticket, OrderStats { started: Some(Instant::now()), ..Default::default() });
+            }
+            KernelEvent::Spawned { pid, ticket, group, .. } if !matches!(group, Group::Architecture | Group::Spec) => {
+                self.tickets_of.lock().unwrap().insert(*pid, *ticket);
+            }
+            _ => {}
+        }
         if let KernelEvent::Usage { pid, model, prompt_tokens, completion_tokens, cached_tokens } = ev {
-            let who = match self.procs.lock().unwrap().get(pid).map(|(g, _)| *g) {
+            let group = self.procs.lock().unwrap().get(pid).map(|(g, _)| *g);
+            let who = match group {
                 Some(Group::Architecture) => "main",
                 Some(Group::Spec) => "spec",
                 _ => "subagents",
             };
-            self.costs.record(
-                who,
-                model,
-                zilch_ipc::Usage { prompt_tokens: *prompt_tokens, completion_tokens: *completion_tokens, cached_tokens: *cached_tokens },
-            );
+            let u =
+                zilch_ipc::Usage { prompt_tokens: *prompt_tokens, completion_tokens: *completion_tokens, cached_tokens: *cached_tokens };
+            self.costs.record(who, model, u);
+            // The order it was for: a subagent's own, or the open order of a resident agent's lane
+            // (none between orders: idle housekeeping counts for the session only).
+            let ticket = self.tickets_of.lock().unwrap().get(pid).copied().or_else(|| {
+                let lane = group?;
+                let lanes = self.lanes_of.lock().unwrap();
+                self.open.lock().unwrap().iter().filter(|t| lanes.get(t) == Some(&lane)).max().copied()
+            });
+            if let Some(t) = ticket {
+                let price = self.costs.price(model, &u);
+                if let Some(s) = self.order_stats.lock().unwrap().get_mut(&t) {
+                    s.requests += 1;
+                    s.usage += u;
+                    match price {
+                        Some(p) => s.usd += p,
+                        None => s.unpriced = true,
+                    }
+                }
+            }
         }
         let mut live = self.live.lock().unwrap();
         match ev {
@@ -393,12 +458,14 @@ impl View {
                 }
             }
             KernelEvent::SyscallIssued { pid, summary, .. } => {
-                // Model calls, and the resident agent waiting again after an idle wake, are not news.
-                if (summary.starts_with("llm ") || summary == "recv") && !self.verbose() {
+                // A resident agent waiting for its next order (also after an idle wake) is never
+                // news; model calls are only in /verbose.
+                if summary == "recv" || (summary.starts_with("llm ") && !self.verbose()) {
                     return None;
                 }
                 format!("    {d}{pid} ▸ {}{r}", self.rel(summary))
             }
+            KernelEvent::SyscallDone { summary, .. } if summary == "recv" || summary == "serve" => return None,
             KernelEvent::SyscallDone { pid, ok: false, summary, result, .. } => {
                 format!("    {red}{pid} ✗ {}{r}{d}: {}{r}", self.rel(summary), first(&result.text(), 200))
             }
@@ -434,10 +501,11 @@ impl View {
                 let width = terminal_width().saturating_sub(2).max(20);
                 let body = markdown::Markdown::new(self.color).with_indent(2).text(summary.trim(), width);
                 let mark = if self.lanes_of.lock().unwrap().get(ticket) == Some(&Group::Spec) { "spec " } else { "" };
+                let stats = self.order_stats.lock().unwrap().remove(ticket).map(|s| format!(" · {}", s.line())).unwrap_or_default();
                 let end = if *ok {
-                    format!("{g}── {mark}order #{ticket} served ──{r}")
+                    format!("{g}── {mark}order #{ticket} served{stats} ──{r}")
                 } else {
-                    format!("{red}── {mark}order #{ticket} not served ──{r}")
+                    format!("{red}── {mark}order #{ticket} not served{stats} ──{r}")
                 };
                 format!("{body}\n{end}")
             }
