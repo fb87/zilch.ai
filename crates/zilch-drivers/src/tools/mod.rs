@@ -223,7 +223,16 @@ pub fn resolve_checked(cwd: &Path, sandbox: bool, p: &str, write: bool) -> Resul
         real.push(part);
     }
     if !real.starts_with(&root) {
-        anyhow::bail!("access denied: '{p}' is outside the workspace ({}). Only files inside the project can be accessed.", root.display());
+        anyhow::bail!(
+            "access denied: '{p}' is outside the workspace ({}). Only files inside the project can be accessed{}",
+            root.display(),
+            if write {
+                "; don't work around this with shell commands (their /tmp is private and discarded): report that the \
+                 path cannot be written and suggest one inside the workspace."
+            } else {
+                "."
+            }
+        );
     }
     if write && real.strip_prefix(&root).ok().and_then(|r| r.components().next()).is_some_and(|c| c.as_os_str() == ".git") {
         anyhow::bail!("access denied: writing inside .git/ is not allowed");

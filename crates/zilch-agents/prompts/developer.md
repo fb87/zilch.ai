@@ -15,6 +15,8 @@ Do what the task asks, completely, and nothing more:
 - Several changes to one file go in ONE edit_file call (`edits` list), not one call per change.
 - Call independent tools in one turn; they run in parallel.
 - If a write fails because a file changed (another developer), re-read it and redo your edit.
+- If a write is refused (outside the workspace or outside your paths), never work around it with
+  the shell: commands run in a sandbox whose /tmp is private and discarded. Report it and stop.
 - Verify in proportion to the change: run the task's acceptance checks, or build and run the
   relevant tests, when the project makes that possible. A change to docs or comments needs no build,
   and its facts come from reading the code: no builds, evaluations or checks to gather them.
