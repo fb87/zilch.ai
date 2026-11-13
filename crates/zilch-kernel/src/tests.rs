@@ -232,6 +232,26 @@ fn capabilities_confine_writes_to_owned_paths_and_commands_to_developers() {
 }
 
 #[test]
+fn a_task_that_owns_no_paths_writes_nothing() {
+    // e.g. "run the full test suite": it may run commands, but not change files.
+    let dev: DevScript = Arc::new(|_| {
+        Box::new(Scripted(0, |n, wake, _| match n {
+            1 => StepResult::Syscalls(vec![tool("write", json!({"path":"src/any.rs"})), tool("exec", json!({}))]),
+            _ => {
+                let r: Vec<String> = wake.iter().map(SyscallResult::text).collect();
+                assert!(r[0].contains("permission denied") && r[0].contains("(none)"), "{}", r[0]);
+                assert_eq!(r[1], "ok", "commands still run");
+                StepResult::Exit(ExitStatus::ok("STATUS: done"))
+            }
+        }))
+    });
+    let mut run = Run::new(cfg(), Arc::new(FakeDrivers::default()), Book { tasks: vec![task("T1", &[], &[])], dev });
+    run.k.send(Cmd::Order("verify".into()));
+    let (ok, summary) = run.served();
+    assert!(ok, "{summary}");
+}
+
+#[test]
 fn a_hung_call_is_interrupted_then_the_process_killed_and_dependents_blocked() {
     let drivers = Arc::new(FakeDrivers::default());
     let dev: DevScript = Arc::new(|t| {
@@ -367,7 +387,7 @@ fn higher_priority_runs_first_and_waiting_work_ages_upward() {
         Arc::new(Book { tasks: vec![], dev: worker() }),
         bus,
     );
-    let caps = || Caps { write: vec![], write_any: false, exec: false };
+    let caps = || Caps { write: vec![], exec: false };
     let idle = || -> Box<dyn Agent> { Box::new(Scripted(0, |_, _, _| StepResult::Yield)) };
     let low = k.spawn(idle(), None, 1, Group::Development, "low".into(), caps(), CancelToken::new(), 2);
     let high = k.spawn(idle(), None, 1, Group::Architecture, "high".into(), caps(), CancelToken::new(), 0);

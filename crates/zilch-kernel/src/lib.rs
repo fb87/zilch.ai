@@ -295,9 +295,8 @@ impl State {
 /// Write permissions of a process.
 #[derive(Debug, Clone)]
 struct Caps {
-    /// Globs this process may write; empty with `write_any` false = nothing.
+    /// Globs this process may write; empty = nothing (a task that owns no paths writes nothing).
     write: Vec<String>,
-    write_any: bool,
     exec: bool,
 }
 
@@ -310,7 +309,7 @@ impl Caps {
             Access::Exec => Err("permission denied: this agent may not run commands".into()),
             Access::Write(path) => {
                 let p = path.trim_start_matches("./");
-                let ok = self.write_any || self.write.iter().any(|g| plan::path_matches(g, p));
+                let ok = self.write.iter().any(|g| plan::path_matches(g, p));
                 if ok {
                     Ok(())
                 } else {
@@ -794,7 +793,7 @@ impl Kernel {
                 let message = order_message(ticket, &text);
                 let (agent, caps, title) = match lane {
                     Group::Spec => match self.recipes.spec(ticket, &message) {
-                        Some(a) => (a, Caps { write: vec![], write_any: false, exec: false }, "spec agent"),
+                        Some(a) => (a, Caps { write: vec![], exec: false }, "spec agent"),
                         None => {
                             self.tickets.insert(
                                 ticket,
@@ -816,7 +815,7 @@ impl Kernel {
                     _ => (
                         self.recipes.architect(ticket, &message),
                         // The main agent writes nothing: it plans, its subagents write.
-                        Caps { write: vec![], write_any: false, exec: false },
+                        Caps { write: vec![], exec: false },
                         "main agent",
                     ),
                 };
@@ -1564,7 +1563,7 @@ impl Kernel {
             let Some(agent) = self.recipes.explorer(ticket, q) else {
                 return self.fill(pid, batch, idx, SyscallResult::Failed("this kitchen has no explorers".into()));
             };
-            let caps = Caps { write: vec![], write_any: false, exec: false };
+            let caps = Caps { write: vec![], exec: false };
             let title = format!("explore: {}", q.chars().take(50).collect::<String>());
             let e = self.spawn(agent, Some(pid), ticket, Group::Development, title, caps, cancel.child(), 0);
             spawned.push((e, i));
@@ -1623,7 +1622,7 @@ impl Kernel {
         };
         let cancel = self.tickets.get(&ticket).map(|t| t.cancel.child()).unwrap_or_default();
         // Dispatched agents read; a planner's developers write (their caps come with the plan).
-        let caps = Caps { write: vec![], write_any: false, exec: false };
+        let caps = Caps { write: vec![], exec: false };
         let title = format!("{agent}: {}", brief.lines().next().unwrap_or("").chars().take(50).collect::<String>());
         let child = self.spawn(sub, Some(pid), ticket, Group::Development, title, caps, cancel.child(), 0);
         self.dispatched.insert(child, (pid, batch, agent));
@@ -1781,7 +1780,7 @@ impl Kernel {
         let jobs: Vec<(usize, PlanTask)> = start.iter().map(|i| (*i, p.tasks[*i].clone())).collect();
         for (i, task) in jobs {
             let agent = self.recipes.developer(ticket, &task, &context);
-            let caps = Caps { write: task.owned_paths.clone(), write_any: task.owned_paths.is_empty(), exec: true };
+            let caps = Caps { write: task.owned_paths.clone(), exec: true };
             let title = format!("[{}] {}", task.id, task.title);
             let priority = task.priority.unwrap_or(1);
             let pid = self.spawn(agent, Some(root), ticket, Group::Development, title, caps, cancel.child(), priority);

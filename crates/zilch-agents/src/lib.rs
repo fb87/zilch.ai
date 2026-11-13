@@ -59,7 +59,7 @@ pub fn submit_plan_spec() -> ToolSpec {
             "title":{"type":"string"},
             "task":{"type":"string","description":"Self-contained brief: the developer sees nothing else"},
             "depends_on":{"type":"array","items":{"type":"string"}},
-            "owned_paths":{"type":"array","items":{"type":"string"},"description":"Files, directories or globs it may write; disjoint from parallel tasks"},
+            "owned_paths":{"type":"array","items":{"type":"string"},"description":"Files, directories or globs it may write; disjoint from parallel tasks; empty = it writes nothing"},
             "acceptance":{"type":"array","items":{"type":"string"}},
             "priority":{"type":"integer","description":"0 urgent … 3 background (default 1)"},
             "worker":{"type":"string","description":"Profile (default: developer)"}
